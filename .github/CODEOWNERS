@@ -1,0 +1,13 @@
+# Default owner for everything in the repo
+*                       @HarishanA21
+
+# Backend
+/api.py                 @HarishanA21
+/Tools/                 @HarishanA21
+/requirements.txt       @HarishanA21
+
+# Frontend
+/ui/                    @HarishanA21
+
+# CI / repo config
+/.github/               @HarishanA21

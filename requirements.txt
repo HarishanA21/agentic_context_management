@@ -1,0 +1,13 @@
+markdown
+openai
+python-dotenv
+langchain
+langchain-openai
+langchain-anthropic
+langgraph-checkpoint-sqlite
+langgraph-checkpoint-postgres
+psycopg[binary]
+psycopg-pool
+pyjwt[crypto]
+fastapi
+uvicorn[standard]
