@@ -1,0 +1,36 @@
+name: Claude PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    name: Claude AI review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Claude review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          mode: review
+          prompt: |
+            Review this pull request for the FYP Agent project (FastAPI + LangGraph backend, Next.js + Supabase frontend).
+
+            Focus on:
+            1. **Security** — JWT verification, RLS scoping, no secrets in code, no SQL injection, no leaked PII in logs.
+            2. **Structure** — backend code stays in `api.py` / `Tools/`, frontend in `ui/`, no cross-layer leakage.
+            3. **Correctness** — auth-protected endpoints actually call `Depends(get_current_user)`, DB queries scope by `user_id`, LangGraph thread_id includes user prefix.
+            4. **Frontend** — components use `authFetch` (not raw `fetch`) for protected routes, errors handled gracefully.
+            5. **Hygiene** — no committed `.env`, no `node_modules`, no `.venv`, no large binary files, no commented-out dead code.
+
+            Be concise. Flag only real issues with file:line references. If the PR looks good, say so.
