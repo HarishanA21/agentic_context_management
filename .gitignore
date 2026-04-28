@@ -1,1 +1,24 @@
-hi
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Env files
+.env
+.env.local
+ui/.env.local
+
+# Next.js / UI
+ui/node_modules/
+ui/.next/
+ui/out/
+ui/next-env.d.ts
+
+uv.lock
+Tools
