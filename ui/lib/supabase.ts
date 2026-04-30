@@ -15,12 +15,14 @@ export async function authFetch(input: string, init: RequestInit = {}) {
     data: { session },
   } = await supabase.auth.getSession()
   const token = session?.access_token
-  return fetch(input, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init.headers || {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-  })
+  // FormData bodies must not carry a hard-coded Content-Type — the browser
+  // needs to set its own multipart/form-data boundary.
+  const isFormData =
+    typeof FormData !== 'undefined' && init.body instanceof FormData
+  const headers: Record<string, string> = {
+    ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
+    ...((init.headers as Record<string, string>) || {}),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  }
+  return fetch(input, { ...init, headers })
 }

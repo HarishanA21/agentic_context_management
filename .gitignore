@@ -22,3 +22,7 @@ ui/next-env.d.ts
 
 uv.lock
 Tools
+
+# Uploaded user files (per-session storage)
+uploads/
+.claude

@@ -11,3 +11,9 @@ psycopg-pool
 pyjwt[crypto]
 fastapi
 uvicorn[standard]
+python-multipart
+
+# File parsing
+pypdf
+python-docx
+openpyxl
