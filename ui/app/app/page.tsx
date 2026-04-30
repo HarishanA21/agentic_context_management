@@ -9,8 +9,19 @@ import { supabase, authFetch } from '@/lib/supabase'
 
 /* ─────────────────────────── types ─────────────────────────── */
 
-type Session = { id: string; name: string; created_at: string }
-type Thread = { id: string; session_id: string; name: string; created_at: string }
+type Session = {
+  id: string
+  name: string
+  created_at: string
+  tokens?: number
+}
+type Thread = {
+  id: string
+  session_id: string
+  name: string
+  created_at: string
+  tokens?: number
+}
 type ToolCall = { name: string; args: Record<string, unknown> }
 type Message = {
   role: 'user' | 'assistant' | 'tool'
@@ -68,6 +79,18 @@ function persistName(key: string, id: string, name: string) {
   const all = loadNameMap(key)
   all[id] = name
   localStorage.setItem(key, JSON.stringify(all))
+}
+
+/** Compact token-count formatter: 245, 1.2k, 23k, 1.4M */
+function fmtTokens(n: number | undefined): string {
+  if (!n || n <= 0) return ''
+  if (n < 1000) return String(n)
+  if (n < 1_000_000) {
+    const k = n / 1000
+    return k >= 10 ? `${Math.round(k)}k` : `${k.toFixed(1).replace(/\.0$/, '')}k`
+  }
+  const m = n / 1_000_000
+  return m >= 10 ? `${Math.round(m)}M` : `${m.toFixed(1).replace(/\.0$/, '')}M`
 }
 
 /** Heuristic title from a user message — first non-empty line, first 6 words,
@@ -600,6 +623,9 @@ export default function AppPage() {
           if (newCount > baselineAssistantCount) {
             setMessages(history)
             setSending(false)
+            // Refresh sidebar token counts.
+            loadSessions()
+            if (kinds[sid] === 'project') loadThreads(sid)
             return
           }
         }
@@ -779,7 +805,14 @@ export default function AppPage() {
                                 active ? 'bg-emerald-400' : 'bg-fog-500'
                               }`}
                             />
-                            <span className="truncate">{threadDisplayName(t)}</span>
+                            <span className="truncate flex-1">
+                              {threadDisplayName(t)}
+                            </span>
+                            {!!t.tokens && (
+                              <span className="text-[10px] text-fog-500 tabular-nums shrink-0">
+                                {fmtTokens(t.tokens)}
+                              </span>
+                            )}
                           </button>
                         )
                       })}
@@ -848,9 +881,17 @@ export default function AppPage() {
                           className="shrink-0 text-fog-400"
                           small
                         />
-                        <span className="truncate">
+                        <span className="truncate flex-1">
                           {sessionDisplayName(s)}
                         </span>
+                        {!!s.tokens && (
+                          <span
+                            className="text-[10px] text-fog-500 tabular-nums shrink-0"
+                            title={`${s.tokens.toLocaleString()} tokens`}
+                          >
+                            {fmtTokens(s.tokens)}
+                          </span>
+                        )}
                       </button>
                       <button
                         data-row-menu="1"

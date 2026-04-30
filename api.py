@@ -17,6 +17,7 @@ from psycopg_pool import ConnectionPool
 from pydantic import BaseModel
 
 from Tools import all_tools
+from agent_callbacks import AgentLogger
 
 load_dotenv()
 
@@ -169,12 +170,13 @@ def _record_message(
     content: str,
     tool_name: Optional[str] = None,
     tool_calls: Optional[list] = None,
+    tokens: int = 0,
 ):
     conn.execute(
         """
         INSERT INTO messages
-            (session_id, thread_id, user_id, role, content, tool_name, tool_calls_json)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+            (session_id, thread_id, user_id, role, content, tool_name, tool_calls_json, tokens)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             session_id,
@@ -184,19 +186,51 @@ def _record_message(
             content,
             tool_name,
             json.dumps(tool_calls) if tool_calls else None,
+            int(tokens or 0),
         ),
     )
+
+
+def _ai_tokens(msg) -> int:
+    """Best-effort token total for an AIMessage."""
+    um = getattr(msg, "usage_metadata", None)
+    if um:
+        try:
+            total = um["total_tokens"] if hasattr(um, "__getitem__") else getattr(um, "total_tokens", 0)
+            if total:
+                return int(total)
+        except Exception:
+            pass
+    rm = getattr(msg, "response_metadata", None) or {}
+    tu = rm.get("token_usage") or rm.get("usage") or {}
+    try:
+        return int(tu.get("total_tokens", 0) or 0)
+    except Exception:
+        return 0
 
 
 @app.get("/sessions")
 def list_sessions(user_id: str = Depends(get_current_user)):
     with app.state.pool.connection() as conn:
         rows = conn.execute(
-            "SELECT id, name, created_at FROM sessions WHERE user_id = %s ORDER BY created_at DESC",
+            """
+            SELECT s.id, s.name, s.created_at,
+                   COALESCE(SUM(m.tokens), 0)::int AS tokens
+            FROM sessions s
+            LEFT JOIN messages m ON m.session_id = s.id
+            WHERE s.user_id = %s
+            GROUP BY s.id, s.name, s.created_at
+            ORDER BY s.created_at DESC
+            """,
             (user_id,),
         ).fetchall()
     return [
-        {"id": str(r[0]), "name": r[1], "created_at": r[2].isoformat()}
+        {
+            "id": str(r[0]),
+            "name": r[1],
+            "created_at": r[2].isoformat(),
+            "tokens": int(r[3] or 0),
+        }
         for r in rows
     ]
 
@@ -219,11 +253,13 @@ def create_session(req: CreateSessionRequest, user_id: str = Depends(get_current
         "id": str(sid),
         "name": sname,
         "created_at": screated.isoformat(),
+        "tokens": 0,
         "default_thread": {
             "id": str(t[0]),
             "session_id": str(sid),
             "name": t[1],
             "created_at": t[2].isoformat(),
+            "tokens": 0,
         },
     }
 
@@ -237,8 +273,15 @@ def list_threads(session_id: str, user_id: str = Depends(get_current_user)):
         ).fetchone():
             raise HTTPException(404, "Session not found")
         rows = conn.execute(
-            "SELECT id, name, created_at FROM threads "
-            "WHERE session_id = %s AND user_id = %s ORDER BY created_at ASC",
+            """
+            SELECT t.id, t.name, t.created_at,
+                   COALESCE(SUM(m.tokens), 0)::int AS tokens
+            FROM threads t
+            LEFT JOIN messages m ON m.thread_id = t.id
+            WHERE t.session_id = %s AND t.user_id = %s
+            GROUP BY t.id, t.name, t.created_at
+            ORDER BY t.created_at ASC
+            """,
             (session_id, user_id),
         ).fetchall()
     return [
@@ -247,6 +290,7 @@ def list_threads(session_id: str, user_id: str = Depends(get_current_user)):
             "session_id": session_id,
             "name": r[1],
             "created_at": r[2].isoformat(),
+            "tokens": int(r[3] or 0),
         }
         for r in rows
     ]
@@ -274,6 +318,7 @@ def create_thread(
         "session_id": session_id,
         "name": t[1],
         "created_at": t[2].isoformat(),
+        "tokens": 0,
     }
 
 
@@ -446,13 +491,15 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
         # Scope LangGraph thread by user+session to prevent cross-user collisions.
         # Inject user_id + session_id so file tools (list/read/write) can
         # resolve the current project's uploads dir without the model having
-        # to pass them.
+        # to pass them. Also attach a per-request logger so tool + LLM
+        # activity prints to the backend terminal.
         config = {
+            "callbacks": [AgentLogger(request_id=req.session_id)],
             "configurable": {
                 "thread_id": f"{user_id}:{req.session_id}",
                 "user_id": user_id,
                 "session_id": req.session_id,
-            }
+            },
         }
 
         with app.state.pool.connection() as conn:
@@ -507,6 +554,7 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
                                 "assistant",
                                 content,
                                 tool_calls=tool_calls or None,
+                                tokens=_ai_tokens(msg),
                             )
                         if content:
                             reply = content
