@@ -143,6 +143,31 @@ export default function AppPage() {
   const [renameValue, setRenameValue] = useState('')
   // Lightweight toast
   const [toast, setToast] = useState<string | null>(null)
+  // Centered confirm dialog (replaces window.confirm)
+  const [confirmDialog, setConfirmDialog] = useState<{
+    title: string
+    message: string
+    confirmLabel?: string
+    danger?: boolean
+    onConfirm: () => void
+  } | null>(null)
+  // Centered prompt dialog (replaces window.prompt)
+  const [promptDialog, setPromptDialog] = useState<{
+    title: string
+    message?: string
+    placeholder?: string
+    initialValue?: string
+    confirmLabel?: string
+    onConfirm: (value: string) => void
+  } | null>(null)
+  // Right-side file viewer
+  const [viewerFile, setViewerFile] = useState<{
+    sessionId: string
+    name: string
+  } | null>(null)
+  const [viewerContent, setViewerContent] = useState<string>('')
+  const [viewerLoading, setViewerLoading] = useState(false)
+  const [viewerError, setViewerError] = useState<string | null>(null)
   // Composer "+" attach menu
   const [composerMenuOpen, setComposerMenuOpen] = useState(false)
   const [uploading, setUploading] = useState(false)
@@ -284,8 +309,22 @@ export default function AppPage() {
     setRenameValue('')
   }
 
-  async function deleteSession(sid: string) {
-    if (!confirm('Delete this conversation? This cannot be undone.')) return
+  function deleteSession(sid: string) {
+    const isProject = (kinds[sid] ?? 'project') === 'project'
+    setConfirmDialog({
+      title: isProject ? 'Delete project?' : 'Delete chat?',
+      message: isProject
+        ? 'This will delete the project and all its threads. This cannot be undone.'
+        : 'This will permanently delete the chat. This cannot be undone.',
+      confirmLabel: 'Delete',
+      danger: true,
+      onConfirm: () => {
+        void doDeleteSession(sid)
+      },
+    })
+  }
+
+  async function doDeleteSession(sid: string) {
     setRowMenuKey(null)
     const r = await authFetch(`/api/sessions/${sid}`, { method: 'DELETE' })
     if (!r.ok) {
@@ -332,23 +371,27 @@ export default function AppPage() {
     setRowMenuKey(null)
     const current = sessions.find((s) => s.id === sid)
     if (!current) return
-    const projectName = window
-      .prompt('Project name?', sessionDisplayName(current))
-      ?.trim()
-    if (!projectName) return
-
-    // The chat's old display name becomes the thread's name (it had no thread name yet).
     const oldChatName = sessionDisplayName(current)
-    const ts = threadsMap[sid] || []
-    if (ts[0] && !threadNames[ts[0].id]) {
-      setThreadName(ts[0].id, oldChatName)
-    }
-
-    saveKind(sid, 'project')
-    setKinds((prev) => ({ ...prev, [sid]: 'project' }))
-    setSessionName(sid, projectName)
-    setExpanded((prev) => new Set(prev).add(sid))
-    setToast('Moved to projects')
+    setPromptDialog({
+      title: 'Move to project',
+      message: 'Give the new project a name.',
+      placeholder: 'Project name',
+      initialValue: oldChatName,
+      confirmLabel: 'Create project',
+      onConfirm: (raw) => {
+        const projectName = raw.trim()
+        if (!projectName) return
+        const ts = threadsMap[sid] || []
+        if (ts[0] && !threadNames[ts[0].id]) {
+          setThreadName(ts[0].id, oldChatName)
+        }
+        saveKind(sid, 'project')
+        setKinds((prev) => ({ ...prev, [sid]: 'project' }))
+        setSessionName(sid, projectName)
+        setExpanded((prev) => new Set(prev).add(sid))
+        setToast('Moved to projects')
+      },
+    })
   }
 
   async function shareSession(sid: string, tid: string) {
@@ -363,7 +406,12 @@ export default function AppPage() {
         .filter(
           (m) =>
             m.role !== 'tool' &&
-            !(m.role === 'assistant' && !m.content?.trim()),
+            !(m.role === 'assistant' && !m.content?.trim()) &&
+            !(
+              m.role === 'assistant' &&
+              m.tool_calls &&
+              m.tool_calls.length > 0
+            ),
         )
         .map(
           (m) =>
@@ -411,6 +459,53 @@ export default function AppPage() {
       setToast(`Upload failed: ${e?.message ?? 'network error'}`)
     } finally {
       setUploading(false)
+    }
+  }
+
+  /** Pull the canonical file list for a session from the backend and merge
+   *  it into filesMap. Used after /chat (the agent may have written files
+   *  via the write_project_file tool) and when the viewer opens. */
+  async function refreshFiles(sid: string) {
+    try {
+      const r = await authFetch(`/api/sessions/${sid}/files`)
+      if (!r.ok) return
+      const list: Array<{ name: string }> = await r.json()
+      const names = list.map((f) => f.name)
+      setFilesMap((prev) => ({ ...prev, [sid]: names }))
+      saveFiles(sid, names)
+    } catch {
+      // ignore — local cache is still fine
+    }
+  }
+
+  async function openFileViewer(sid: string, name: string) {
+    setViewerFile({ sessionId: sid, name })
+    setViewerContent('')
+    setViewerError(null)
+    setViewerLoading(true)
+    try {
+      const r = await authFetch(
+        `/api/sessions/${sid}/files/${encodeURIComponent(name)}`,
+      )
+      if (!r.ok) {
+        const status = r.status
+        let detail = `${status} ${r.statusText}`
+        try {
+          const body = await r.json()
+          if (body?.detail) detail = body.detail
+        } catch {}
+        setViewerError(detail)
+        return
+      }
+      const data = await r.json()
+      setViewerContent(
+        (data?.content ?? '') +
+          (data?.truncated ? '\n\n[... truncated ...]' : ''),
+      )
+    } catch (e: any) {
+      setViewerError(e?.message ?? 'Network error')
+    } finally {
+      setViewerLoading(false)
     }
   }
 
@@ -535,6 +630,8 @@ export default function AppPage() {
     setActiveThread(tid)
     setMessages([])
     await loadHistory(sid, tid)
+    // Sync file chips with backend reality (agent may have written files).
+    refreshFiles(sid)
   }
 
   async function selectChat(sid: string) {
@@ -626,6 +723,8 @@ export default function AppPage() {
             // Refresh sidebar token counts.
             loadSessions()
             if (kinds[sid] === 'project') loadThreads(sid)
+            // Refresh files — the agent may have created or modified some.
+            refreshFiles(sid)
             return
           }
         }
@@ -771,21 +870,77 @@ export default function AppPage() {
               const isOpen = expanded.has(s.id)
               const threads = threadsMap[s.id] || []
               const fileCount = filesMap[s.id]?.length || 0
+              const rk = `project:${s.id}`
+              const renaming = renameKey === rk
+              const menuOpen = rowMenuKey === rk
               return (
-                <div key={s.id} className="mb-0.5">
-                  <button
-                    onClick={() => toggleSession(s.id)}
-                    className="w-full px-2.5 py-1.5 text-left text-sm flex items-center gap-2 rounded-md hover:bg-white/[0.04] text-fog-100"
-                  >
-                    <Caret open={isOpen} className="text-fog-400" />
-                    <IconFolder className="shrink-0 text-fog-300" small />
-                    <span className="truncate flex-1">{s.name}</span>
-                    {fileCount > 0 && (
-                      <span className="text-[10px] text-fog-500">
-                        {fileCount}
-                      </span>
-                    )}
-                  </button>
+                <div
+                  key={s.id}
+                  data-row-menu={menuOpen ? '1' : undefined}
+                  className="mb-0.5"
+                >
+                  {renaming ? (
+                    <RenameInput
+                      value={renameValue}
+                      onChange={setRenameValue}
+                      onCommit={commitRename}
+                      onCancel={cancelRename}
+                      icon={
+                        <IconFolder className="shrink-0 text-fog-300" small />
+                      }
+                    />
+                  ) : (
+                    <div className="group relative flex items-center rounded-md hover:bg-white/[0.04]">
+                      <button
+                        onClick={() => toggleSession(s.id)}
+                        className="flex-1 min-w-0 px-2.5 py-1.5 text-left text-sm flex items-center gap-2 text-fog-100"
+                      >
+                        <Caret open={isOpen} className="text-fog-400" />
+                        <IconFolder className="shrink-0 text-fog-300" small />
+                        <span className="truncate flex-1">
+                          {sessionDisplayName(s)}
+                        </span>
+                        {fileCount > 0 && (
+                          <span className="text-[10px] text-fog-500">
+                            {fileCount}
+                          </span>
+                        )}
+                      </button>
+                      <button
+                        data-row-menu="1"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setRowMenuKey(menuOpen ? null : rk)
+                        }}
+                        className={`shrink-0 mr-1 w-6 h-6 rounded hover:bg-white/[0.08] text-fog-300 flex items-center justify-center ${
+                          menuOpen
+                            ? 'opacity-100'
+                            : 'opacity-0 group-hover:opacity-100 focus:opacity-100'
+                        }`}
+                        aria-label="More"
+                      >
+                        <DotsIcon />
+                      </button>
+                      {menuOpen && (
+                        <RowMenu
+                          items={[
+                            {
+                              label: 'Rename',
+                              icon: <IconPencil />,
+                              onClick: () =>
+                                startRename(rk, sessionDisplayName(s)),
+                            },
+                            {
+                              label: 'Delete',
+                              icon: <IconTrash />,
+                              danger: true,
+                              onClick: () => deleteSession(s.id),
+                            },
+                          ]}
+                        />
+                      )}
+                    </div>
+                  )}
                   {isOpen && (
                     <div className="pl-3 pt-0.5">
                       {threads.map((t) => {
@@ -1023,16 +1178,22 @@ export default function AppPage() {
                 {activeKind === 'project' ? 'Project files' : 'Files'}
               </span>
               <div className="flex flex-wrap gap-1.5">
-                {activeFiles.slice(0, 12).map((f) => (
-                  <span
-                    key={f}
-                    className="chip text-[11px] py-0.5"
-                    title={f}
-                  >
-                    <IconFile />
-                    {f.split('/').pop()}
-                  </span>
-                ))}
+                {activeFiles.slice(0, 12).map((f) => {
+                  const display = f.split('/').pop() || f
+                  return (
+                    <button
+                      key={f}
+                      onClick={() =>
+                        activeSession && openFileViewer(activeSession, display)
+                      }
+                      className="chip text-[11px] py-0.5 hover:bg-white/[0.08] cursor-pointer"
+                      title={`Open ${display}`}
+                    >
+                      <IconFile />
+                      {display}
+                    </button>
+                  )
+                })}
                 {activeFiles.length > 12 && (
                   <span className="chip text-[11px] py-0.5">
                     +{activeFiles.length - 12} more
@@ -1053,7 +1214,12 @@ export default function AppPage() {
                 .filter(
                   (m) =>
                     m.role !== 'tool' &&
-                    !(m.role === 'assistant' && !m.content?.trim()),
+                    !(m.role === 'assistant' && !m.content?.trim()) &&
+                    !(
+                      m.role === 'assistant' &&
+                      m.tool_calls &&
+                      m.tool_calls.length > 0
+                    ),
                 )
                 .map((m, i) => (
                   <MessageBlock key={i} msg={m} />
@@ -1201,6 +1367,50 @@ export default function AppPage() {
             setProjectModalOpen(false)
             await createProject(name, files)
           }}
+        />
+      )}
+
+      {/* Centered confirm dialog */}
+      {confirmDialog && (
+        <ConfirmDialog
+          title={confirmDialog.title}
+          message={confirmDialog.message}
+          confirmLabel={confirmDialog.confirmLabel}
+          danger={confirmDialog.danger}
+          onCancel={() => setConfirmDialog(null)}
+          onConfirm={() => {
+            const fn = confirmDialog.onConfirm
+            setConfirmDialog(null)
+            fn()
+          }}
+        />
+      )}
+
+      {/* Centered prompt dialog */}
+      {promptDialog && (
+        <PromptDialog
+          title={promptDialog.title}
+          message={promptDialog.message}
+          placeholder={promptDialog.placeholder}
+          initialValue={promptDialog.initialValue}
+          confirmLabel={promptDialog.confirmLabel}
+          onCancel={() => setPromptDialog(null)}
+          onConfirm={(value) => {
+            const fn = promptDialog.onConfirm
+            setPromptDialog(null)
+            fn(value)
+          }}
+        />
+      )}
+
+      {/* File viewer side panel */}
+      {viewerFile && (
+        <FileViewer
+          name={viewerFile.name}
+          content={viewerContent}
+          loading={viewerLoading}
+          error={viewerError}
+          onClose={() => setViewerFile(null)}
         />
       )}
 
@@ -1738,6 +1948,241 @@ function RenameInput({
         onBlur={onCommit}
         className="flex-1 min-w-0 bg-ink-300 border border-lineStrong rounded px-2 py-1 text-[13px] outline-none"
       />
+    </div>
+  )
+}
+
+/* ─────────────────────────── confirm / prompt dialogs ─────────────────────────── */
+
+function ModalShell({
+  onClose,
+  children,
+}: {
+  onClose: () => void
+  children: ReactNode
+}) {
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+  return (
+    <div
+      className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 backdrop-blur-sm animate-float-up"
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="w-[min(92vw,420px)] rounded-2xl border border-lineStrong bg-ink-200 p-6 shadow-2xl shadow-black/60"
+      >
+        {children}
+      </div>
+    </div>
+  )
+}
+
+function ConfirmDialog({
+  title,
+  message,
+  confirmLabel = 'Confirm',
+  danger,
+  onCancel,
+  onConfirm,
+}: {
+  title: string
+  message: string
+  confirmLabel?: string
+  danger?: boolean
+  onCancel: () => void
+  onConfirm: () => void
+}) {
+  return (
+    <ModalShell onClose={onCancel}>
+      <h3 className="text-base font-medium text-white mb-2">{title}</h3>
+      <p className="text-sm text-fog-300 leading-relaxed mb-5">{message}</p>
+      <div className="flex justify-end gap-2">
+        <button
+          onClick={onCancel}
+          className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-white/[0.06]"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={onConfirm}
+          autoFocus
+          className={`px-4 py-2 rounded-lg text-sm font-medium ${
+            danger
+              ? 'bg-red-500/90 hover:bg-red-500 text-white'
+              : 'bg-white text-black hover:bg-white/90'
+          }`}
+        >
+          {confirmLabel}
+        </button>
+      </div>
+    </ModalShell>
+  )
+}
+
+function PromptDialog({
+  title,
+  message,
+  placeholder,
+  initialValue = '',
+  confirmLabel = 'OK',
+  onCancel,
+  onConfirm,
+}: {
+  title: string
+  message?: string
+  placeholder?: string
+  initialValue?: string
+  confirmLabel?: string
+  onCancel: () => void
+  onConfirm: (value: string) => void
+}) {
+  const [value, setValue] = useState(initialValue)
+  const ref = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    ref.current?.focus()
+    ref.current?.select()
+  }, [])
+  return (
+    <ModalShell onClose={onCancel}>
+      <h3 className="text-base font-medium text-white mb-2">{title}</h3>
+      {message && (
+        <p className="text-sm text-fog-300 leading-relaxed mb-3">{message}</p>
+      )}
+      <input
+        ref={ref}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault()
+            if (value.trim()) onConfirm(value)
+          }
+        }}
+        placeholder={placeholder}
+        className="w-full bg-ink-300 border border-lineStrong rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-white/40 mb-5"
+      />
+      <div className="flex justify-end gap-2">
+        <button
+          onClick={onCancel}
+          className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-white/[0.06]"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={() => onConfirm(value)}
+          disabled={!value.trim()}
+          className="px-4 py-2 rounded-lg text-sm font-medium bg-white text-black hover:bg-white/90 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {confirmLabel}
+        </button>
+      </div>
+    </ModalShell>
+  )
+}
+
+/* ─────────────────────────── file viewer ─────────────────────────── */
+
+function FileViewer({
+  name,
+  content,
+  loading,
+  error,
+  onClose,
+}: {
+  name: string
+  content: string
+  loading: boolean
+  error: string | null
+  onClose: () => void
+}) {
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const lines = content ? content.split('\n') : []
+  const padWidth = String(Math.max(lines.length, 1)).length
+
+  async function copyAll() {
+    try {
+      await navigator.clipboard.writeText(content)
+    } catch {
+      // best-effort
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-[70] flex justify-end bg-black/40"
+      onClick={onClose}
+    >
+      <aside
+        onClick={(e) => e.stopPropagation()}
+        className="w-[min(720px,90vw)] h-full bg-ink-200 border-l border-lineStrong flex flex-col shadow-2xl shadow-black/60"
+      >
+        <header className="flex items-center justify-between px-4 py-3 border-b border-line">
+          <div className="flex items-center gap-2 min-w-0">
+            <IconFile />
+            <span className="text-sm text-white truncate">{name}</span>
+            {!loading && !error && (
+              <span className="text-[11px] text-fog-500 shrink-0 ml-2">
+                {lines.length} line{lines.length === 1 ? '' : 's'}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              onClick={copyAll}
+              disabled={loading || !!error}
+              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-white/[0.06] disabled:opacity-40"
+            >
+              Copy
+            </button>
+            <button
+              onClick={onClose}
+              className="w-7 h-7 rounded hover:bg-white/[0.06] text-fog-300 flex items-center justify-center"
+              aria-label="Close"
+            >
+              ✕
+            </button>
+          </div>
+        </header>
+
+        <div className="flex-1 overflow-auto">
+          {loading && (
+            <div className="p-6 text-sm text-fog-400">Loading…</div>
+          )}
+          {error && (
+            <div className="p-6 text-sm text-red-400">Error: {error}</div>
+          )}
+          {!loading && !error && (
+            <pre className="m-0 text-[12.5px] leading-[1.55] font-mono">
+              {lines.map((line, i) => (
+                <div key={i} className="flex">
+                  <span
+                    className="select-none pl-3 pr-3 text-right text-fog-500 tabular-nums shrink-0"
+                    style={{ minWidth: `${padWidth + 2}ch` }}
+                  >
+                    {i + 1}
+                  </span>
+                  <span className="whitespace-pre text-fog-100 pr-4">
+                    {line || ' '}
+                  </span>
+                </div>
+              ))}
+            </pre>
+          )}
+        </div>
+      </aside>
     </div>
   )
 }

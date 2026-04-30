@@ -417,6 +417,44 @@ def delete_file(
     return {"ok": True}
 
 
+MAX_VIEW_BYTES = 1_000_000  # 1 MB cap for the in-browser viewer
+
+
+@app.get("/sessions/{session_id}/files/{filename}")
+def read_file_content(
+    session_id: str,
+    filename: str,
+    user_id: str = Depends(get_current_user),
+):
+    with app.state.pool.connection() as conn:
+        _verify_session(conn, user_id, session_id)
+
+    name = _safe_filename(filename)
+    sdir = _session_dir(user_id, session_id)
+    target = (sdir / name).resolve()
+    if sdir not in target.parents:
+        raise HTTPException(400, "Invalid path")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, "File not found")
+    size = target.stat().st_size
+    truncated = size > MAX_VIEW_BYTES
+    try:
+        if truncated:
+            with target.open("rb") as f:
+                data = f.read(MAX_VIEW_BYTES)
+            content = data.decode("utf-8", errors="replace")
+        else:
+            content = target.read_text("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(415, "Not a UTF-8 text file")
+    return {
+        "name": name,
+        "size": size,
+        "truncated": truncated,
+        "content": content,
+    }
+
+
 @app.post("/title")
 def make_title(req: TitleRequest, _user_id: str = Depends(get_current_user)):
     """Generate a 3–7 word topic title from the given text. Best-effort —

@@ -15,18 +15,25 @@ A full-stack LangGraph agent with per-user authentication, persistent multi-proj
 
 ```
 agent/
-├── api.py                # FastAPI app, auth, sessions/threads/messages, /chat
-├── Tools/                # Tools registered with the agent
-│   ├── __init__.py       # all_tools registry
-│   ├── weather_tool.py
-│   └── calculator_tool.py
-├── ui/                   # Next.js frontend
-│   └── app/
-│       ├── page.tsx      # main chat UI
-│       ├── login/        # login + signup
-│       └── globals.css   # markdown + theme styles
-├── requirements.txt
-└── .env                  # backend secrets (not committed)
+├── backend/                # All Python / FastAPI code
+│   ├── api.py              # FastAPI app, auth, sessions/threads/messages, /chat
+│   ├── agent_callbacks.py  # LangGraph callbacks
+│   ├── Tools/              # Tools registered with the agent
+│   │   ├── __init__.py     # all_tools registry
+│   │   ├── weather_tool.py
+│   │   └── calculator_tool.py
+│   ├── requirements.txt
+│   ├── pyproject.toml
+│   ├── .env.example
+│   └── .env                # backend secrets (not committed)
+├── ui/                     # Next.js frontend
+│   ├── app/
+│   │   ├── page.tsx        # main chat UI
+│   │   ├── app/page.tsx    # chat workspace
+│   │   ├── login/          # login + signup
+│   │   └── globals.css     # markdown + theme styles
+│   └── lib/                # shared client utilities
+└── README.md
 ```
 
 ## Prerequisites
@@ -40,7 +47,7 @@ agent/
 
 ### 1. Backend
 
-Create `.env` in the project root:
+Create `backend/.env`:
 
 ```env
 OPENROUTER_API_KEY=sk-or-v1-...
@@ -53,12 +60,12 @@ LANGSMITH_API_KEY=lsv2_pt_...
 LANGSMITH_PROJECT=FYP
 ```
 
-Install dependencies into a virtualenv:
+Install dependencies into a virtualenv (kept at the project root):
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r backend/requirements.txt
 ```
 
 ### 2. Database schema
@@ -133,6 +140,8 @@ Open two terminals.
 
 ```powershell
 .venv\Scripts\activate
+cd backend
+uv pip install -r requirements.txt
 uvicorn api:app --reload --port 8000
 ```
 
@@ -157,14 +166,14 @@ Then open http://localhost:3000.
 
 ## Adding a tool
 
-1. Create `Tools/<name>_tool.py` with a `@tool`-decorated function.
-2. Import it in [Tools/__init__.py](Tools/__init__.py) and add it to `all_tools`.
+1. Create `backend/Tools/<name>_tool.py` with a `@tool`-decorated function.
+2. Import it in [backend/Tools/__init__.py](backend/Tools/__init__.py) and add it to `all_tools`.
 3. Restart the backend.
 
 ## Troubleshooting
 
-- **`KeyError: 'SUPABASE_DB_URL'` on startup** — `.env` is missing or not in the project root.
+- **`KeyError: 'SUPABASE_DB_URL'` on startup** — `backend/.env` is missing.
 - **`ModuleNotFoundError: No module named 'jwt'`** — venv isn't activated. Look for `(agent)` in your prompt before running `uvicorn`.
 - **`supabaseUrl is required` in the browser** — `ui/.env.local` is missing.
-- **`ECONNREFUSED 127.0.0.1:8000`** — backend isn't running.
+- **`ECONNREFUSED 127.0.0.1:8000`** — backend isn't running, or you ran `uvicorn` from the wrong directory (run it from `backend/`).
 - **HTTP 429 from the model** — OpenRouter free-tier daily quota (200 req/day, shared across all `:free` models). Wait or add credit.
