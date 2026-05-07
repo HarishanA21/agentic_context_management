@@ -1,23 +1,19 @@
-"""Path utilities shared by the project-file tools.
+"""Helpers shared by the project-file tools.
 
 The /chat endpoint injects user_id and session_id into the runnable config so
 file tools don't need the model to pass them. We use those to scope every
-file operation to backend/uploads/<user_id>/<session_id>/.
+storage operation to <user_id>/<session_id>/ in the Supabase Storage bucket.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from langchain_core.runnables import RunnableConfig
 
 
-UPLOADS_DIR = Path(os.environ.get("UPLOADS_DIR", "uploads")).resolve()
-
-
-def session_dir(config: RunnableConfig) -> Path:
-    """Resolve (and create) the upload dir for the current session."""
+def get_session_ids(config: RunnableConfig) -> tuple[str, str]:
+    """Pull the JWT-verified user_id and session_id from the chat config."""
     cfg = (config or {}).get("configurable", {}) or {}
     user_id = cfg.get("user_id")
     session_id = cfg.get("session_id")
@@ -25,11 +21,7 @@ def session_dir(config: RunnableConfig) -> Path:
         raise ValueError(
             "Tool called outside a /chat context — user_id/session_id missing."
         )
-    d = (UPLOADS_DIR / str(user_id) / str(session_id)).resolve()
-    if UPLOADS_DIR not in d.parents and d != UPLOADS_DIR:
-        raise ValueError("Invalid session path.")
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return str(user_id), str(session_id)
 
 
 def safe_name(name: str) -> str:

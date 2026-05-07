@@ -1,7 +1,8 @@
 from langchain.tools import tool
 from langchain_core.runnables import RunnableConfig
 
-from Tools._paths import safe_name, session_dir
+from Tools._paths import get_session_ids, safe_name
+from storage import file_key, get_bucket
 
 MAX_WRITE_BYTES = 1_000_000  # 1 MB cap
 
@@ -19,7 +20,7 @@ def write_project_file(
         content: The UTF-8 text content to write.
     """
     try:
-        sdir = session_dir(config)
+        user_id, session_id = get_session_ids(config)
         name = safe_name(filename)
     except ValueError as e:
         return f"Error: {e}"
@@ -31,13 +32,16 @@ def write_project_file(
     if len(payload) > MAX_WRITE_BYTES:
         return f"Error: content exceeds {MAX_WRITE_BYTES // 1024} KB limit."
 
-    target = (sdir / name).resolve()
-    if sdir not in target.parents:
-        return "Error: invalid path."
-
     try:
-        target.write_bytes(payload)
-    except OSError as e:
+        get_bucket().upload(
+            path=file_key(user_id, session_id, name),
+            file=payload,
+            file_options={
+                "content-type": "text/plain; charset=utf-8",
+                "upsert": "true",
+            },
+        )
+    except Exception as e:
         return f"Error writing file: {e}"
 
     return f"Wrote {len(payload)} bytes to {name}."

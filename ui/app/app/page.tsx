@@ -168,6 +168,11 @@ export default function AppPage() {
   const [viewerContent, setViewerContent] = useState<string>('')
   const [viewerLoading, setViewerLoading] = useState(false)
   const [viewerError, setViewerError] = useState<string | null>(null)
+  // Files picked but not yet uploaded — uploaded together with the next send.
+  const [pendingFiles, setPendingFiles] = useState<File[]>([])
+  // GitHub PAT connection state
+  const [githubModalOpen, setGithubModalOpen] = useState(false)
+  const [githubUsername, setGithubUsername] = useState<string | null>(null)
   // Composer "+" attach menu
   const [composerMenuOpen, setComposerMenuOpen] = useState(false)
   const [uploading, setUploading] = useState(false)
@@ -193,6 +198,7 @@ export default function AppPage() {
       setThreadNames(loadNameMap(THREAD_NAMES_KEY))
       setReady(true)
       loadSessions()
+      loadGithubStatus()
     })
     const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
       if (!session) router.replace('/login')
@@ -425,41 +431,22 @@ export default function AppPage() {
     }
   }
 
-  async function uploadFilesToSession(list: FileList | null) {
-    if (!list || !list.length || !activeSession) return
-    const sid = activeSession
-    const fd = new FormData()
-    for (const f of Array.from(list)) fd.append('files', f, f.name)
+  /** Stage files in the composer without uploading. They'll be uploaded
+   *  together with the next send. */
+  function addPendingFiles(list: FileList | null) {
+    if (!list || !list.length) return
+    // Snapshot the FileList synchronously — the input's value gets reset
+    // right after this returns, which can clear `list` in some browsers.
+    const incoming = Array.from(list)
+    setPendingFiles((prev) => {
+      const seen = new Set(prev.map((f) => f.name))
+      const fresh = incoming.filter((f) => !seen.has(f.name))
+      return [...prev, ...fresh]
+    })
+  }
 
-    setUploading(true)
-    try {
-      const r = await authFetch(`/api/sessions/${sid}/files`, {
-        method: 'POST',
-        body: fd,
-      })
-      if (!r.ok) {
-        let msg = `${r.status} ${r.statusText}`
-        try {
-          const body = await r.json()
-          if (body?.detail) msg = body.detail
-        } catch {}
-        setToast(`Upload failed: ${msg.slice(0, 60)}`)
-        return
-      }
-      const data = await r.json()
-      const names: string[] = (data?.saved || []).map((s: any) => s.name)
-      const existing = filesMap[sid] || []
-      const merged = Array.from(new Set([...existing, ...names]))
-      setFilesMap((prev) => ({ ...prev, [sid]: merged }))
-      saveFiles(sid, merged)
-      setToast(
-        `Uploaded ${names.length} file${names.length === 1 ? '' : 's'}`,
-      )
-    } catch (e: any) {
-      setToast(`Upload failed: ${e?.message ?? 'network error'}`)
-    } finally {
-      setUploading(false)
-    }
+  function removePendingFile(name: string) {
+    setPendingFiles((prev) => prev.filter((f) => f.name !== name))
   }
 
   /** Pull the canonical file list for a session from the backend and merge
@@ -535,6 +522,37 @@ export default function AppPage() {
     const r = await authFetch('/api/sessions')
     if (!r.ok) return
     setSessions(await r.json())
+  }
+  async function loadGithubStatus() {
+    try {
+      const r = await authFetch('/api/github/status')
+      if (!r.ok) return
+      const data = await r.json()
+      setGithubUsername(data.connected ? data.username : null)
+    } catch {
+      // ignore — non-critical
+    }
+  }
+  async function saveGithubToken(token: string): Promise<string | null> {
+    const r = await authFetch('/api/github/token', {
+      method: 'POST',
+      body: JSON.stringify({ token }),
+    })
+    if (!r.ok) {
+      let detail = `${r.status} ${r.statusText}`
+      try {
+        const body = await r.json()
+        if (body?.detail) detail = body.detail
+      } catch {}
+      return detail // error message
+    }
+    const data = await r.json()
+    setGithubUsername(data.username)
+    return null // success
+  }
+  async function disconnectGithub() {
+    await authFetch('/api/github/token', { method: 'DELETE' })
+    setGithubUsername(null)
   }
   async function loadThreads(sid: string) {
     const r = await authFetch(`/api/sessions/${sid}/threads`)
@@ -645,10 +663,48 @@ export default function AppPage() {
     const sid = activeSession
     const tid = activeThread
     const msg = input.trim()
+    const filesToUpload = pendingFiles
     const isFirstMessage = messages.length === 0
     setInput('')
+    setPendingFiles([])
     setSending(true)
     setMessages((prev) => [...prev, { role: 'user', content: msg }])
+
+    // Upload any pending attachments BEFORE the chat request so the agent
+    // can find them via list_project_files / read_project_file.
+    let attachedFiles: string[] = []
+    if (filesToUpload.length) {
+      setUploading(true)
+      const fd = new FormData()
+      for (const f of filesToUpload) fd.append('files', f, f.name)
+      try {
+        const r = await authFetch(`/api/sessions/${sid}/files`, {
+          method: 'POST',
+          body: fd,
+        })
+        if (r.ok) {
+          const data = await r.json()
+          const names: string[] = (data?.saved || []).map((s: any) => s.name)
+          attachedFiles = names
+          // Reflect in the chip strip immediately.
+          const existing = filesMap[sid] || []
+          const merged = Array.from(new Set([...existing, ...names]))
+          setFilesMap((prev) => ({ ...prev, [sid]: merged }))
+          saveFiles(sid, merged)
+        } else {
+          let detail = `${r.status} ${r.statusText}`
+          try {
+            const body = await r.json()
+            if (body?.detail) detail = body.detail
+          } catch {}
+          setToast(`Upload failed: ${detail.slice(0, 80)}`)
+        }
+      } catch (e: any) {
+        setToast(`Upload failed: ${e?.message ?? 'network error'}`)
+      } finally {
+        setUploading(false)
+      }
+    }
 
     // Auto-title on the first exchange. Show the heuristic title immediately
     // for snappy sidebar feedback, then upgrade to a model-summarized title
@@ -685,7 +741,12 @@ export default function AppPage() {
     let chatStatus: number | null = null
     authFetch('/api/chat', {
       method: 'POST',
-      body: JSON.stringify({ session_id: sid, thread_id: tid, message: msg }),
+      body: JSON.stringify({
+        session_id: sid,
+        thread_id: tid,
+        message: msg,
+        attached_files: attachedFiles,
+      }),
     })
       .then(async (r) => {
         chatStatus = r.status
@@ -1123,6 +1184,18 @@ export default function AppPage() {
                 Back to home
               </Link>
               <button
+                onClick={() => {
+                  setUserMenuOpen(false)
+                  setGithubModalOpen(true)
+                }}
+                className="w-full text-left px-3 py-2 rounded-md hover:bg-white/[0.06] flex items-center justify-between"
+              >
+                <span>GitHub</span>
+                <span className="text-[11px] text-fog-400 truncate ml-2">
+                  {githubUsername ? `@${githubUsername}` : 'Not connected'}
+                </span>
+              </button>
+              <button
                 onClick={signOut}
                 className="w-full text-left px-3 py-2 rounded-md hover:bg-white/[0.06]"
               >
@@ -1240,6 +1313,28 @@ export default function AppPage() {
               }}
               className="rounded-3xl border border-line bg-ink-100/80 hover:border-lineStrong focus-within:border-lineStrong transition-colors px-3 py-2"
             >
+              {pendingFiles.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 px-1.5 pb-2">
+                  {pendingFiles.map((f) => (
+                    <span
+                      key={f.name}
+                      className="chip text-[11px] py-0.5 pr-1 group"
+                      title={f.name}
+                    >
+                      <IconFile />
+                      <span className="max-w-[180px] truncate">{f.name}</span>
+                      <button
+                        type="button"
+                        onClick={() => removePendingFile(f.name)}
+                        className="ml-1 w-4 h-4 rounded-full text-fog-400 hover:text-white hover:bg-white/[0.1] flex items-center justify-center text-[10px]"
+                        aria-label={`Remove ${f.name}`}
+                      >
+                        ✕
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
               <div className="flex items-end gap-2">
                 <div className="relative shrink-0" ref={composerMenuRef}>
                   <button
@@ -1301,7 +1396,7 @@ export default function AppPage() {
                     multiple
                     className="hidden"
                     onChange={(e) => {
-                      uploadFilesToSession(e.target.files)
+                      addPendingFiles(e.target.files)
                       e.target.value = ''
                     }}
                   />
@@ -1312,7 +1407,7 @@ export default function AppPage() {
                     accept="image/*"
                     className="hidden"
                     onChange={(e) => {
-                      uploadFilesToSession(e.target.files)
+                      addPendingFiles(e.target.files)
                       e.target.value = ''
                     }}
                   />
@@ -1411,6 +1506,19 @@ export default function AppPage() {
           loading={viewerLoading}
           error={viewerError}
           onClose={() => setViewerFile(null)}
+        />
+      )}
+
+      {/* GitHub connection modal */}
+      {githubModalOpen && (
+        <GithubConnectModal
+          username={githubUsername}
+          onClose={() => setGithubModalOpen(false)}
+          onSave={saveGithubToken}
+          onDisconnect={async () => {
+            await disconnectGithub()
+            setToast('GitHub disconnected')
+          }}
         />
       )}
 
@@ -2184,5 +2292,114 @@ function FileViewer({
         </div>
       </aside>
     </div>
+  )
+}
+
+/* ─────────────────────────── GitHub connect ─────────────────────────── */
+
+function GithubConnectModal({
+  username,
+  onClose,
+  onSave,
+  onDisconnect,
+}: {
+  username: string | null
+  onClose: () => void
+  onSave: (token: string) => Promise<string | null>
+  onDisconnect: () => Promise<void>
+}) {
+  const [token, setToken] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  async function handleSave() {
+    if (!token.trim()) return
+    setSaving(true)
+    setError(null)
+    const err = await onSave(token.trim())
+    setSaving(false)
+    if (err) {
+      setError(err)
+    } else {
+      setToken('')
+      onClose()
+    }
+  }
+
+  return (
+    <ModalShell onClose={onClose}>
+      <h3 className="text-base font-medium text-white mb-2">GitHub</h3>
+      {username ? (
+        <>
+          <p className="text-sm text-fog-300 leading-relaxed mb-4">
+            Connected as{' '}
+            <span className="text-white font-medium">@{username}</span>. The
+            agent can now read, push to, and revert files in repos you grant
+            access to.
+          </p>
+          <div className="flex justify-end gap-2">
+            <button
+              onClick={onClose}
+              className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-white/[0.06]"
+            >
+              Close
+            </button>
+            <button
+              onClick={async () => {
+                await onDisconnect()
+                onClose()
+              }}
+              className="px-4 py-2 rounded-lg text-sm font-medium bg-red-500/90 hover:bg-red-500 text-white"
+            >
+              Disconnect
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          <p className="text-sm text-fog-300 leading-relaxed mb-3">
+            Paste a Personal Access Token (PAT). Generate one at{' '}
+            <a
+              href="https://github.com/settings/tokens"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline text-fog-100"
+            >
+              github.com/settings/tokens
+            </a>{' '}
+            with the <code className="text-fog-100">repo</code> scope.
+          </p>
+          <input
+            type="password"
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && token.trim()) handleSave()
+            }}
+            placeholder="ghp_..."
+            className="w-full bg-ink-300 border border-lineStrong rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-white/40 mb-3 font-mono"
+          />
+          {error && (
+            <p className="text-sm text-red-400 mb-3">{error}</p>
+          )}
+          <div className="flex justify-end gap-2">
+            <button
+              onClick={onClose}
+              disabled={saving}
+              className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-white/[0.06] disabled:opacity-40"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleSave}
+              disabled={saving || !token.trim()}
+              className="px-4 py-2 rounded-lg text-sm font-medium bg-white text-black hover:bg-white/90 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {saving ? 'Verifying…' : 'Connect'}
+            </button>
+          </div>
+        </>
+      )}
+    </ModalShell>
   )
 }

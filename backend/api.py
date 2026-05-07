@@ -18,6 +18,8 @@ from pydantic import BaseModel
 
 from Tools import all_tools
 from agent_callbacks import AgentLogger
+from storage import file_key, get_bucket, is_not_found, session_prefix
+import github_client
 
 load_dotenv()
 
@@ -27,18 +29,7 @@ JWKS_URL = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
 _jwks_client = PyJWKClient(JWKS_URL)
 
 # ── File uploads ────────────────────────────────────────────────────────────
-UPLOADS_DIR = Path(os.environ.get("UPLOADS_DIR", "uploads")).resolve()
-UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB per file
-
-
-def _session_dir(user_id: str, session_id: str) -> Path:
-    d = (UPLOADS_DIR / user_id / session_id).resolve()
-    # Belt-and-suspenders: refuse if user_id/session_id smuggled traversal in.
-    if UPLOADS_DIR not in d.parents and d != UPLOADS_DIR:
-        raise HTTPException(400, "Invalid session path")
-    d.mkdir(parents=True, exist_ok=True)
-    return d
 
 
 def _safe_filename(name: str) -> str:
@@ -81,10 +72,15 @@ class ChatRequest(BaseModel):
     session_id: str
     thread_id: str
     message: str
+    attached_files: List[str] = []
 
 
 class TitleRequest(BaseModel):
     text: str
+
+
+class GithubTokenRequest(BaseModel):
+    token: str
 
 
 _saver_cm = None
@@ -351,27 +347,29 @@ async def upload_files(
     with app.state.pool.connection() as conn:
         _verify_session(conn, user_id, session_id)
 
-    sdir = _session_dir(user_id, session_id)
+    bucket = get_bucket()
     saved = []
     for f in files:
         name = _safe_filename(f.filename or "unnamed")
-        target = sdir / name
-        size = 0
-        with target.open("wb") as out:
-            while True:
-                chunk = await f.read(64 * 1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > MAX_UPLOAD_BYTES:
-                    out.close()
-                    target.unlink(missing_ok=True)
-                    raise HTTPException(
-                        413,
-                        f"{name} exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit",
-                    )
-                out.write(chunk)
-        saved.append({"name": name, "size": size})
+        data = await f.read()
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                413,
+                f"{name} exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit",
+            )
+        key = file_key(user_id, session_id, name)
+        try:
+            bucket.upload(
+                path=key,
+                file=data,
+                file_options={
+                    "content-type": f.content_type or "application/octet-stream",
+                    "upsert": "true",
+                },
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Upload failed for {name}: {e}")
+        saved.append({"name": name, "size": len(data)})
     return {"saved": saved}
 
 
@@ -383,18 +381,24 @@ def list_files(
     with app.state.pool.connection() as conn:
         _verify_session(conn, user_id, session_id)
 
-    sdir = _session_dir(user_id, session_id)
+    bucket = get_bucket()
+    try:
+        items = bucket.list(session_prefix(user_id, session_id))
+    except Exception as e:
+        raise HTTPException(500, f"List failed: {e}")
     out = []
-    for p in sorted(sdir.iterdir()):
-        if p.is_file():
-            stat = p.stat()
-            out.append(
-                {
-                    "name": p.name,
-                    "size": stat.st_size,
-                    "modified_at": stat.st_mtime,
-                }
-            )
+    for it in items or []:
+        # Storage returns a placeholder row with id=None for empty folders.
+        if not it.get("id"):
+            continue
+        meta = it.get("metadata") or {}
+        out.append(
+            {
+                "name": it.get("name"),
+                "size": meta.get("size", 0),
+                "modified_at": it.get("updated_at") or it.get("created_at"),
+            }
+        )
     return out
 
 
@@ -408,12 +412,12 @@ def delete_file(
         _verify_session(conn, user_id, session_id)
 
     name = _safe_filename(filename)
-    sdir = _session_dir(user_id, session_id)
-    target = (sdir / name).resolve()
-    if sdir not in target.parents:
-        raise HTTPException(400, "Invalid path")
-    if target.exists():
-        target.unlink()
+    bucket = get_bucket()
+    try:
+        bucket.remove([file_key(user_id, session_id, name)])
+    except Exception as e:
+        if not is_not_found(e):
+            raise HTTPException(500, f"Delete failed: {e}")
     return {"ok": True}
 
 
@@ -430,21 +434,19 @@ def read_file_content(
         _verify_session(conn, user_id, session_id)
 
     name = _safe_filename(filename)
-    sdir = _session_dir(user_id, session_id)
-    target = (sdir / name).resolve()
-    if sdir not in target.parents:
-        raise HTTPException(400, "Invalid path")
-    if not target.exists() or not target.is_file():
-        raise HTTPException(404, "File not found")
-    size = target.stat().st_size
-    truncated = size > MAX_VIEW_BYTES
+    bucket = get_bucket()
     try:
-        if truncated:
-            with target.open("rb") as f:
-                data = f.read(MAX_VIEW_BYTES)
-            content = data.decode("utf-8", errors="replace")
-        else:
-            content = target.read_text("utf-8")
+        data: bytes = bucket.download(file_key(user_id, session_id, name))
+    except Exception as e:
+        if is_not_found(e):
+            raise HTTPException(404, "File not found")
+        raise HTTPException(500, f"Download failed: {e}")
+    size = len(data)
+    truncated = size > MAX_VIEW_BYTES
+    if truncated:
+        data = data[:MAX_VIEW_BYTES]
+    try:
+        content = data.decode("utf-8")
     except UnicodeDecodeError:
         raise HTTPException(415, "Not a UTF-8 text file")
     return {
@@ -486,6 +488,40 @@ def make_title(req: TitleRequest, _user_id: str = Depends(get_current_user)):
         if "429" in msg or "rate" in msg.lower():
             raise HTTPException(429, "Rate-limited")
         raise HTTPException(500, f"Title generation failed: {msg[:200]}")
+
+
+# ── GitHub integration ─────────────────────────────────────────────────────
+
+@app.get("/github/status")
+def github_status(user_id: str = Depends(get_current_user)):
+    """Returns the connected GitHub username, or null if not connected."""
+    with app.state.pool.connection() as conn:
+        username = github_client.get_username(conn, user_id)
+    return {"connected": bool(username), "username": username}
+
+
+@app.post("/github/token")
+def save_github_token(
+    req: GithubTokenRequest,
+    user_id: str = Depends(get_current_user),
+):
+    """Save and verify a GitHub Personal Access Token."""
+    token = (req.token or "").strip()
+    if not token:
+        raise HTTPException(400, "Token is empty")
+    try:
+        with app.state.pool.connection() as conn:
+            username = github_client.save_token(conn, user_id, token)
+    except ValueError as e:
+        raise HTTPException(401, str(e))
+    return {"connected": True, "username": username}
+
+
+@app.delete("/github/token")
+def delete_github_token(user_id: str = Depends(get_current_user)):
+    with app.state.pool.connection() as conn:
+        github_client.delete_token(conn, user_id)
+    return {"connected": False}
 
 
 @app.get("/sessions/{session_id}/threads/{thread_id}/history")
@@ -552,9 +588,22 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
         pre_msgs = (pre_state.values or {}).get("messages", []) if pre_state else []
         pre_count = len(pre_msgs)
 
+        # Build the actual prompt sent to the LLM. If the user just attached
+        # files, prepend a hint so the agent knows to read them with the
+        # read_project_file tool instead of asking what to explain.
+        if req.attached_files:
+            file_list = ", ".join(req.attached_files)
+            llm_input = (
+                f"[The user just attached the following files to this message: "
+                f"{file_list}. Use read_project_file to read them before "
+                f"answering.]\n\n{req.message}"
+            )
+        else:
+            llm_input = req.message
+
         try:
             result = agent.invoke(
-                {"messages": [HumanMessage(content=req.message)]},
+                {"messages": [HumanMessage(content=llm_input)]},
                 config=config,
             )
         except Exception as e:
@@ -574,8 +623,15 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
             with app.state.pool.connection() as conn:
                 for msg in new_messages:
                     if isinstance(msg, HumanMessage):
+                        # Store the original user-typed text in DB, not the
+                        # attachment-augmented prompt we sent to the LLM.
+                        stored = (
+                            req.message
+                            if msg.content == llm_input
+                            else msg.content
+                        )
                         _record_message(
-                            conn, req.session_id, req.thread_id, user_id, "user", msg.content
+                            conn, req.session_id, req.thread_id, user_id, "user", stored
                         )
                     elif isinstance(msg, AIMessage):
                         tool_calls = []
