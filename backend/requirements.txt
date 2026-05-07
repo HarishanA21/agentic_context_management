@@ -17,3 +17,10 @@ python-multipart
 pypdf
 python-docx
 openpyxl
+
+# Storage
+supabase
+
+# GitHub integration
+PyGithub
+

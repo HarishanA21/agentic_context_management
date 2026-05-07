@@ -11,7 +11,6 @@ wheels/
 
 # Env files
 .env
-.env.local
 ui/.env.local
 
 # Next.js / UI
@@ -21,7 +20,7 @@ ui/out/
 ui/next-env.d.ts
 
 uv.lock
-Tools
+
 
 # Uploaded user files (per-session storage)
 uploads/

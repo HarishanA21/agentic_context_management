@@ -17,20 +17,24 @@ Example: `feat: add calculator tool to agent registry`
 
 ```
 agent/
-├── api.py                # FastAPI entrypoint — all HTTP routes here
-├── Tools/                # All agent tools live here
-│   ├── __init__.py       # Must export all_tools
-│   └── *_tool.py         # One @tool-decorated function per file
+├── backend/              # All Python / FastAPI code
+│   ├── api.py            # FastAPI entrypoint — all HTTP routes here
+│   ├── agent_callbacks.py
+│   ├── Tools/            # All agent tools live here
+│   │   ├── __init__.py   # Must export all_tools
+│   │   └── *_tool.py     # One @tool-decorated function per file
+│   ├── requirements.txt  # Backend deps
+│   ├── pyproject.toml
+│   └── .env.example
 ├── ui/                   # Next.js app — never import backend code from here
 │   ├── app/              # App Router pages
 │   └── lib/              # Shared client utilities (e.g. authFetch)
-├── requirements.txt      # Backend deps
 └── README.md             # Always reflects current setup
 ```
 
 Rules:
-- New tools go in `Tools/<name>_tool.py` and **must** be added to `all_tools` in [Tools/__init__.py](../Tools/__init__.py).
-- Backend code never imports from `ui/`. Frontend never imports from Python.
+- New tools go in `backend/Tools/<name>_tool.py` and **must** be added to `all_tools` in [backend/Tools/__init__.py](../backend/Tools/__init__.py).
+- Backend code lives only under `backend/`. Frontend code lives only under `ui/`. Neither imports from the other.
 - All HTTP routes that touch user data **must** declare `user_id: str = Depends(get_current_user)` and scope DB queries by `user_id`.
 - LangGraph `thread_id` must always be prefixed with the user id: `f"{user_id}:{session_id}"`.
 - Frontend calls to `/api/*` (other than login) **must** go through `authFetch`, not raw `fetch`.
@@ -60,6 +64,7 @@ See the [README](../README.md#running) for full setup. TL;DR:
 ```powershell
 # Backend
 .venv\Scripts\activate
+cd backend
 uvicorn api:app --reload --port 8000
 
 # Frontend (separate terminal)
