@@ -173,6 +173,11 @@ export default function AppPage() {
   // GitHub PAT connection state
   const [githubModalOpen, setGithubModalOpen] = useState(false)
   const [githubUsername, setGithubUsername] = useState<string | null>(null)
+  // Context window viewer
+  const [contextOpen, setContextOpen] = useState(false)
+  const [contextData, setContextData] = useState<any>(null)
+  const [contextLoading, setContextLoading] = useState(false)
+  const [contextError, setContextError] = useState<string | null>(null)
   // Composer "+" attach menu
   const [composerMenuOpen, setComposerMenuOpen] = useState(false)
   const [uploading, setUploading] = useState(false)
@@ -290,7 +295,7 @@ export default function AppPage() {
     return override || s.name
   }
   function threadDisplayName(t: Thread): string {
-    return threadNames[t.id] || 'New thread'
+    return threadNames[t.id] || 'New chat'
   }
 
   /* ─── row actions ─── */
@@ -371,6 +376,50 @@ export default function AppPage() {
       setMessages([])
     }
     setToast('Deleted')
+  }
+
+  function deleteThread(sid: string, tid: string) {
+    setConfirmDialog({
+      title: 'Delete chat?',
+      message:
+        'This will permanently delete this chat. Files in the project stay. This cannot be undone.',
+      confirmLabel: 'Delete',
+      danger: true,
+      onConfirm: () => {
+        void doDeleteThread(sid, tid)
+      },
+    })
+  }
+
+  async function doDeleteThread(sid: string, tid: string) {
+    setRowMenuKey(null)
+    const r = await authFetch(`/api/sessions/${sid}/threads/${tid}`, {
+      method: 'DELETE',
+    })
+    if (!r.ok) {
+      setToast('Delete failed')
+      return
+    }
+    // Clean local state.
+    const newThreadNames = { ...threadNames }
+    delete newThreadNames[tid]
+    setThreadNames(newThreadNames)
+    localStorage.setItem(THREAD_NAMES_KEY, JSON.stringify(newThreadNames))
+
+    const remaining = (threadsMap[sid] || []).filter((t) => t.id !== tid)
+    setThreadsMap((prev) => ({ ...prev, [sid]: remaining }))
+
+    // If we just deleted the active thread, fall back to the next one
+    // in the same project, or clear the active selection entirely.
+    if (activeThread === tid) {
+      if (remaining[0]) {
+        selectThread(sid, remaining[0].id)
+      } else {
+        setActiveThread(null)
+        setMessages([])
+      }
+    }
+    setToast('Chat deleted')
   }
 
   function moveChatToProject(sid: string) {
@@ -554,6 +603,33 @@ export default function AppPage() {
     await authFetch('/api/github/token', { method: 'DELETE' })
     setGithubUsername(null)
   }
+
+  async function openContextViewer() {
+    if (!activeSession || !activeThread) return
+    setContextOpen(true)
+    setContextLoading(true)
+    setContextError(null)
+    setContextData(null)
+    try {
+      const r = await authFetch(
+        `/api/sessions/${activeSession}/threads/${activeThread}/context`,
+      )
+      if (!r.ok) {
+        let detail = `${r.status} ${r.statusText}`
+        try {
+          const body = await r.json()
+          if (body?.detail) detail = body.detail
+        } catch {}
+        setContextError(detail)
+        return
+      }
+      setContextData(await r.json())
+    } catch (e: any) {
+      setContextError(e?.message ?? 'Network error')
+    } finally {
+      setContextLoading(false)
+    }
+  }
   async function loadThreads(sid: string) {
     const r = await authFetch(`/api/sessions/${sid}/threads`)
     const data: Thread[] = await r.json()
@@ -568,7 +644,7 @@ export default function AppPage() {
   async function createProject(name: string, files: File[]) {
     const r = await authFetch('/api/sessions', {
       method: 'POST',
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, kind: 'project' }),
     })
     if (!r.ok) return
     const data = await r.json()
@@ -582,10 +658,28 @@ export default function AppPage() {
     saveKind(s.id, 'project')
     setKinds((prev) => ({ ...prev, [s.id]: 'project' }))
 
-    const names = files.map((f) => (f as any).webkitRelativePath || f.name)
-    if (names.length) {
-      saveFiles(s.id, names)
-      setFilesMap((prev) => ({ ...prev, [s.id]: names }))
+    // Actually upload the picked files to the backend bucket.
+    if (files.length) {
+      const fd = new FormData()
+      for (const f of files) fd.append('files', f, f.name)
+      try {
+        const upR = await authFetch(`/api/sessions/${s.id}/files`, {
+          method: 'POST',
+          body: fd,
+        })
+        if (!upR.ok) {
+          let detail = `${upR.status} ${upR.statusText}`
+          try {
+            const body = await upR.json()
+            if (body?.detail) detail = body.detail
+          } catch {}
+          setToast(`Some files failed: ${detail.slice(0, 80)}`)
+        }
+      } catch (e: any) {
+        setToast(`Upload failed: ${e?.message ?? 'network error'}`)
+      }
+      // Refresh from the backend so the sidebar reflects reality.
+      await refreshFiles(s.id)
     }
 
     setSessions((prev) => [s, ...prev])
@@ -624,7 +718,7 @@ export default function AppPage() {
     // No prompt — auto-name from the first message instead.
     const r = await authFetch(`/api/sessions/${sid}/threads`, {
       method: 'POST',
-      body: JSON.stringify({ name: 'New thread' }),
+      body: JSON.stringify({ name: 'New chat' }),
     })
     if (!r.ok) return
     const t: Thread = await r.json()
@@ -639,6 +733,8 @@ export default function AppPage() {
     } else {
       next.add(sid)
       if (!threadsMap[sid]) await loadThreads(sid)
+      // Sync files alongside threads so the sidebar list is fresh.
+      refreshFiles(sid)
     }
     setExpanded(next)
   }
@@ -1004,32 +1100,121 @@ export default function AppPage() {
                   )}
                   {isOpen && (
                     <div className="pl-3 pt-0.5">
+                      {/* FILES section — uploaded + agent-written */}
+                      {(filesMap[s.id]?.length ?? 0) > 0 && (
+                        <>
+                          <div className="px-2.5 pt-1 pb-0.5 text-[10px] uppercase tracking-widest text-fog-500">
+                            Files
+                          </div>
+                          {(filesMap[s.id] || []).map((f) => {
+                            const display = f.split('/').pop() || f
+                            return (
+                              <button
+                                key={`f:${f}`}
+                                onClick={() => openFileViewer(s.id, display)}
+                                className="w-full text-left px-2.5 py-1.5 rounded-md flex items-center gap-2.5 text-[13px] text-fog-200 hover:bg-white/[0.03] hover:text-white"
+                                title={`Open ${display}`}
+                              >
+                                <IconFile />
+                                <span className="truncate flex-1">{display}</span>
+                              </button>
+                            )
+                          })}
+                        </>
+                      )}
+
+                      {/* CHATS section */}
+                      <div className="px-2.5 pt-2 pb-0.5 text-[10px] uppercase tracking-widest text-fog-500">
+                        Chats
+                      </div>
                       {threads.map((t) => {
                         const active = activeThread === t.id
+                        const tk = `thread:${t.id}`
+                        const tRenaming = renameKey === tk
+                        const tMenuOpen = rowMenuKey === tk
                         return (
-                          <button
+                          <div
                             key={t.id}
-                            onClick={() => selectThread(s.id, t.id)}
-                            className={`group w-full text-left px-2.5 py-1.5 rounded-md flex items-center gap-2.5 text-[13px] transition ${
+                            data-row-menu={tMenuOpen ? '1' : undefined}
+                            className={`group relative rounded-md flex items-center text-[13px] ${
                               active
                                 ? 'bg-white/[0.07] text-white'
-                                : 'text-fog-200 hover:bg-white/[0.03] hover:text-white'
+                                : 'text-fog-200 hover:bg-white/[0.03]'
                             }`}
                           >
-                            <span
-                              className={`dot shrink-0 ${
-                                active ? 'bg-emerald-400' : 'bg-fog-500'
-                              }`}
-                            />
-                            <span className="truncate flex-1">
-                              {threadDisplayName(t)}
-                            </span>
-                            {!!t.tokens && (
-                              <span className="text-[10px] text-fog-500 tabular-nums shrink-0">
-                                {fmtTokens(t.tokens)}
-                              </span>
+                            {tRenaming ? (
+                              <RenameInput
+                                value={renameValue}
+                                onChange={setRenameValue}
+                                onCommit={commitRename}
+                                onCancel={cancelRename}
+                                icon={
+                                  <span
+                                    className={`dot shrink-0 ${
+                                      active ? 'bg-emerald-400' : 'bg-fog-500'
+                                    }`}
+                                  />
+                                }
+                              />
+                            ) : (
+                              <>
+                                <button
+                                  onClick={() => selectThread(s.id, t.id)}
+                                  className="flex-1 min-w-0 text-left px-2.5 py-1.5 flex items-center gap-2.5 hover:text-white"
+                                >
+                                  <span
+                                    className={`dot shrink-0 ${
+                                      active ? 'bg-emerald-400' : 'bg-fog-500'
+                                    }`}
+                                  />
+                                  <span className="truncate flex-1">
+                                    {threadDisplayName(t)}
+                                  </span>
+                                  {!!t.tokens && (
+                                    <span
+                                      className="text-[10px] text-fog-500 tabular-nums shrink-0"
+                                      title={`${t.tokens.toLocaleString()} tokens`}
+                                    >
+                                      {fmtTokens(t.tokens)}
+                                    </span>
+                                  )}
+                                </button>
+                                <button
+                                  data-row-menu="1"
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    setRowMenuKey(tMenuOpen ? null : tk)
+                                  }}
+                                  className={`shrink-0 mr-1 w-6 h-6 rounded hover:bg-white/[0.08] text-fog-300 flex items-center justify-center ${
+                                    tMenuOpen
+                                      ? 'opacity-100'
+                                      : 'opacity-0 group-hover:opacity-100 focus:opacity-100'
+                                  }`}
+                                  aria-label="More"
+                                >
+                                  <DotsIcon />
+                                </button>
+                                {tMenuOpen && (
+                                  <RowMenu
+                                    items={[
+                                      {
+                                        label: 'Rename',
+                                        icon: <IconPencil />,
+                                        onClick: () =>
+                                          startRename(tk, threadDisplayName(t)),
+                                      },
+                                      {
+                                        label: 'Delete',
+                                        icon: <IconTrash />,
+                                        danger: true,
+                                        onClick: () => deleteThread(s.id, t.id),
+                                      },
+                                    ]}
+                                  />
+                                )}
+                              </>
                             )}
-                          </button>
+                          </div>
                         )
                       })}
                       <button
@@ -1037,7 +1222,7 @@ export default function AppPage() {
                         className="w-full text-left px-2.5 py-1.5 rounded-md text-[12px] text-fog-400 hover:text-white hover:bg-white/[0.03] flex items-center gap-2.5"
                       >
                         <PlusIcon small />
-                        New thread
+                        New chat
                       </button>
                     </div>
                   )}
@@ -1278,7 +1463,7 @@ export default function AppPage() {
         )}
 
         {/* Conversation */}
-        <div className="flex-1 overflow-y-auto">
+        <div className="flex-1 overflow-y-auto relative">
           <div className="mx-auto max-w-3xl px-6 py-10">
             {!activeThread && <EmptyState onPick={(text) => setInput(text)} />}
 
@@ -1301,6 +1486,31 @@ export default function AppPage() {
               <div ref={endRef} />
             </div>
           </div>
+
+          {/* Floating context-window button — right side, vertically centered */}
+          {activeThread && (
+            <button
+              onClick={openContextViewer}
+              className="fixed right-5 top-1/2 -translate-y-1/2 z-30 w-10 h-10 rounded-full bg-ink-200 border border-lineStrong text-fog-300 hover:text-white hover:bg-white/[0.06] shadow-xl shadow-black/40 flex items-center justify-center transition opacity-70 hover:opacity-100"
+              title="View context window"
+              aria-label="View context window"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 7v5l3 2" />
+              </svg>
+            </button>
+          )}
         </div>
 
         {/* Composer */}
@@ -1509,6 +1719,17 @@ export default function AppPage() {
         />
       )}
 
+      {/* Context window side panel */}
+      {contextOpen && (
+        <ContextViewer
+          data={contextData}
+          loading={contextLoading}
+          error={contextError}
+          onClose={() => setContextOpen(false)}
+          onRefresh={openContextViewer}
+        />
+      )}
+
       {/* GitHub connection modal */}
       {githubModalOpen && (
         <GithubConnectModal
@@ -1541,8 +1762,8 @@ function EmptyState({ onPick }: { onPick: (text: string) => void }) {
         Where should we begin?
       </div>
       <p className="text-fog-300 text-base mb-10 max-w-md mx-auto">
-        Start a new chat or open a project from the sidebar. Threads inside a
-        project share context; chats stay isolated.
+        Start a new chat or open a project from the sidebar. Chats inside a
+        project share context; standalone chats stay isolated.
       </p>
       <div className="grid sm:grid-cols-2 gap-3 max-w-xl mx-auto text-left">
         {hints.map((h) => (
@@ -2296,6 +2517,208 @@ function FileViewer({
 }
 
 /* ─────────────────────────── GitHub connect ─────────────────────────── */
+
+/* ─────────────────────────── context window viewer ─────────────────────────── */
+
+function ContextViewer({
+  data,
+  loading,
+  error,
+  onClose,
+  onRefresh,
+}: {
+  data: any
+  loading: boolean
+  error: string | null
+  onClose: () => void
+  onRefresh: () => void
+}) {
+  const [systemOpen, setSystemOpen] = useState(false)
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  function fmtTokenCount(n: number): string {
+    if (n < 1000) return String(n)
+    return `${(n / 1000).toFixed(1)}k`
+  }
+
+  const pct = data?.percent_used ?? 0
+  const barColor =
+    pct > 75 ? 'bg-red-500' : pct > 50 ? 'bg-yellow-500' : 'bg-emerald-500'
+
+  return (
+    <div
+      className="fixed inset-0 z-[70] flex justify-end bg-black/40"
+      onClick={onClose}
+    >
+      <aside
+        onClick={(e) => e.stopPropagation()}
+        className="w-[min(640px,92vw)] h-full bg-ink-200 border-l border-lineStrong flex flex-col shadow-2xl shadow-black/60"
+      >
+        <header className="flex items-center justify-between px-4 py-3 border-b border-line">
+          <div className="text-sm text-white font-medium">Context window</div>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={onRefresh}
+              disabled={loading}
+              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-white/[0.06] disabled:opacity-40"
+            >
+              Refresh
+            </button>
+            <button
+              onClick={onClose}
+              className="w-7 h-7 rounded hover:bg-white/[0.06] text-fog-300 flex items-center justify-center"
+              aria-label="Close"
+            >
+              ✕
+            </button>
+          </div>
+        </header>
+
+        <div className="flex-1 overflow-auto px-5 py-4 space-y-5 text-sm">
+          {loading && <div className="text-fog-400">Loading…</div>}
+          {error && <div className="text-red-400">Error: {error}</div>}
+
+          {!loading && !error && data && (
+            <>
+              {/* Model + token usage */}
+              <section>
+                <div className="text-[11px] uppercase tracking-widest text-fog-500 mb-2">
+                  Model
+                </div>
+                <div className="text-fog-100 font-mono text-[12.5px] mb-3">
+                  {data.model}
+                </div>
+                <div className="flex items-baseline justify-between mb-1.5">
+                  <span className="text-fog-300">
+                    {data.total_tokens.toLocaleString()} /{' '}
+                    {data.context_limit.toLocaleString()} tokens
+                  </span>
+                  <span className="text-fog-400 text-xs">
+                    {pct.toFixed(1)}%
+                  </span>
+                </div>
+                <div className="h-2 rounded-full bg-white/[0.06] overflow-hidden">
+                  <div
+                    className={`h-full ${barColor}`}
+                    style={{ width: `${Math.min(100, pct)}%` }}
+                  />
+                </div>
+              </section>
+
+              {/* System prompt */}
+              <section>
+                <button
+                  onClick={() => setSystemOpen((v) => !v)}
+                  className="w-full flex items-center justify-between text-[11px] uppercase tracking-widest text-fog-500 mb-2 hover:text-fog-300"
+                >
+                  <span>
+                    System prompt · {fmtTokenCount(data.system_tokens)} tokens
+                  </span>
+                  <span>{systemOpen ? '▾' : '▸'}</span>
+                </button>
+                {systemOpen && (
+                  <pre className="text-[12px] leading-relaxed text-fog-200 whitespace-pre-wrap bg-ink-300 border border-line rounded-md p-3 max-h-72 overflow-auto">
+                    {data.system_prompt}
+                  </pre>
+                )}
+              </section>
+
+              {/* Messages */}
+              <section>
+                <div className="text-[11px] uppercase tracking-widest text-fog-500 mb-2">
+                  Messages · {data.messages.length}
+                </div>
+                {data.messages.length === 0 && (
+                  <p className="text-fog-500 text-xs">No messages yet.</p>
+                )}
+                <div className="space-y-1.5">
+                  {data.messages.map((m: any, i: number) => (
+                    <ContextMessageRow key={i} msg={m} />
+                  ))}
+                </div>
+              </section>
+
+              {/* Files */}
+              {data.files.length > 0 && (
+                <section>
+                  <div className="text-[11px] uppercase tracking-widest text-fog-500 mb-2">
+                    Project files · {data.files.length}
+                  </div>
+                  <div className="space-y-0.5">
+                    {data.files.map((f: any) => (
+                      <div
+                        key={f.name}
+                        className="flex items-center justify-between text-[12.5px] py-1 px-2 rounded hover:bg-white/[0.03]"
+                      >
+                        <span className="text-fog-200 truncate">{f.name}</span>
+                        <span className="text-fog-500 text-[11px] shrink-0 ml-2">
+                          {f.size} B
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
+            </>
+          )}
+        </div>
+      </aside>
+    </div>
+  )
+}
+
+function ContextMessageRow({ msg }: { msg: any }) {
+  const [open, setOpen] = useState(false)
+  const preview = (msg.content || '').slice(0, 100).replace(/\n/g, ' ')
+  const roleColor =
+    msg.role === 'user'
+      ? 'text-blue-300'
+      : msg.role === 'assistant'
+      ? 'text-emerald-300'
+      : 'text-purple-300'
+
+  return (
+    <div className="rounded-md border border-line bg-ink-300/40">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-white/[0.03]"
+      >
+        <span
+          className={`text-[10px] uppercase tracking-wider font-mono shrink-0 ${roleColor}`}
+        >
+          {msg.role}
+          {msg.tool_name ? `:${msg.tool_name}` : ''}
+        </span>
+        <span className="text-fog-300 text-[12px] truncate flex-1">
+          {preview || (msg.tool_calls ? '(tool call)' : '(empty)')}
+        </span>
+        <span className="text-fog-500 text-[11px] shrink-0 tabular-nums">
+          {msg.tokens}
+        </span>
+      </button>
+      {open && (
+        <div className="px-3 pb-3 pt-1 text-[12px] text-fog-200">
+          {msg.tool_calls && msg.tool_calls.length > 0 && (
+            <pre className="whitespace-pre-wrap text-[11.5px] text-fog-400 bg-ink-300 border border-line rounded p-2 mb-2 max-h-48 overflow-auto">
+              {JSON.stringify(msg.tool_calls, null, 2)}
+            </pre>
+          )}
+          <pre className="whitespace-pre-wrap leading-relaxed">
+            {msg.content || '(no content)'}
+          </pre>
+        </div>
+      )}
+    </div>
+  )
+}
+
 
 function GithubConnectModal({
   username,

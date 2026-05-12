@@ -48,11 +48,14 @@ def _verify_session(conn, user_id: str, session_id: str):
         raise HTTPException(404, "Session not found")
 
 model = ChatOpenAI(
-    model="z-ai/glm-4.5-air:free",
+    # Note: glm-4.5-air:free has a known bug where it wraps multi-arg tool
+    # call `args` in a list, breaking AIMessage validation. Llama-3.3 + Qwen-2.5
+    # handle structured tool calls correctly. Override via CHAT_MODEL env var.
+    model=os.getenv("CHAT_MODEL", "meta-llama/llama-3.3-70b-instruct:free"),
     openai_api_key=os.getenv("OPENROUTER_API_KEY"),
     openai_api_base="https://openrouter.ai/api/v1",
-    max_tokens=1000,
-    temperature=0.5,
+    max_tokens=int(os.getenv("CHAT_MAX_TOKENS", "1500")),
+    temperature=float(os.getenv("CHAT_TEMPERATURE", "0.3")),
     default_headers={
         "HTTP-Referer": "http://localhost",
         "X-Title": "FYP Agent Project",
@@ -62,6 +65,7 @@ model = ChatOpenAI(
 
 class CreateSessionRequest(BaseModel):
     name: str
+    kind: Optional[str] = "chat"  # "project" auto-creates starter files
 
 
 class CreateThreadRequest(BaseModel):
@@ -85,6 +89,41 @@ class GithubTokenRequest(BaseModel):
 
 _saver_cm = None
 
+SYSTEM_PROMPT = (
+    "You are a helpful assistant with access to project files via tools.\n"
+    "\n"
+    "CRITICAL RULES — follow strictly:\n"
+    "1. When the user asks you to CREATE, WRITE, MODIFY, or SAVE anything, "
+    "you MUST call the write_project_file tool in the SAME response. "
+    "Do not say 'I will write...' or 'Let me write...' — actually call the tool now.\n"
+    "2. When the user asks about a file by name, ALWAYS call read_project_file "
+    "before answering. Do not say you can't read the file before trying.\n"
+    "3. When the user asks what files exist or refers to 'my files', call "
+    "list_project_files first.\n"
+    "4. Never claim you wrote a file unless write_project_file just returned "
+    "a success message (it starts with 'Wrote'). If it returned an Error, "
+    "tell the user what went wrong.\n"
+    "\n"
+    "PROJECT BOOKKEEPING — applies only when architecture.md and report.md "
+    "exist in the project (you can confirm with list_project_files):\n"
+    "5. AFTER you write or modify any project file (other than architecture.md "
+    "and report.md themselves), update BOTH:\n"
+    "   a) architecture.md — read it, then write it back with the structure "
+    "section updated to reflect the new/changed file. Keep the existing "
+    "format and headings.\n"
+    "   b) report.md — read it, then write it back with ONE new line appended "
+    "at the very end, formatted exactly:\n"
+    "      - <date>: <one-line summary of the change>\n"
+    "      Use today's date in YYYY-MM-DD if you know it; otherwise write "
+    "'today'. Keep summaries to a single short sentence.\n"
+    "6. DO NOT recurse: do NOT update architecture.md or report.md in response "
+    "to changes to architecture.md or report.md themselves.\n"
+    "7. If multiple files changed in the same turn, do ONE combined update to "
+    "architecture.md and ONE combined log entry in report.md — not one per file.\n"
+    "\n"
+    "Remember everything the user tells you across this project/session."
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -100,10 +139,7 @@ async def lifespan(app: FastAPI):
     agent = create_agent(
         model=model,
         tools=all_tools,
-        system_prompt=(
-            "You are a helpful assistant. Use tools when needed. "
-            "Remember everything the user tells you across this project/session."
-        ),
+        system_prompt=SYSTEM_PROMPT,
         checkpointer=saver,
     )
 
@@ -205,6 +241,26 @@ def _ai_tokens(msg) -> int:
         return 0
 
 
+def _record_error_reply(
+    session_id: str, thread_id: str, user_id: str, error_msg: str
+) -> None:
+    """Persist an assistant-side error message so the user sees what went wrong
+    on refresh, instead of an unexplained gap after their message."""
+    short = error_msg[:300]
+    try:
+        with app.state.pool.connection() as conn:
+            _record_message(
+                conn,
+                session_id,
+                thread_id,
+                user_id,
+                "assistant",
+                f"Error: {short}",
+            )
+    except Exception as e:
+        print(f"[/chat] could not record error reply: {e!r}", flush=True)
+
+
 @app.get("/sessions")
 def list_sessions(user_id: str = Depends(get_current_user)):
     with app.state.pool.connection() as conn:
@@ -245,6 +301,11 @@ def create_session(req: CreateSessionRequest, user_id: str = Depends(get_current
             "RETURNING id, name, created_at",
             (sid, user_id, "General"),
         ).fetchone()
+
+    # For projects, seed two starter files the agent maintains over time.
+    if (req.kind or "").lower() == "project":
+        _seed_project_files(user_id, str(sid), sname)
+
     return {
         "id": str(sid),
         "name": sname,
@@ -258,6 +319,50 @@ def create_session(req: CreateSessionRequest, user_id: str = Depends(get_current
             "tokens": 0,
         },
     }
+
+
+def _seed_project_files(user_id: str, session_id: str, project_name: str) -> None:
+    """Write architecture.md + report.md into the bucket for a new project.
+    Best-effort: a failure here shouldn't block session creation."""
+    from datetime import datetime
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    architecture = (
+        f"# {project_name} — Architecture\n"
+        "\n"
+        "_The agent maintains this document as the project evolves._\n"
+        "\n"
+        "## Overview\n"
+        "\n"
+        "_What this project does (one paragraph)._\n"
+        "\n"
+        "## Components\n"
+        "\n"
+        "_Major files / modules and their responsibilities._\n"
+        "\n"
+        "## Data flow\n"
+        "\n"
+        "_How information moves between components._\n"
+    )
+    report = (
+        f"# {project_name} — Activity log\n"
+        "\n"
+        f"## {today}\n"
+        "- Project created.\n"
+    )
+    bucket = get_bucket()
+    for name, body in (("architecture.md", architecture), ("report.md", report)):
+        try:
+            bucket.upload(
+                path=file_key(user_id, session_id, name),
+                file=body.encode("utf-8"),
+                file_options={
+                    "content-type": "text/markdown; charset=utf-8",
+                    "upsert": "true",
+                },
+            )
+        except Exception as e:
+            print(f"[create_session] could not seed {name}: {e!r}", flush=True)
 
 
 @app.get("/sessions/{session_id}/threads")
@@ -335,6 +440,22 @@ def delete_session(session_id: str, user_id: str = Depends(get_current_user)):
     # own tables; they're orphaned but harmless and not user-visible.
     # Uploaded files for this session are intentionally left on disk —
     # an explicit cleanup pass can be added later if storage becomes an issue.
+    return {"ok": True}
+
+
+@app.delete("/sessions/{session_id}/threads/{thread_id}")
+def delete_thread(
+    session_id: str,
+    thread_id: str,
+    user_id: str = Depends(get_current_user),
+):
+    with app.state.pool.connection() as conn:
+        _verify_thread(conn, user_id, session_id, thread_id)
+        # Messages cascade via FK ON DELETE CASCADE.
+        conn.execute(
+            "DELETE FROM threads WHERE id = %s AND session_id = %s AND user_id = %s",
+            (thread_id, session_id, user_id),
+        )
     return {"ok": True}
 
 
@@ -556,6 +677,101 @@ def get_history(
     return out
 
 
+def _estimate_tokens(text: str) -> int:
+    """Rough OpenAI-style estimate: ~4 characters per token for English text."""
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
+# Context window sizes for common models (in tokens). Used to compute %used.
+_MODEL_CONTEXT_LIMITS = {
+    "meta-llama/llama-3.3-70b-instruct:free": 131072,
+    "z-ai/glm-4.5-air:free": 131072,
+    "qwen/qwen-2.5-72b-instruct:free": 131072,
+    "google/gemini-2.0-flash-exp:free": 1048576,
+    "openai/gpt-4o-mini": 128000,
+    "anthropic/claude-haiku-4-5": 200000,
+}
+
+
+@app.get("/sessions/{session_id}/threads/{thread_id}/context")
+def get_context(
+    session_id: str,
+    thread_id: str,
+    user_id: str = Depends(get_current_user),
+):
+    """Return what the LLM sees on the next turn: system prompt, message
+    history, attached files, and approximate token usage."""
+    with app.state.pool.connection() as conn:
+        _verify_thread(conn, user_id, session_id, thread_id)
+        rows = conn.execute(
+            """
+            SELECT role, content, tool_name, tool_calls_json, tokens
+            FROM messages
+            WHERE session_id = %s AND thread_id = %s AND user_id = %s
+            ORDER BY id ASC
+            """,
+            (session_id, thread_id, user_id),
+        ).fetchall()
+
+    messages = []
+    total_tokens = 0
+    for role, content, tool_name, tool_calls_json, recorded_tokens in rows:
+        # Prefer the recorded token count for assistant messages (real usage
+        # from the API). Fall back to a rough char-based estimate otherwise.
+        if recorded_tokens and recorded_tokens > 0:
+            tokens = int(recorded_tokens)
+        else:
+            tokens = _estimate_tokens(content or "")
+        total_tokens += tokens
+        m = {
+            "role": role,
+            "content": content,
+            "tokens": tokens,
+        }
+        if tool_name:
+            m["tool_name"] = tool_name
+        if tool_calls_json:
+            m["tool_calls"] = (
+                tool_calls_json
+                if isinstance(tool_calls_json, list)
+                else json.loads(tool_calls_json)
+            )
+        messages.append(m)
+
+    sys_tokens = _estimate_tokens(SYSTEM_PROMPT)
+    total_tokens += sys_tokens
+
+    # Files in the session's bucket folder.
+    files: list[dict] = []
+    try:
+        items = get_bucket().list(session_prefix(user_id, session_id))
+        for it in items or []:
+            if not it.get("id"):
+                continue
+            meta = it.get("metadata") or {}
+            files.append({"name": it.get("name"), "size": meta.get("size", 0)})
+    except Exception as e:
+        print(f"[/context] could not list files: {e!r}", flush=True)
+
+    model_name = os.getenv("CHAT_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+    context_limit = _MODEL_CONTEXT_LIMITS.get(model_name, 128000)
+
+    return {
+        "model": model_name,
+        "context_limit": context_limit,
+        "total_tokens": total_tokens,
+        "percent_used": round(100 * total_tokens / context_limit, 2)
+        if context_limit
+        else 0,
+        "system_prompt": SYSTEM_PROMPT,
+        "system_tokens": sys_tokens,
+        "messages": messages,
+        "files": files,
+    }
+
+
 @app.post("/chat")
 def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
     import traceback
@@ -576,14 +792,25 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
             },
         }
 
+        # Record the user's message in DB *before* invoking the agent. That
+        # way it survives in chat history even if the model crashes mid-turn.
         with app.state.pool.connection() as conn:
             _verify_thread(conn, user_id, req.session_id, req.thread_id)
+            _record_message(
+                conn, req.session_id, req.thread_id, user_id, "user", req.message
+            )
 
         try:
             pre_state = agent.get_state(config)
         except Exception as e:
             print(f"[/chat] get_state failed: {e!r}", flush=True)
             traceback.print_exc()
+            _record_error_reply(
+                req.session_id,
+                req.thread_id,
+                user_id,
+                f"Checkpoint state error: {e}",
+            )
             raise HTTPException(500, f"Checkpoint state error: {e}")
         pre_msgs = (pre_state.values or {}).get("messages", []) if pre_state else []
         pre_count = len(pre_msgs)
@@ -612,9 +839,24 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
             traceback.print_exc()
             low = msg.lower()
             if "429" in msg or "rate" in low or "quota" in low:
+                _record_error_reply(
+                    req.session_id,
+                    req.thread_id,
+                    user_id,
+                    "Model rate-limited. Wait a minute and retry, or add OpenRouter credit.",
+                )
                 raise HTTPException(429, "Model rate-limited. Wait a minute and retry, or add OpenRouter credit.")
             if "401" in msg or "unauthorized" in low or "api key" in low:
+                _record_error_reply(
+                    req.session_id,
+                    req.thread_id,
+                    user_id,
+                    f"Model auth failed (check OPENROUTER_API_KEY): {msg[:200]}",
+                )
                 raise HTTPException(401, f"Model auth failed (check OPENROUTER_API_KEY): {msg[:200]}")
+            _record_error_reply(
+                req.session_id, req.thread_id, user_id, f"Model error: {msg[:300]}"
+            )
             raise HTTPException(500, f"Model error: {msg[:300]}")
 
         reply = ""
@@ -623,16 +865,9 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
             with app.state.pool.connection() as conn:
                 for msg in new_messages:
                     if isinstance(msg, HumanMessage):
-                        # Store the original user-typed text in DB, not the
-                        # attachment-augmented prompt we sent to the LLM.
-                        stored = (
-                            req.message
-                            if msg.content == llm_input
-                            else msg.content
-                        )
-                        _record_message(
-                            conn, req.session_id, req.thread_id, user_id, "user", stored
-                        )
+                        # Already recorded before agent.invoke — skip to avoid
+                        # duplicating the user's message in the chat history.
+                        continue
                     elif isinstance(msg, AIMessage):
                         tool_calls = []
                         if msg.tool_calls:
