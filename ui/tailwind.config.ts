@@ -1,6 +1,14 @@
 import type { Config } from 'tailwindcss'
 
+// Surfaces use the `ink-*` scale (darkest → lightest in dark mode).
+// Text uses the `fog-*` scale (lightest → mid → faint in dark mode).
+// Both are CSS-variable-backed so flipping `data-theme="light"` on <html>
+// remaps every existing utility class without touching call sites.
+const inkVars = (k: string) => `rgb(var(--ink-${k}) / <alpha-value>)`
+const fogVars = (k: string) => `rgb(var(--fog-${k}) / <alpha-value>)`
+
 const config: Config = {
+  darkMode: ['class', '[data-theme="dark"]'],
   content: [
     './app/**/*.{ts,tsx}',
     './components/**/*.{ts,tsx}',
@@ -9,30 +17,34 @@ const config: Config = {
     extend: {
       colors: {
         ink: {
-          0: '#000000',
-          50: '#0a0a0a',
-          100: '#0f0f10',
-          200: '#141416',
-          300: '#1a1a1d',
-          400: '#1f1f23',
-          500: '#2a2a2e',
-          600: '#3a3a3e',
+          0: inkVars('0'),
+          50: inkVars('50'),
+          100: inkVars('100'),
+          200: inkVars('200'),
+          300: inkVars('300'),
+          400: inkVars('400'),
+          500: inkVars('500'),
+          600: inkVars('600'),
         },
         fog: {
-          50: '#f5f5f5',
-          100: '#e6e6e6',
-          200: '#bdbdbd',
-          300: '#8a8a8a',
-          400: '#6b6b6b',
-          500: '#4a4a4a',
+          50: fogVars('50'),
+          100: fogVars('100'),
+          200: fogVars('200'),
+          300: fogVars('300'),
+          400: fogVars('400'),
+          500: fogVars('500'),
         },
-        line: 'rgba(255,255,255,0.08)',
-        lineStrong: 'rgba(255,255,255,0.14)',
+        line: 'rgb(var(--line-rgb) / var(--line-a, 0.08))',
+        lineStrong: 'rgb(var(--line-rgb) / var(--line-strong-a, 0.14))',
+        // `soft` follows the line color (white in dark, black in light) so
+        // `bg-soft/[0.06]`, `hover:bg-soft/[0.08]`, etc. give the same
+        // "subtle highlight over surface" feel in both themes.
+        soft: 'rgb(var(--line-rgb) / <alpha-value>)',
         // legacy aliases used by older code
-        panel: '#0f0f10',
-        panelAlt: '#141416',
-        border: '#1f1f23',
-        accent: '#ffffff',
+        panel: inkVars('100'),
+        panelAlt: inkVars('200'),
+        border: inkVars('400'),
+        accent: 'rgb(var(--accent) / <alpha-value>)',
       },
       fontFamily: {
         sans: ['var(--font-sans)', 'ui-sans-serif', 'system-ui', 'sans-serif'],

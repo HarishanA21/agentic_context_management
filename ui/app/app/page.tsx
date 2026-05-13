@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { supabase, authFetch, authToken } from '@/lib/supabase'
+import { useTheme } from '@/lib/theme'
 
 /* ─────────────────────────── types ─────────────────────────── */
 
@@ -270,6 +271,13 @@ export default function AppPage() {
   const [contextData, setContextData] = useState<any>(null)
   const [contextLoading, setContextLoading] = useState(false)
   const [contextError, setContextError] = useState<string | null>(null)
+  // Lightweight summary kept in sync with the live thread so the floating
+  // ring button can show a percentage without opening the full viewer.
+  const [contextSummary, setContextSummary] = useState<{
+    total: number
+    limit: number
+    percent: number
+  } | null>(null)
   // Workspace history (commit timeline + revert)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [historyData, setHistoryData] = useState<WorkspaceCommit[] | null>(null)
@@ -412,6 +420,30 @@ export default function AppPage() {
     }
   })
 
+  // Debounced fetcher for the ring button. A streaming agent run can fire
+  // many `message` SSE events in quick succession (assistant + N tool
+  // results); collapse them into one refresh.
+  const ctxRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const refreshContextSummaryRef = useRef<() => void>(() => {})
+  useEffect(() => {
+    refreshContextSummaryRef.current = refreshContextSummary
+  })
+  function scheduleContextRefresh() {
+    if (ctxRefreshTimerRef.current) clearTimeout(ctxRefreshTimerRef.current)
+    ctxRefreshTimerRef.current = setTimeout(() => {
+      refreshContextSummaryRef.current()
+    }, 700)
+  }
+
+  // Reset + initial fetch when the active thread changes.
+  useEffect(() => {
+    setContextSummary(null)
+    if (activeSession && activeThread) {
+      refreshContextSummary()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSession, activeThread, selectedModel])
+
   useEffect(() => {
     if (!activeSession || !activeThread) return
     let cancelled = false
@@ -446,6 +478,9 @@ export default function AppPage() {
             setLiveTokens('')
           }
           setMessages((prev) => mergeIncomingMessage(prev, evt))
+          // Keep the floating ring's percentage in sync. Debounce so a
+          // burst of tool + assistant messages collapses into one refetch.
+          scheduleContextRefresh()
         } else if (evt?.type === 'llm_token') {
           // Append to the live preview. Tokens arrive in order — no
           // need to keep them addressed by run_id for now.
@@ -864,11 +899,42 @@ export default function AppPage() {
         setContextError(detail)
         return
       }
-      setContextData(await r.json())
+      const data = await r.json()
+      setContextData(data)
+      setContextSummary({
+        total: Number(data?.total_tokens) || 0,
+        limit: Number(data?.context_limit) || 0,
+        percent: Number(data?.percent_used) || 0,
+      })
     } catch (e: any) {
       setContextError(e?.message ?? 'Network error')
     } finally {
       setContextLoading(false)
+    }
+  }
+
+  // Cheap passive refresh — fetches just the summary block of the context
+  // endpoint so the ring button keeps its percentage in sync after the
+  // agent writes a new message. Debounced so streaming token bursts don't
+  // hammer the endpoint.
+  async function refreshContextSummary() {
+    if (!activeSession || !activeThread) return
+    try {
+      const qs = selectedModel
+        ? `?model=${encodeURIComponent(selectedModel)}`
+        : ''
+      const r = await authFetch(
+        `/api/sessions/${activeSession}/threads/${activeThread}/context${qs}`,
+      )
+      if (!r.ok) return
+      const data = await r.json()
+      setContextSummary({
+        total: Number(data?.total_tokens) || 0,
+        limit: Number(data?.context_limit) || 0,
+        percent: Number(data?.percent_used) || 0,
+      })
+    } catch {
+      // best-effort
     }
   }
   async function deleteContextMessage(messageId: number) {
@@ -1216,6 +1282,22 @@ export default function AppPage() {
     if (threads[0]) selectThread(sid, threads[0].id)
   }
 
+  // Open the project landing pane: active session, no active thread.
+  // Clicking on a project row header should put the user here so they can
+  // see the project's files, threads, and metadata before diving in.
+  async function selectProject(sid: string) {
+    setActiveSession(sid)
+    setActiveThread(null)
+    setMessages([])
+    setInflightTools([])
+    setLlmThinking(false)
+    setLiveTokens('')
+    setPendingApproval(null)
+    setReplayIdx(null)
+    if (!threadsMap[sid]) await loadThreads(sid)
+    refreshFiles(sid)
+  }
+
   async function send() {
     if (!input.trim() || !activeSession || !activeThread || sending) return
     const sid = activeSession
@@ -1439,18 +1521,19 @@ export default function AppPage() {
     <div className="flex h-screen bg-ink-50 text-fog-100 overflow-hidden">
       {/* ────── Sidebar ────── */}
       <aside className="w-72 shrink-0 border-r border-line bg-ink-100/60 flex flex-col">
-        <div className="px-4 py-3 flex items-center gap-2 border-b border-line">
+        <div className="px-4 py-3 flex items-center justify-between gap-2 border-b border-line">
           <Link href="/" className="flex items-center gap-2 group">
             <Glyph />
             <span className="text-sm tracking-tight font-medium">agent</span>
           </Link>
+          <ThemeToggle />
         </div>
 
         {/* + New dropdown */}
         <div className="px-3 pt-3 relative" ref={newBtnWrapRef}>
           <button
             onClick={() => setNewMenuOpen((v) => !v)}
-            className="w-full flex items-center justify-between gap-2 bg-white text-black hover:bg-fog-50 transition px-3 py-2 rounded-lg text-sm font-medium"
+            className="w-full flex items-center justify-between gap-2 bg-accent text-ink-50 hover:bg-accent/90 transition px-3 py-2 rounded-lg text-sm font-medium"
           >
             <span className="flex items-center gap-2">
               <PlusIcon />
@@ -1466,7 +1549,7 @@ export default function AppPage() {
                   setNewMenuOpen(false)
                   setProjectModalOpen(true)
                 }}
-                className="w-full text-left px-3 py-2 rounded-md hover:bg-white/[0.06] flex items-center gap-2.5"
+                className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5"
               >
                 <IconFolder />
                 <div>
@@ -1481,7 +1564,7 @@ export default function AppPage() {
                   setNewMenuOpen(false)
                   createChat()
                 }}
-                className="w-full text-left px-3 py-2 rounded-md hover:bg-white/[0.06] flex items-center gap-2.5"
+                className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5"
               >
                 <IconChat />
                 <div>
@@ -1499,10 +1582,13 @@ export default function AppPage() {
         <div className="flex-1 overflow-y-auto pt-3 pb-4">
           {/* Projects */}
           <div className="px-4 mb-1.5 flex items-center justify-between">
-            <span className="text-[11px] uppercase tracking-widest text-fog-400">
+            <span className="text-[11px] uppercase tracking-widest text-fog-400 inline-flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-sm bg-amber-500/80" />
               Projects
             </span>
-            <span className="text-[11px] text-fog-500">{projects.length}</span>
+            <span className="text-[10px] text-fog-500 px-1.5 py-0.5 rounded-full bg-soft/[0.06] tabular-nums">
+              {projects.length}
+            </span>
           </div>
           <div className="px-1.5">
             {projects.length === 0 && (
@@ -1534,18 +1620,32 @@ export default function AppPage() {
                       }
                     />
                   ) : (
-                    <div className="group relative flex items-center rounded-md hover:bg-white/[0.04]">
+                    <div
+                      className={`group relative flex items-center rounded-md hover:bg-soft/[0.04] ${
+                        activeSession === s.id
+                          ? 'bg-soft/[0.05] ring-1 ring-amber-500/20'
+                          : ''
+                      }`}
+                    >
+                      {/* Left accent strip — visible whenever this project
+                         (or any thread inside it) is the active session. */}
+                      {activeSession === s.id && (
+                        <span className="absolute left-0 top-1 bottom-1 w-[2px] rounded-r bg-amber-500/70" />
+                      )}
                       <button
-                        onClick={() => toggleSession(s.id)}
-                        className="flex-1 min-w-0 px-2.5 py-1.5 text-left text-sm flex items-center gap-2 text-fog-100"
+                        onClick={() => {
+                          toggleSession(s.id)
+                          selectProject(s.id)
+                        }}
+                        className="flex-1 min-w-0 px-2.5 py-1.5 text-left text-sm flex items-center gap-2 text-fog-100 font-medium"
                       >
                         <Caret open={isOpen} className="text-fog-400" />
-                        <IconFolder className="shrink-0 text-fog-300" small />
+                        <IconFolder className="shrink-0 text-amber-500/80" small />
                         <span className="truncate flex-1">
                           {sessionDisplayName(s)}
                         </span>
                         {fileCount > 0 && (
-                          <span className="text-[10px] text-fog-500">
+                          <span className="text-[10px] text-fog-500 tabular-nums">
                             {fileCount}
                           </span>
                         )}
@@ -1556,7 +1656,7 @@ export default function AppPage() {
                           e.stopPropagation()
                           setRowMenuKey(menuOpen ? null : rk)
                         }}
-                        className={`shrink-0 mr-1 w-6 h-6 rounded hover:bg-white/[0.08] text-fog-300 flex items-center justify-center ${
+                        className={`shrink-0 mr-1 w-6 h-6 rounded hover:bg-soft/[0.08] text-fog-300 flex items-center justify-center ${
                           menuOpen
                             ? 'opacity-100'
                             : 'opacity-0 group-hover:opacity-100 focus:opacity-100'
@@ -1599,7 +1699,7 @@ export default function AppPage() {
                               <button
                                 key={`f:${f}`}
                                 onClick={() => openFileViewer(s.id, display)}
-                                className="w-full text-left px-2.5 py-1.5 rounded-md flex items-center gap-2.5 text-[13px] text-fog-200 hover:bg-white/[0.03] hover:text-white"
+                                className="w-full text-left px-2.5 py-1.5 rounded-md flex items-center gap-2.5 text-[13px] text-fog-200 hover:bg-soft/[0.03] hover:text-fog-50"
                                 title={`Open ${display}`}
                               >
                                 <IconFile />
@@ -1625,8 +1725,8 @@ export default function AppPage() {
                             data-row-menu={tMenuOpen ? '1' : undefined}
                             className={`group relative rounded-md flex items-center text-[13px] ${
                               active
-                                ? 'bg-white/[0.07] text-white'
-                                : 'text-fog-200 hover:bg-white/[0.03]'
+                                ? 'bg-soft/[0.07] text-fog-50'
+                                : 'text-fog-200 hover:bg-soft/[0.03]'
                             }`}
                           >
                             {tRenaming ? (
@@ -1647,7 +1747,7 @@ export default function AppPage() {
                               <>
                                 <button
                                   onClick={() => selectThread(s.id, t.id)}
-                                  className="flex-1 min-w-0 text-left px-2.5 py-1.5 flex items-center gap-2.5 hover:text-white"
+                                  className="flex-1 min-w-0 text-left px-2.5 py-1.5 flex items-center gap-2.5 hover:text-fog-50"
                                 >
                                   <span
                                     className={`dot shrink-0 ${
@@ -1672,7 +1772,7 @@ export default function AppPage() {
                                     e.stopPropagation()
                                     setRowMenuKey(tMenuOpen ? null : tk)
                                   }}
-                                  className={`shrink-0 mr-1 w-6 h-6 rounded hover:bg-white/[0.08] text-fog-300 flex items-center justify-center ${
+                                  className={`shrink-0 mr-1 w-6 h-6 rounded hover:bg-soft/[0.08] text-fog-300 flex items-center justify-center ${
                                     tMenuOpen
                                       ? 'opacity-100'
                                       : 'opacity-0 group-hover:opacity-100 focus:opacity-100'
@@ -1706,7 +1806,7 @@ export default function AppPage() {
                       })}
                       <button
                         onClick={() => createThread(s.id)}
-                        className="w-full text-left px-2.5 py-1.5 rounded-md text-[12px] text-fog-400 hover:text-white hover:bg-white/[0.03] flex items-center gap-2.5"
+                        className="w-full text-left px-2.5 py-1.5 rounded-md text-[12px] text-fog-400 hover:text-fog-50 hover:bg-soft/[0.03] flex items-center gap-2.5"
                       >
                         <PlusIcon small />
                         New chat
@@ -1720,10 +1820,13 @@ export default function AppPage() {
 
           {/* Chats */}
           <div className="px-4 mt-5 mb-1.5 flex items-center justify-between">
-            <span className="text-[11px] uppercase tracking-widest text-fog-400">
+            <span className="text-[11px] uppercase tracking-widest text-fog-400 inline-flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-fog-400" />
               Chats
             </span>
-            <span className="text-[11px] text-fog-500">{chats.length}</span>
+            <span className="text-[10px] text-fog-500 px-1.5 py-0.5 rounded-full bg-soft/[0.06] tabular-nums">
+              {chats.length}
+            </span>
           </div>
           <div className="px-1.5">
             {chats.length === 0 && (
@@ -1742,8 +1845,8 @@ export default function AppPage() {
                   data-row-menu={menuOpen ? '1' : undefined}
                   className={`group relative rounded-md flex items-center text-[13px] ${
                     active
-                      ? 'bg-white/[0.07] text-white'
-                      : 'text-fog-200 hover:bg-white/[0.03]'
+                      ? 'bg-soft/[0.07] text-fog-50'
+                      : 'text-fog-200 hover:bg-soft/[0.03]'
                   }`}
                 >
                   {renaming ? (
@@ -1763,7 +1866,7 @@ export default function AppPage() {
                     <>
                       <button
                         onClick={() => selectChat(s.id)}
-                        className="flex-1 min-w-0 text-left px-2.5 py-1.5 flex items-center gap-2.5 hover:text-white"
+                        className="flex-1 min-w-0 text-left px-2.5 py-1.5 flex items-center gap-2.5 hover:text-fog-50"
                       >
                         <IconChat
                           className="shrink-0 text-fog-400"
@@ -1787,7 +1890,7 @@ export default function AppPage() {
                           e.stopPropagation()
                           setRowMenuKey(menuOpen ? null : rk)
                         }}
-                        className={`shrink-0 mr-1 w-6 h-6 rounded hover:bg-white/[0.08] text-fog-300 flex items-center justify-center ${
+                        className={`shrink-0 mr-1 w-6 h-6 rounded hover:bg-soft/[0.08] text-fog-300 flex items-center justify-center ${
                           menuOpen
                             ? 'opacity-100'
                             : 'opacity-0 group-hover:opacity-100 focus:opacity-100'
@@ -1839,9 +1942,9 @@ export default function AppPage() {
         <div className="border-t border-line p-3 relative">
           <button
             onClick={() => setUserMenuOpen((v) => !v)}
-            className="w-full flex items-center gap-3 px-2 py-2 rounded-md hover:bg-white/[0.04]"
+            className="w-full flex items-center gap-3 px-2 py-2 rounded-md hover:bg-soft/[0.04]"
           >
-            <span className="w-7 h-7 rounded-full bg-white/10 flex items-center justify-center text-xs">
+            <span className="w-7 h-7 rounded-full bg-soft/10 flex items-center justify-center text-xs">
               {(userEmail ?? '?').slice(0, 1).toUpperCase()}
             </span>
             <span className="text-sm truncate flex-1 text-left">{userEmail}</span>
@@ -1851,7 +1954,7 @@ export default function AppPage() {
             <div className="absolute bottom-full left-3 right-3 mb-2 z-50 rounded-2xl border border-lineStrong bg-ink-200 p-1 text-sm shadow-2xl shadow-black/60">
               <Link
                 href="/"
-                className="block px-3 py-2 rounded-md hover:bg-white/[0.06]"
+                className="block px-3 py-2 rounded-md hover:bg-soft/[0.06]"
               >
                 Back to home
               </Link>
@@ -1860,7 +1963,7 @@ export default function AppPage() {
                   setUserMenuOpen(false)
                   setGithubModalOpen(true)
                 }}
-                className="w-full text-left px-3 py-2 rounded-md hover:bg-white/[0.06] flex items-center justify-between"
+                className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center justify-between"
               >
                 <span>GitHub</span>
                 <span className="text-[11px] text-fog-400 truncate ml-2">
@@ -1869,7 +1972,7 @@ export default function AppPage() {
               </button>
               <button
                 onClick={signOut}
-                className="w-full text-left px-3 py-2 rounded-md hover:bg-white/[0.06]"
+                className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06]"
               >
                 Sign out
               </button>
@@ -1883,22 +1986,30 @@ export default function AppPage() {
         {/* Top bar */}
         <header className="h-12 px-5 border-b border-line flex items-center justify-between">
           <div className="text-sm flex items-center gap-2 min-w-0">
-            {activeSessionObj && activeThreadObj ? (
+            {activeSessionObj ? (
               activeKind === 'project' ? (
                 <>
-                  <IconFolder small className="text-fog-400" />
-                  <span className="text-fog-300 truncate">
-                    {activeSessionObj.name}
-                  </span>
-                  <span className="text-fog-500">/</span>
-                  <span className="text-white truncate">
-                    {threadDisplayName(activeThreadObj)}
-                  </span>
+                  <IconFolder small className="text-amber-500/80" />
+                  <button
+                    onClick={() => selectProject(activeSessionObj.id)}
+                    className="text-fog-200 truncate hover:text-fog-50 transition"
+                    title="Open project home"
+                  >
+                    {sessionDisplayName(activeSessionObj)}
+                  </button>
+                  {activeThreadObj && (
+                    <>
+                      <span className="text-fog-500">/</span>
+                      <span className="text-fog-50 truncate">
+                        {threadDisplayName(activeThreadObj)}
+                      </span>
+                    </>
+                  )}
                 </>
               ) : (
                 <>
                   <IconChat small className="text-fog-400" />
-                  <span className="text-white truncate">
+                  <span className="text-fog-50 truncate">
                     {sessionDisplayName(activeSessionObj)}
                   </span>
                 </>
@@ -1943,14 +2054,14 @@ export default function AppPage() {
                       localStorage.setItem('selected_model', v)
                     }
                   }}
-                  className="bg-transparent text-xs text-white outline-none max-w-[14rem] truncate"
+                  className="bg-transparent text-xs text-fog-50 outline-none max-w-[14rem] truncate"
                   title="Chat model (OpenRouter free tier)"
                 >
                   {models.map((m) => (
                     <option
                       key={m.id}
                       value={m.id}
-                      className="bg-ink-200 text-white"
+                      className="bg-ink-200 text-fog-50"
                     >
                       {m.name.replace(/\s*\(free\)\s*$/i, '')}
                     </option>
@@ -1982,7 +2093,7 @@ export default function AppPage() {
                       onClick={() =>
                         activeSession && openFileViewer(activeSession, display)
                       }
-                      className="chip text-[11px] py-0.5 hover:bg-white/[0.08] cursor-pointer"
+                      className="chip text-[11px] py-0.5 hover:bg-soft/[0.08] cursor-pointer"
                       title={`Open ${display}`}
                     >
                       <IconFile />
@@ -2018,7 +2129,23 @@ export default function AppPage() {
             />
           ) : (
             <div className="mx-auto max-w-3xl px-6 py-10">
-              {!activeThread && <EmptyState onPick={(text) => setInput(text)} />}
+              {!activeThread &&
+                (activeKind === 'project' && activeSessionObj ? (
+                  <ProjectLanding
+                    session={activeSessionObj}
+                    threads={threadsMap[activeSessionObj.id] || []}
+                    files={filesMap[activeSessionObj.id] || []}
+                    threadNames={threadNames}
+                    sessionName={sessionDisplayName(activeSessionObj)}
+                    onOpenThread={(tid) =>
+                      selectThread(activeSessionObj.id, tid)
+                    }
+                    onOpenFile={(name) => openFileViewer(activeSessionObj.id, name)}
+                    onNewThread={() => createThread(activeSessionObj.id)}
+                  />
+                ) : (
+                  <EmptyState onPick={(text) => setInput(text)} />
+                ))}
 
               <div className="space-y-5">
                 {(() => {
@@ -2073,7 +2200,7 @@ export default function AppPage() {
                   <div className="flex justify-end">
                     <button
                       onClick={cancelChat}
-                      className="text-[11px] px-2.5 py-1 rounded-md border border-line text-fog-300 hover:bg-white/[0.06] hover:text-white"
+                      className="text-[11px] px-2.5 py-1 rounded-md border border-line text-fog-300 hover:bg-soft/[0.06] hover:text-fog-50"
                     >
                       Stop
                     </button>
@@ -2084,29 +2211,14 @@ export default function AppPage() {
             </div>
           )}
 
-          {/* Floating context-window button — right side, vertically centered */}
+          {/* Floating context-window ring — right side, vertically centered.
+             Shows live token usage as a percentage with an arc that fills
+             proportionally and changes color as usage climbs. */}
           {activeThread && (
-            <button
+            <ContextRingButton
+              summary={contextSummary}
               onClick={openContextViewer}
-              className="fixed right-5 top-1/2 -translate-y-1/2 z-30 w-10 h-10 rounded-full bg-ink-200 border border-lineStrong text-fog-300 hover:text-white hover:bg-white/[0.06] shadow-xl shadow-black/40 flex items-center justify-center transition opacity-70 hover:opacity-100"
-              title="View context window"
-              aria-label="View context window"
-            >
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.8"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <circle cx="12" cy="12" r="9" />
-                <path d="M12 7v5l3 2" />
-              </svg>
-            </button>
+            />
           )}
 
           {/* Floating history button — only for project sessions. Sits below
@@ -2114,7 +2226,7 @@ export default function AppPage() {
           {activeThread && activeKind === 'project' && (
             <button
               onClick={openWorkspaceHistory}
-              className="fixed right-5 z-30 w-10 h-10 rounded-full bg-ink-200 border border-lineStrong text-fog-300 hover:text-white hover:bg-white/[0.06] shadow-xl shadow-black/40 flex items-center justify-center transition opacity-70 hover:opacity-100"
+              className="fixed right-5 z-30 w-10 h-10 rounded-full bg-ink-200 border border-lineStrong text-fog-300 hover:text-fog-50 hover:bg-soft/[0.06] shadow-xl shadow-black/40 flex items-center justify-center transition opacity-70 hover:opacity-100"
               style={{ top: 'calc(50% + 48px)' }}
               title="Workspace history"
               aria-label="Workspace history"
@@ -2138,8 +2250,13 @@ export default function AppPage() {
           )}
         </div>
 
-        {/* Composer */}
-        <footer className="border-t border-line">
+        {/* Composer — hidden on the project landing pane (no thread to
+           send into; user picks or creates a thread first). */}
+        <footer
+          className={`border-t border-line ${
+            activeKind === 'project' && !activeThread ? 'hidden' : ''
+          }`}
+        >
           <div className="mx-auto max-w-3xl px-6 py-4">
             <form
               onSubmit={(e) => {
@@ -2161,7 +2278,7 @@ export default function AppPage() {
                       <button
                         type="button"
                         onClick={() => removePendingFile(f.name)}
-                        className="ml-1 w-4 h-4 rounded-full text-fog-400 hover:text-white hover:bg-white/[0.1] flex items-center justify-center text-[10px]"
+                        className="ml-1 w-4 h-4 rounded-full text-fog-400 hover:text-fog-50 hover:bg-soft/[0.1] flex items-center justify-center text-[10px]"
                         aria-label={`Remove ${f.name}`}
                       >
                         ✕
@@ -2176,7 +2293,7 @@ export default function AppPage() {
                     type="button"
                     onClick={() => setComposerMenuOpen((v) => !v)}
                     disabled={!activeSession || uploading}
-                    className="w-9 h-9 rounded-full hover:bg-white/[0.06] text-fog-300 hover:text-white flex items-center justify-center transition disabled:opacity-30 disabled:cursor-not-allowed"
+                    className="w-9 h-9 rounded-full hover:bg-soft/[0.06] text-fog-300 hover:text-fog-50 flex items-center justify-center transition disabled:opacity-30 disabled:cursor-not-allowed"
                     title={
                       activeSession ? 'Attach files' : 'Pick a chat first'
                     }
@@ -2196,7 +2313,7 @@ export default function AppPage() {
                           setComposerMenuOpen(false)
                           fileInputRef.current?.click()
                         }}
-                        className="w-full text-left px-3 py-2 rounded-md hover:bg-white/[0.06] flex items-center gap-2.5"
+                        className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5"
                       >
                         <IconFile />
                         <div>
@@ -2212,7 +2329,7 @@ export default function AppPage() {
                           setComposerMenuOpen(false)
                           photoInputRef.current?.click()
                         }}
-                        className="w-full text-left px-3 py-2 rounded-md hover:bg-white/[0.06] flex items-center gap-2.5"
+                        className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5"
                       >
                         <IconImage />
                         <div>
@@ -2271,11 +2388,11 @@ export default function AppPage() {
                 <button
                   type="submit"
                   disabled={!activeThread || sending || !input.trim()}
-                  className="shrink-0 rounded-full bg-white text-black w-9 h-9 flex items-center justify-center disabled:opacity-30 disabled:cursor-not-allowed hover:bg-fog-50 transition"
+                  className="shrink-0 rounded-full bg-accent text-ink-50 w-9 h-9 flex items-center justify-center disabled:opacity-30 disabled:cursor-not-allowed hover:bg-accent/90 transition"
                   title="Send"
                 >
                   {sending ? (
-                    <span className="w-3 h-3 rounded-full border-2 border-black border-t-transparent animate-spin" />
+                    <span className="w-3 h-3 rounded-full border-2 border-ink-50 border-t-transparent animate-spin" />
                   ) : (
                     <ArrowUp />
                   )}
@@ -2412,7 +2529,7 @@ export default function AppPage() {
 
       {/* Toast */}
       {toast && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] px-4 py-2 rounded-full bg-white text-black text-sm shadow-2xl animate-float-up">
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] px-4 py-2 rounded-full bg-accent text-ink-50 text-sm shadow-2xl animate-float-up">
           {toast}
         </div>
       )}
@@ -2425,7 +2542,7 @@ export default function AppPage() {
 function EmptyState({ onPick }: { onPick: (text: string) => void }) {
   return (
     <div className="text-center pt-16 pb-8 animate-float-up">
-      <div className="serif text-5xl tracking-tighter text-white mb-3">
+      <div className="serif text-5xl tracking-tighter text-fog-50 mb-3">
         Where should we begin?
       </div>
       <p className="text-fog-300 text-base mb-10 max-w-md mx-auto">
@@ -2437,9 +2554,9 @@ function EmptyState({ onPick }: { onPick: (text: string) => void }) {
           <button
             key={h.title}
             onClick={() => onPick(h.prompt)}
-            className="surface p-4 hover:bg-white/[0.03] transition cursor-pointer text-left"
+            className="surface p-4 hover:bg-soft/[0.03] transition cursor-pointer text-left"
           >
-            <div className="text-sm text-white mb-1">{h.title}</div>
+            <div className="text-sm text-fog-50 mb-1">{h.title}</div>
             <div className="text-xs text-fog-400 leading-relaxed">{h.body}</div>
           </button>
         ))}
@@ -2481,8 +2598,8 @@ function LiveAssistantPreview({ tokens }: { tokens: string }) {
   return (
     <div className="animate-float-up">
       <div className="flex items-center gap-2 mb-2 text-[11px] uppercase tracking-widest text-fog-400">
-        <span className="w-5 h-5 rounded-full bg-white/10 flex items-center justify-center">
-          <span className="w-1.5 h-1.5 bg-white rounded-sm" />
+        <span className="w-5 h-5 rounded-full bg-soft/10 flex items-center justify-center">
+          <span className="w-1.5 h-1.5 bg-accent rounded-sm" />
         </span>
         Agent
       </div>
@@ -2525,7 +2642,7 @@ function MessageBlock({
   if (msg.role === 'user') {
     return (
       <div className="flex justify-end animate-float-up">
-        <div className="max-w-[80%] rounded-3xl bg-white/[0.06] border border-line text-fog-100 px-4 py-2.5 text-[15px] leading-7 whitespace-pre-wrap">
+        <div className="max-w-[80%] rounded-3xl bg-soft/[0.06] border border-line text-fog-100 px-4 py-2.5 text-[15px] leading-7 whitespace-pre-wrap">
           {msg.content}
         </div>
       </div>
@@ -2539,8 +2656,8 @@ function MessageBlock({
   return (
     <div className="animate-float-up">
       <div className="flex items-center gap-2 mb-2 text-[11px] uppercase tracking-widest text-fog-400">
-        <span className="w-5 h-5 rounded-full bg-white/10 flex items-center justify-center">
-          <span className="w-1.5 h-1.5 bg-white rounded-sm" />
+        <span className="w-5 h-5 rounded-full bg-soft/10 flex items-center justify-center">
+          <span className="w-1.5 h-1.5 bg-accent rounded-sm" />
         </span>
         Agent
       </div>
@@ -2578,7 +2695,7 @@ function ApprovalCard({
         <div className="space-y-2">
           <div className="flex items-center gap-2 text-fog-100">
             <span className="text-fog-400">Write</span>
-            <code className="font-mono text-white">
+            <code className="font-mono text-fog-50">
               {(approval as any).filename}
             </code>
             <span className="text-[11px] font-mono text-fog-500">
@@ -2609,14 +2726,14 @@ function ApprovalCard({
         <button
           onClick={() => onDecide(false, 'denied via confirm prompt')}
           disabled={disabled}
-          className="text-[12px] px-3 py-1.5 rounded-md border border-line text-fog-300 hover:bg-white/[0.06] hover:text-white disabled:opacity-40 transition"
+          className="text-[12px] px-3 py-1.5 rounded-md border border-line text-fog-300 hover:bg-soft/[0.06] hover:text-fog-50 disabled:opacity-40 transition"
         >
           Deny
         </button>
         <button
           onClick={() => onDecide(true)}
           disabled={disabled}
-          className="text-[12px] px-3 py-1.5 rounded-md bg-white text-ink-100 hover:bg-fog-100 disabled:opacity-40 transition font-medium"
+          className="text-[12px] px-3 py-1.5 rounded-md bg-accent text-ink-100 hover:bg-fog-100 disabled:opacity-40 transition font-medium"
         >
           {disabled ? 'Working…' : 'Approve'}
         </button>
@@ -2765,7 +2882,7 @@ function TaskView({
             <div className="flex justify-end">
               <button
                 onClick={onCancel}
-                className="text-[11px] px-2.5 py-1 rounded-md border border-line text-fog-300 hover:bg-white/[0.06] hover:text-white"
+                className="text-[11px] px-2.5 py-1 rounded-md border border-line text-fog-300 hover:bg-soft/[0.06] hover:text-fog-50"
               >
                 Stop
               </button>
@@ -2861,7 +2978,7 @@ function ReplayControls({
     return (
       <button
         onClick={onEnter}
-        className="text-[11px] px-2.5 py-1 rounded-full border border-line bg-ink-200 text-fog-300 hover:text-white hover:bg-white/[0.06]"
+        className="text-[11px] px-2.5 py-1 rounded-full border border-line bg-ink-200 text-fog-300 hover:text-fog-50 hover:bg-soft/[0.06]"
         title="Step through this thread message-by-message"
       >
         Replay
@@ -2876,7 +2993,7 @@ function ReplayControls({
       <button
         onClick={() => onStep(-1)}
         disabled={replayIdx <= 1}
-        className="px-2 py-1 rounded-full text-fog-200 hover:text-white hover:bg-white/[0.06] disabled:opacity-40"
+        className="px-2 py-1 rounded-full text-fog-200 hover:text-fog-50 hover:bg-soft/[0.06] disabled:opacity-40"
         title="Previous"
       >
         ◀
@@ -2884,14 +3001,14 @@ function ReplayControls({
       <button
         onClick={() => onStep(1)}
         disabled={replayIdx >= total}
-        className="px-2 py-1 rounded-full text-fog-200 hover:text-white hover:bg-white/[0.06] disabled:opacity-40"
+        className="px-2 py-1 rounded-full text-fog-200 hover:text-fog-50 hover:bg-soft/[0.06] disabled:opacity-40"
         title="Next"
       >
         ▶
       </button>
       <button
         onClick={onExit}
-        className="px-2 py-1 rounded-full text-fog-300 hover:text-white hover:bg-white/[0.06]"
+        className="px-2 py-1 rounded-full text-fog-300 hover:text-fog-50 hover:bg-soft/[0.06]"
         title="Exit replay"
       >
         Live
@@ -2924,8 +3041,8 @@ function ViewToggle({
           onClick={() => mode !== m && onChange(m)}
           className={`px-2.5 py-1 rounded-full transition ${
             mode === m
-              ? 'bg-white/[0.10] text-white'
-              : 'text-fog-400 hover:text-white'
+              ? 'bg-soft/[0.10] text-fog-50'
+              : 'text-fog-400 hover:text-fog-50'
           }`}
         >
           {m === 'chat' ? 'Chat' : 'Task'}
@@ -2959,8 +3076,8 @@ function ModeToggle({
           onClick={() => mode !== m && onChange(m)}
           className={`px-2.5 py-1 rounded-full transition ${
             mode === m
-              ? 'bg-white/[0.10] text-white'
-              : 'text-fog-400 hover:text-white'
+              ? 'bg-soft/[0.10] text-fog-50'
+              : 'text-fog-400 hover:text-fog-50'
           }`}
         >
           {m === 'auto' ? 'Auto' : 'Confirm'}
@@ -3050,7 +3167,7 @@ function EventRow({
           {icon && <span className="text-fog-500">{icon}</span>}
           <span className={`font-medium ${verbColor}`}>{verb}</span>
           {target && (
-            <code className="font-mono text-white text-[13px] truncate">
+            <code className="font-mono text-fog-50 text-[13px] truncate">
               {target}
             </code>
           )}
@@ -3133,7 +3250,7 @@ function ShellEventRow({
         hasOutput && (
           <button
             onClick={() => setOpen((v) => !v)}
-            className="text-[11px] text-fog-400 hover:text-white"
+            className="text-[11px] text-fog-400 hover:text-fog-50"
           >
             {open ? 'Hide output' : 'Show output'}
           </button>
@@ -3267,7 +3384,7 @@ function WriteFileEventRow({
         sha && sessionId ? (
           <button
             onClick={toggleDiff}
-            className="text-[11px] text-fog-400 hover:text-white"
+            className="text-[11px] text-fog-400 hover:text-fog-50"
           >
             {diffOpen ? 'Hide diff' : diff ? 'Show diff' : 'View diff'}
           </button>
@@ -3444,7 +3561,7 @@ function ListFilesEventRow({
         fileLines.length > 0 ? (
           <button
             onClick={() => setOpen((v) => !v)}
-            className="text-[11px] text-fog-400 hover:text-white"
+            className="text-[11px] text-fog-400 hover:text-fog-50"
           >
             {open ? 'Hide' : 'Show'}
           </button>
@@ -3682,7 +3799,7 @@ function NewProjectModal({
       <div className="relative w-full max-w-md rounded-2xl border border-lineStrong bg-ink-200 shadow-2xl shadow-black/80 p-6">
         <div className="flex items-start justify-between mb-1">
           <div>
-            <h2 className="serif text-2xl tracking-tighter text-white">
+            <h2 className="serif text-2xl tracking-tighter text-fog-50">
               New project
             </h2>
             <p className="text-xs text-fog-400 mt-0.5">
@@ -3691,7 +3808,7 @@ function NewProjectModal({
           </div>
           <button
             onClick={onClose}
-            className="w-8 h-8 rounded-full hover:bg-white/[0.06] text-fog-400 hover:text-white flex items-center justify-center transition"
+            className="w-8 h-8 rounded-full hover:bg-soft/[0.06] text-fog-400 hover:text-fog-50 flex items-center justify-center transition"
             aria-label="Close"
           >
             ×
@@ -3787,8 +3904,8 @@ function NewProjectModal({
                   onClick={() => setGhMode(m)}
                   className={`text-[12px] py-1.5 rounded-md transition ${
                     ghMode === m
-                      ? 'bg-white/[0.10] text-white'
-                      : 'text-fog-300 hover:text-white hover:bg-white/[0.04]'
+                      ? 'bg-soft/[0.10] text-fog-50'
+                      : 'text-fog-300 hover:text-fog-50 hover:bg-soft/[0.04]'
                   }`}
                 >
                   {label}
@@ -3804,7 +3921,7 @@ function NewProjectModal({
                 <button
                   type="button"
                   onClick={onOpenGithub}
-                  className="underline underline-offset-2 hover:text-white"
+                  className="underline underline-offset-2 hover:text-fog-50"
                 >
                   Connect now
                 </button>
@@ -3909,13 +4026,249 @@ function NewProjectModal({
   )
 }
 
+/* ─────────────────────────── project landing pane ─────────────────────────── */
+
+function ProjectLanding({
+  session,
+  threads,
+  files,
+  threadNames,
+  sessionName,
+  onOpenThread,
+  onOpenFile,
+  onNewThread,
+}: {
+  session: Session
+  threads: Thread[]
+  files: string[]
+  threadNames: Record<string, string>
+  sessionName: string
+  onOpenThread: (tid: string) => void
+  onOpenFile: (name: string) => void
+  onNewThread: () => void
+}) {
+  const mode = session.mode || 'auto'
+  return (
+    <div className="animate-float-up">
+      <div className="flex items-start justify-between gap-4 mb-6">
+        <div className="min-w-0">
+          <div className="text-[11px] uppercase tracking-widest text-fog-400 mb-1 inline-flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-sm bg-amber-500/80" />
+            Project
+          </div>
+          <h1 className="serif text-3xl tracking-tighter text-fog-50 truncate">
+            {sessionName}
+          </h1>
+          <div className="flex items-center gap-2 mt-2 text-[11px] text-fog-400">
+            <span
+              className={`chip ${
+                mode === 'confirm'
+                  ? 'border-amber-500/40 text-amber-300'
+                  : ''
+              }`}
+            >
+              {mode === 'confirm' ? 'Confirm mode' : 'Auto mode'}
+            </span>
+            <span className="chip">
+              {threads.length} {threads.length === 1 ? 'thread' : 'threads'}
+            </span>
+            <span className="chip">
+              {files.length} {files.length === 1 ? 'file' : 'files'}
+            </span>
+          </div>
+        </div>
+        <button
+          onClick={onNewThread}
+          className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-accent text-ink-50 text-sm font-medium hover:bg-accent/90 transition"
+        >
+          <PlusIcon small />
+          New thread
+        </button>
+      </div>
+
+      {/* Files */}
+      <section className="mb-6">
+        <h2 className="text-[11px] uppercase tracking-widest text-fog-400 mb-2">
+          Files
+        </h2>
+        {files.length === 0 ? (
+          <p className="text-sm text-fog-500 px-2">
+            No files yet. Upload one from a thread or have the agent write some.
+          </p>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {files.map((f) => {
+              const display = f.split('/').pop() || f
+              return (
+                <button
+                  key={f}
+                  onClick={() => onOpenFile(display)}
+                  className="surface flex items-center gap-2.5 px-3 py-2 text-left hover:bg-soft/[0.03] transition"
+                  title={`Open ${display}`}
+                >
+                  <IconFile />
+                  <span className="text-[13px] text-fog-100 truncate flex-1">
+                    {display}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+        )}
+      </section>
+
+      {/* Threads */}
+      <section>
+        <h2 className="text-[11px] uppercase tracking-widest text-fog-400 mb-2">
+          Threads
+        </h2>
+        {threads.length === 0 ? (
+          <p className="text-sm text-fog-500 px-2">
+            No threads yet. Start one with the button above.
+          </p>
+        ) : (
+          <div className="space-y-1">
+            {threads.map((t) => (
+              <button
+                key={t.id}
+                onClick={() => onOpenThread(t.id)}
+                className="w-full surface flex items-center gap-3 px-3 py-2.5 text-left hover:bg-soft/[0.03] transition"
+              >
+                <IconChat className="shrink-0 text-fog-400" small />
+                <span className="flex-1 truncate text-[14px] text-fog-100">
+                  {threadNames[t.id] || t.name || 'New chat'}
+                </span>
+                {!!t.tokens && (
+                  <span
+                    className="text-[10px] text-fog-500 tabular-nums"
+                    title={`${t.tokens.toLocaleString()} tokens`}
+                  >
+                    {fmtTokens(t.tokens)}
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
+
+/* ─────────────────────────── context ring button ─────────────────────────── */
+
+function ContextRingButton({
+  summary,
+  onClick,
+}: {
+  summary: { total: number; limit: number; percent: number } | null
+  onClick: () => void
+}) {
+  const pct = summary?.percent ?? 0
+  // Clamp so an unexpectedly-large total never wraps the arc.
+  const clamped = Math.max(0, Math.min(100, pct))
+  // Threshold colors — green → amber → orange → red as usage climbs.
+  const color =
+    clamped < 50
+      ? '#22c55e'
+      : clamped < 80
+        ? '#f59e0b'
+        : clamped < 95
+          ? '#f97316'
+          : '#ef4444'
+  // SVG arc geometry. r=15 gives ~94 circumference at strokeWidth=3, which
+  // leaves enough room for the percentage label inside a 40px button.
+  const r = 15
+  const c = 2 * Math.PI * r
+  const dash = (clamped / 100) * c
+  const offset = c - dash
+  const hasData = summary != null && summary.limit > 0
+  const label = hasData ? `${Math.round(clamped)}%` : '—'
+  const title = hasData
+    ? `${summary!.total.toLocaleString()} / ${summary!.limit.toLocaleString()} tokens (${clamped.toFixed(1)}%)`
+    : 'Context window'
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      aria-label={title}
+      className="fixed right-5 top-1/2 -translate-y-1/2 z-30 w-11 h-11 rounded-full bg-ink-200 border border-lineStrong shadow-xl shadow-black/40 flex items-center justify-center transition hover:bg-soft/[0.06]"
+    >
+      <svg width="40" height="40" viewBox="0 0 40 40" className="-rotate-90">
+        {/* track */}
+        <circle
+          cx="20"
+          cy="20"
+          r={r}
+          fill="none"
+          stroke="currentColor"
+          strokeOpacity="0.18"
+          strokeWidth="3"
+          className="text-fog-300"
+        />
+        {/* progress arc */}
+        {hasData && (
+          <circle
+            cx="20"
+            cy="20"
+            r={r}
+            fill="none"
+            stroke={color}
+            strokeWidth="3"
+            strokeLinecap="round"
+            strokeDasharray={c}
+            strokeDashoffset={offset}
+            style={{ transition: 'stroke-dashoffset 0.4s ease, stroke 0.3s' }}
+          />
+        )}
+      </svg>
+      <span
+        className={`absolute font-mono tabular-nums leading-none ${
+          hasData ? 'text-fog-100' : 'text-fog-400'
+        }`}
+        style={{ fontSize: clamped >= 100 ? 9 : 10 }}
+      >
+        {label}
+      </span>
+    </button>
+  )
+}
+
+/* ─────────────────────────── theme toggle ─────────────────────────── */
+
+function ThemeToggle() {
+  const [theme, setTheme] = useTheme()
+  const dark = theme === 'dark'
+  return (
+    <button
+      onClick={() => setTheme(dark ? 'light' : 'dark')}
+      title={dark ? 'Switch to light mode' : 'Switch to dark mode'}
+      aria-label="Toggle color theme"
+      className="w-7 h-7 rounded-full text-fog-300 hover:text-fog-50 hover:bg-soft/[0.08] flex items-center justify-center transition"
+    >
+      {dark ? (
+        // moon
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
+        </svg>
+      ) : (
+        // sun
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="4" />
+          <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+        </svg>
+      )}
+    </button>
+  )
+}
+
 /* ─────────────────────────── icons ─────────────────────────── */
 
 function Glyph() {
   return (
     <span className="relative w-6 h-6 inline-flex items-center justify-center">
-      <span className="absolute inset-0 rounded-md bg-white/10" />
-      <span className="relative w-2 h-2 rounded-sm bg-white" />
+      <span className="absolute inset-0 rounded-md bg-soft/10" />
+      <span className="relative w-2 h-2 rounded-sm bg-accent" />
     </span>
   )
 }
@@ -4129,7 +4482,7 @@ function RowMenu({ items }: { items: MenuItem[] }) {
           className={`w-full text-left px-3 py-2 rounded-md flex items-center gap-2.5 ${
             item.danger
               ? 'text-red-300 hover:bg-red-500/10'
-              : 'text-fog-100 hover:bg-white/[0.06]'
+              : 'text-fog-100 hover:bg-soft/[0.06]'
           }`}
         >
           {item.icon && <span className="text-fog-300">{item.icon}</span>}
@@ -4229,12 +4582,12 @@ function ConfirmDialog({
 }) {
   return (
     <ModalShell onClose={onCancel}>
-      <h3 className="text-base font-medium text-white mb-2">{title}</h3>
+      <h3 className="text-base font-medium text-fog-50 mb-2">{title}</h3>
       <p className="text-sm text-fog-300 leading-relaxed mb-5">{message}</p>
       <div className="flex justify-end gap-2">
         <button
           onClick={onCancel}
-          className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-white/[0.06]"
+          className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-soft/[0.06]"
         >
           Cancel
         </button>
@@ -4243,8 +4596,8 @@ function ConfirmDialog({
           autoFocus
           className={`px-4 py-2 rounded-lg text-sm font-medium ${
             danger
-              ? 'bg-red-500/90 hover:bg-red-500 text-white'
-              : 'bg-white text-black hover:bg-white/90'
+              ? 'bg-red-500/90 hover:bg-red-500 text-fog-50'
+              : 'bg-accent text-ink-50 hover:bg-soft/90'
           }`}
         >
           {confirmLabel}
@@ -4279,7 +4632,7 @@ function PromptDialog({
   }, [])
   return (
     <ModalShell onClose={onCancel}>
-      <h3 className="text-base font-medium text-white mb-2">{title}</h3>
+      <h3 className="text-base font-medium text-fog-50 mb-2">{title}</h3>
       {message && (
         <p className="text-sm text-fog-300 leading-relaxed mb-3">{message}</p>
       )}
@@ -4294,19 +4647,19 @@ function PromptDialog({
           }
         }}
         placeholder={placeholder}
-        className="w-full bg-ink-300 border border-lineStrong rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-white/40 mb-5"
+        className="w-full bg-ink-300 border border-lineStrong rounded-lg px-3 py-2 text-sm text-fog-50 outline-none focus:border-lineStrong mb-5"
       />
       <div className="flex justify-end gap-2">
         <button
           onClick={onCancel}
-          className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-white/[0.06]"
+          className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-soft/[0.06]"
         >
           Cancel
         </button>
         <button
           onClick={() => onConfirm(value)}
           disabled={!value.trim()}
-          className="px-4 py-2 rounded-lg text-sm font-medium bg-white text-black hover:bg-white/90 disabled:opacity-40 disabled:cursor-not-allowed"
+          className="px-4 py-2 rounded-lg text-sm font-medium bg-accent text-ink-50 hover:bg-soft/90 disabled:opacity-40 disabled:cursor-not-allowed"
         >
           {confirmLabel}
         </button>
@@ -4361,7 +4714,7 @@ function FileViewer({
         <header className="flex items-center justify-between px-4 py-3 border-b border-line">
           <div className="flex items-center gap-2 min-w-0">
             <IconFile />
-            <span className="text-sm text-white truncate">{name}</span>
+            <span className="text-sm text-fog-50 truncate">{name}</span>
             {!loading && !error && (
               <span className="text-[11px] text-fog-500 shrink-0 ml-2">
                 {lines.length} line{lines.length === 1 ? '' : 's'}
@@ -4372,13 +4725,13 @@ function FileViewer({
             <button
               onClick={copyAll}
               disabled={loading || !!error}
-              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-white/[0.06] disabled:opacity-40"
+              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-soft/[0.06] disabled:opacity-40"
             >
               Copy
             </button>
             <button
               onClick={onClose}
-              className="w-7 h-7 rounded hover:bg-white/[0.06] text-fog-300 flex items-center justify-center"
+              className="w-7 h-7 rounded hover:bg-soft/[0.06] text-fog-300 flex items-center justify-center"
               aria-label="Close"
             >
               ✕
@@ -4455,18 +4808,18 @@ function HistoryPanel({
         className="w-[min(560px,90vw)] h-full bg-ink-200 border-l border-lineStrong flex flex-col shadow-2xl shadow-black/60"
       >
         <header className="flex items-center justify-between px-4 py-3 border-b border-line">
-          <div className="text-sm text-white font-medium">Workspace history</div>
+          <div className="text-sm text-fog-50 font-medium">Workspace history</div>
           <div className="flex items-center gap-1">
             <button
               onClick={onRefresh}
               disabled={loading}
-              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-white/[0.06] disabled:opacity-40"
+              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-soft/[0.06] disabled:opacity-40"
             >
               {loading ? 'Loading…' : 'Refresh'}
             </button>
             <button
               onClick={onClose}
-              className="w-7 h-7 rounded hover:bg-white/[0.06] text-fog-300 flex items-center justify-center"
+              className="w-7 h-7 rounded hover:bg-soft/[0.06] text-fog-300 flex items-center justify-center"
               aria-label="Close"
             >
               ✕
@@ -4514,7 +4867,7 @@ function HistoryPanel({
                         revertingId !== null ||
                         c.message === 'Initial commit'
                       }
-                      className="shrink-0 text-[11px] px-2 py-1 rounded border border-line text-fog-200 hover:bg-white/[0.06] hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition"
+                      className="shrink-0 text-[11px] px-2 py-1 rounded border border-line text-fog-200 hover:bg-soft/[0.06] hover:text-fog-50 disabled:opacity-30 disabled:cursor-not-allowed transition"
                       title={
                         c.status === 'reverted'
                           ? 'Already reverted'
@@ -4547,7 +4900,7 @@ function StatusBadge({ status }: { status: WorkspaceCommit['status'] }) {
       ? 'text-rose-300/90 bg-rose-300/10 border-rose-300/20'
       : status === 'pushed'
         ? 'text-emerald-300/90 bg-emerald-300/10 border-emerald-300/20'
-        : 'text-fog-400 bg-white/[0.04] border-line'
+        : 'text-fog-400 bg-soft/[0.04] border-line'
   return (
     <span
       className={`text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded border ${styles}`}
@@ -4623,12 +4976,12 @@ function ContextViewer({
         className="w-[min(640px,92vw)] h-full bg-ink-200 border-l border-lineStrong flex flex-col shadow-2xl shadow-black/60"
       >
         <header className="flex items-center justify-between px-4 py-3 border-b border-line">
-          <div className="text-sm text-white font-medium">Context window</div>
+          <div className="text-sm text-fog-50 font-medium">Context window</div>
           <div className="flex items-center gap-1">
             <button
               onClick={() => setRawMode((v) => !v)}
               disabled={loading || !data}
-              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-white/[0.06] disabled:opacity-40"
+              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-soft/[0.06] disabled:opacity-40"
               title="See system prompt + every message as one block"
             >
               {rawMode ? 'Summary' : 'View raw'}
@@ -4636,13 +4989,13 @@ function ContextViewer({
             <button
               onClick={onRefresh}
               disabled={loading}
-              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-white/[0.06] disabled:opacity-40"
+              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-soft/[0.06] disabled:opacity-40"
             >
               Refresh
             </button>
             <button
               onClick={onClose}
-              className="w-7 h-7 rounded hover:bg-white/[0.06] text-fog-300 flex items-center justify-center"
+              className="w-7 h-7 rounded hover:bg-soft/[0.06] text-fog-300 flex items-center justify-center"
               aria-label="Close"
             >
               ✕
@@ -4666,7 +5019,7 @@ function ContextViewer({
                       navigator.clipboard.writeText(rawText)
                     }
                   }}
-                  className="text-[11px] px-2 py-0.5 rounded text-fog-300 hover:bg-white/[0.06]"
+                  className="text-[11px] px-2 py-0.5 rounded text-fog-300 hover:bg-soft/[0.06]"
                 >
                   Copy
                 </button>
@@ -4696,7 +5049,7 @@ function ContextViewer({
                     {pct.toFixed(1)}%
                   </span>
                 </div>
-                <div className="h-2 rounded-full bg-white/[0.06] overflow-hidden">
+                <div className="h-2 rounded-full bg-soft/[0.06] overflow-hidden">
                   <div
                     className={`h-full ${barColor}`}
                     style={{ width: `${Math.min(100, pct)}%` }}
@@ -4751,7 +5104,7 @@ function ContextViewer({
                     {data.files.map((f: any) => (
                       <div
                         key={f.name}
-                        className="flex items-center justify-between text-[12.5px] py-1 px-2 rounded hover:bg-white/[0.03]"
+                        className="flex items-center justify-between text-[12.5px] py-1 px-2 rounded hover:bg-soft/[0.03]"
                       >
                         <span className="text-fog-200 truncate">{f.name}</span>
                         <span className="text-fog-500 text-[11px] shrink-0 ml-2">
@@ -4799,7 +5152,7 @@ function ContextMessageRow({
 
   return (
     <div className="rounded-md border border-line bg-ink-300/40 group">
-      <div className="w-full flex items-center gap-2 hover:bg-white/[0.03]">
+      <div className="w-full flex items-center gap-2 hover:bg-soft/[0.03]">
         <button
           onClick={() => setOpen((v) => !v)}
           className="text-left px-3 py-2 flex items-center gap-2 flex-1 min-w-0"
@@ -4841,7 +5194,7 @@ function ContextMessageRow({
             <div className="mb-2 border border-line rounded bg-ink-300/60">
               <button
                 onClick={() => setTokensOpen((v) => !v)}
-                className="w-full text-left px-2 py-1.5 flex items-center gap-2 hover:bg-white/[0.03] text-[11px] text-fog-300"
+                className="w-full text-left px-2 py-1.5 flex items-center gap-2 hover:bg-soft/[0.03] text-[11px] text-fog-300"
               >
                 <span className="text-fog-500 w-3 inline-block">
                   {tokensOpen ? '▾' : '▸'}
@@ -4931,19 +5284,19 @@ function GithubConnectModal({
 
   return (
     <ModalShell onClose={onClose}>
-      <h3 className="text-base font-medium text-white mb-2">GitHub</h3>
+      <h3 className="text-base font-medium text-fog-50 mb-2">GitHub</h3>
       {username ? (
         <>
           <p className="text-sm text-fog-300 leading-relaxed mb-4">
             Connected as{' '}
-            <span className="text-white font-medium">@{username}</span>. The
+            <span className="text-fog-50 font-medium">@{username}</span>. The
             agent can now read, push to, and revert files in repos you grant
             access to.
           </p>
           <div className="flex justify-end gap-2">
             <button
               onClick={onClose}
-              className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-white/[0.06]"
+              className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-soft/[0.06]"
             >
               Close
             </button>
@@ -4952,7 +5305,7 @@ function GithubConnectModal({
                 await onDisconnect()
                 onClose()
               }}
-              className="px-4 py-2 rounded-lg text-sm font-medium bg-red-500/90 hover:bg-red-500 text-white"
+              className="px-4 py-2 rounded-lg text-sm font-medium bg-red-500/90 hover:bg-red-500 text-fog-50"
             >
               Disconnect
             </button>
@@ -4980,7 +5333,7 @@ function GithubConnectModal({
               if (e.key === 'Enter' && token.trim()) handleSave()
             }}
             placeholder="ghp_..."
-            className="w-full bg-ink-300 border border-lineStrong rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-white/40 mb-3 font-mono"
+            className="w-full bg-ink-300 border border-lineStrong rounded-lg px-3 py-2 text-sm text-fog-50 outline-none focus:border-lineStrong mb-3 font-mono"
           />
           {error && (
             <p className="text-sm text-red-400 mb-3">{error}</p>
@@ -4989,14 +5342,14 @@ function GithubConnectModal({
             <button
               onClick={onClose}
               disabled={saving}
-              className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-white/[0.06] disabled:opacity-40"
+              className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-soft/[0.06] disabled:opacity-40"
             >
               Cancel
             </button>
             <button
               onClick={handleSave}
               disabled={saving || !token.trim()}
-              className="px-4 py-2 rounded-lg text-sm font-medium bg-white text-black hover:bg-white/90 disabled:opacity-40 disabled:cursor-not-allowed"
+              className="px-4 py-2 rounded-lg text-sm font-medium bg-accent text-ink-50 hover:bg-soft/90 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {saving ? 'Verifying…' : 'Connect'}
             </button>
