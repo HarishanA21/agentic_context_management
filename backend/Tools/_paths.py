@@ -30,3 +30,28 @@ def safe_name(name: str) -> str:
     if not base or base in {".", ".."} or base.startswith("."):
         raise ValueError(f"Invalid filename: {name!r}")
     return base
+
+
+def get_workspace_ref(config: RunnableConfig) -> str | None:
+    """Return the backend_ref of the workspace attached to this /chat turn.
+
+    The /chat endpoint injects `workspace_ref` into the runnable config when
+    the session has a sandboxed workspace. Tools that need to run inside the
+    workspace (shell_tool, git tools, dual-backend file tools) read it from
+    here. Returns None for chat-only sessions with no workspace attached.
+    """
+    cfg = (config or {}).get("configurable", {}) or {}
+    ref = cfg.get("workspace_ref")
+    return str(ref) if ref else None
+
+
+def get_session_mode(config: RunnableConfig) -> str:
+    """Return the session's confirmation mode — `auto` or `confirm`.
+
+    Used by write/exec tools to decide whether to call LangGraph's
+    `interrupt()` for hard approval gates. Defaults to `auto` so a missing
+    config (e.g. a tool invoked outside /chat) doesn't break things.
+    """
+    cfg = (config or {}).get("configurable", {}) or {}
+    mode = (cfg.get("session_mode") or "auto").lower()
+    return "confirm" if mode == "confirm" else "auto"

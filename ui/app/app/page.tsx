@@ -5,7 +5,9 @@ import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { supabase, authFetch } from '@/lib/supabase'
+import { supabase, authFetch, authToken } from '@/lib/supabase'
+import { useTheme } from '@/lib/theme'
+import { MCPInventoryPanel } from '@/components/mcp-inventory'
 
 /* ─────────────────────────── types ─────────────────────────── */
 
@@ -14,6 +16,7 @@ type Session = {
   name: string
   created_at: string
   tokens?: number
+  mode?: 'auto' | 'confirm'
 }
 type Thread = {
   id: string
@@ -24,12 +27,100 @@ type Thread = {
 }
 type ToolCall = { name: string; args: Record<string, unknown> }
 type Message = {
+  id?: number
   role: 'user' | 'assistant' | 'tool'
   content: string
   tool_name?: string
   tool_calls?: ToolCall[]
 }
 type Kind = 'project' | 'chat'
+// One row in the live activity stream — represents a tool the agent has
+// invoked but whose persisted result hasn't arrived yet. Replaced by the
+// real tool message as soon as `_record_message` fires its SSE event.
+type InflightTool = {
+  run_id: string
+  tool_name: string
+  args: Record<string, any>
+  started_at: number
+}
+
+type WorkspaceCommit = {
+  id: number
+  sha: string
+  message: string
+  pushed_at: string | null
+  reverted_at: string | null
+  created_at: string
+  status: 'local' | 'pushed' | 'reverted'
+}
+// What the agent is asking permission to do, surfaced when the session is in
+// Confirm mode. Matches the shape published from the tool's interrupt() call.
+type PendingApproval =
+  | {
+      kind: 'approval_request'
+      tool: 'write_project_file'
+      filename: string
+      size: number
+      preview?: string
+    }
+  | {
+      kind: 'approval_request'
+      tool: 'run_shell'
+      cmd: string
+      cwd: string
+      timeout: number
+    }
+  | {
+      kind: 'approval_request'
+      tool: string
+      [k: string]: any
+    }
+
+/** Walk a message list and find the args the agent passed when it invoked
+ *  each tool message. The assistant message immediately preceding a tool
+ *  result contains `tool_calls` with the args we need to render rich rows
+ *  (filename for read/write, cmd for shell, etc.). Returns a parallel array
+ *  indexed by message position. */
+function pairToolArgs(messages: Message[]): Array<Record<string, any> | undefined> {
+  const out: Array<Record<string, any> | undefined> = new Array(messages.length)
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]
+    if (m.role !== 'tool') continue
+    for (let j = i - 1; j >= 0; j--) {
+      const prev = messages[j]
+      if (prev.role === 'user') break
+      if (prev.role === 'assistant' && prev.tool_calls?.length) {
+        const match = prev.tool_calls.find((c) => c.name === m.tool_name)
+        if (match) {
+          out[i] = match.args as Record<string, any>
+          break
+        }
+      }
+    }
+  }
+  return out
+}
+
+/** Merge a single SSE-pushed message into the local message list.
+ *  - Skip if we already have a row with this `id` (idempotent on re-delivery).
+ *  - If incoming is a user message that matches an id-less optimistic entry
+ *    by content, replace it in place so the entry gains its real id.
+ *  - Otherwise append. */
+function mergeIncomingMessage(prev: Message[], incoming: Message): Message[] {
+  if (incoming.id != null && prev.some((m) => m.id === incoming.id)) {
+    return prev
+  }
+  if (incoming.role === 'user' && incoming.id != null) {
+    const idx = prev.findIndex(
+      (m) =>
+        m.role === 'user' && m.id == null && m.content === incoming.content,
+    )
+    if (idx >= 0) {
+      return [...prev.slice(0, idx), incoming, ...prev.slice(idx + 1)]
+    }
+  }
+  return [...prev, incoming]
+}
 
 /* ─────────────────────────── localStorage classification ─────────────────── */
 // Project/chat distinction lives client-side because the backend `sessions`
@@ -131,9 +222,15 @@ export default function AppPage() {
 
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
+  // 'chat': linear conversation. 'task': three-pane (activity / diff / chat).
+  // Project sessions only.
+  const [viewMode, setViewMode] = useState<'chat' | 'task'>('chat')
 
   const [newMenuOpen, setNewMenuOpen] = useState(false)
   const [userMenuOpen, setUserMenuOpen] = useState(false)
+  // MCP inventory takes over the main pane when open — exclusive with the
+  // chat view; clicking any session/project/chat row closes it.
+  const [mcpsOpen, setMcpsOpen] = useState(false)
   const [projectModalOpen, setProjectModalOpen] = useState(false)
 
   // Per-row "⋯" menu — keyed by `${kind}:${id}` so chats and threads don't collide
@@ -178,6 +275,35 @@ export default function AppPage() {
   const [contextData, setContextData] = useState<any>(null)
   const [contextLoading, setContextLoading] = useState(false)
   const [contextError, setContextError] = useState<string | null>(null)
+  // Lightweight summary kept in sync with the live thread so the floating
+  // ring button can show a percentage without opening the full viewer.
+  const [contextSummary, setContextSummary] = useState<{
+    total: number
+    limit: number
+    percent: number
+  } | null>(null)
+  // Workspace history (commit timeline + revert)
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [historyData, setHistoryData] = useState<WorkspaceCommit[] | null>(null)
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyError, setHistoryError] = useState<string | null>(null)
+  const [revertingId, setRevertingId] = useState<number | null>(null)
+  // Confirm-mode approval gate
+  const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null)
+  const [resolvingApproval, setResolvingApproval] = useState(false)
+  // Replay mode: when non-null, only the first N messages are rendered.
+  // Useful for stepping through a finished agent run after the fact.
+  const [replayIdx, setReplayIdx] = useState<number | null>(null)
+  // Tools the agent has started but not yet persisted. Keyed by run_id;
+  // SSE `tool_started` adds, `tool_finished` removes. Renders as in-flight
+  // event rows below the static messages.
+  const [inflightTools, setInflightTools] = useState<InflightTool[]>([])
+  // Coarse signal — was the LLM most recently observed thinking?
+  const [llmThinking, setLlmThinking] = useState(false)
+  // Tokens accumulated from the current `llm_token` SSE stream — rendered as
+  // a transient assistant message preview so text appears character-by-
+  // character. Cleared when the persisted assistant `message` event lands.
+  const [liveTokens, setLiveTokens] = useState('')
   // Composer "+" attach menu
   const [composerMenuOpen, setComposerMenuOpen] = useState(false)
   const [uploading, setUploading] = useState(false)
@@ -284,6 +410,130 @@ export default function AppPage() {
     el.style.height = 'auto'
     el.style.height = Math.min(el.scrollHeight, 220) + 'px'
   }, [input])
+
+  /* ─── live event stream (SSE) ─── */
+  // The SSE handler closure captures whatever values exist at subscribe
+  // time, but `historyOpen` / `activeSession` can flip while subscribed.
+  // We funnel commit events through a ref-stored callback that's rewritten
+  // on every render — so the handler always invokes the latest closure.
+  const onSseCommitsRef = useRef<() => void>(() => {})
+  useEffect(() => {
+    onSseCommitsRef.current = () => {
+      if (historyOpen) openWorkspaceHistory()
+      if (activeSession) refreshFiles(activeSession)
+    }
+  })
+
+  // Debounced fetcher for the ring button. A streaming agent run can fire
+  // many `message` SSE events in quick succession (assistant + N tool
+  // results); collapse them into one refresh.
+  const ctxRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const refreshContextSummaryRef = useRef<() => void>(() => {})
+  useEffect(() => {
+    refreshContextSummaryRef.current = refreshContextSummary
+  })
+  function scheduleContextRefresh() {
+    if (ctxRefreshTimerRef.current) clearTimeout(ctxRefreshTimerRef.current)
+    ctxRefreshTimerRef.current = setTimeout(() => {
+      refreshContextSummaryRef.current()
+    }, 700)
+  }
+
+  // Reset + initial fetch when the active thread changes.
+  useEffect(() => {
+    setContextSummary(null)
+    if (activeSession && activeThread) {
+      refreshContextSummary()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSession, activeThread, selectedModel])
+
+  useEffect(() => {
+    if (!activeSession || !activeThread) return
+    let cancelled = false
+    let es: EventSource | null = null
+
+    ;(async () => {
+      const tok = await authToken()
+      if (!tok || cancelled) return
+      const url = `/api/sessions/${activeSession}/threads/${activeThread}/stream?token=${encodeURIComponent(tok)}`
+      es = new EventSource(url)
+      es.onmessage = (ev) => {
+        let evt: any
+        try {
+          evt = JSON.parse(ev.data)
+        } catch {
+          return
+        }
+        if (evt?.type === 'message') {
+          // A persisted tool message just arrived — flush the matching
+          // in-flight row, if any, before appending. Match by tool_name
+          // FIFO (the agent invokes tools sequentially in our setup).
+          if (evt.role === 'tool' && evt.tool_name) {
+            setInflightTools((prev) => {
+              const idx = prev.findIndex((t) => t.tool_name === evt.tool_name)
+              if (idx < 0) return prev
+              return [...prev.slice(0, idx), ...prev.slice(idx + 1)]
+            })
+          }
+          // Final assistant message has landed → drop the live-token
+          // preview now that the canonical version is in `messages`.
+          if (evt.role === 'assistant' && evt.content) {
+            setLiveTokens('')
+          }
+          setMessages((prev) => mergeIncomingMessage(prev, evt))
+          // Keep the floating ring's percentage in sync. Debounce so a
+          // burst of tool + assistant messages collapses into one refetch.
+          scheduleContextRefresh()
+        } else if (evt?.type === 'llm_token') {
+          // Append to the live preview. Tokens arrive in order — no
+          // need to keep them addressed by run_id for now.
+          setLiveTokens((prev) => prev + (evt.text ?? ''))
+        } else if (evt?.type === 'commits') {
+          onSseCommitsRef.current()
+        } else if (evt?.type === 'approval_request') {
+          setPendingApproval(evt as PendingApproval)
+          setLlmThinking(false)
+        } else if (evt?.type === 'tool_started') {
+          setLlmThinking(false)
+          setInflightTools((prev) => [
+            ...prev,
+            {
+              run_id: evt.run_id,
+              tool_name: evt.tool_name,
+              args: evt.args || {},
+              started_at: Date.now(),
+            },
+          ])
+        } else if (evt?.type === 'tool_finished') {
+          // Defensive: clear by run_id in case the matching `message`
+          // event was missed (e.g. tool errored without persisting).
+          setInflightTools((prev) =>
+            prev.filter((t) => t.run_id !== evt.run_id),
+          )
+        } else if (evt?.type === 'llm_started') {
+          setLlmThinking(true)
+          // Fresh LLM call → start a new live-token preview.
+          setLiveTokens('')
+        } else if (evt?.type === 'llm_finished') {
+          setLlmThinking(false)
+        } else if (evt?.type === 'cancelled') {
+          setInflightTools([])
+          setLlmThinking(false)
+          setLiveTokens('')
+        }
+      }
+      es.onerror = () => {
+        // EventSource auto-reconnects on its own; the sendMessage polling
+        // is still in place as a backstop if the connection stays down.
+      }
+    })()
+
+    return () => {
+      cancelled = true
+      if (es) es.close()
+    }
+  }, [activeSession, activeThread])
 
   /* ─── name helpers ─── */
   function setSessionName(id: string, name: string) {
@@ -653,11 +903,42 @@ export default function AppPage() {
         setContextError(detail)
         return
       }
-      setContextData(await r.json())
+      const data = await r.json()
+      setContextData(data)
+      setContextSummary({
+        total: Number(data?.total_tokens) || 0,
+        limit: Number(data?.context_limit) || 0,
+        percent: Number(data?.percent_used) || 0,
+      })
     } catch (e: any) {
       setContextError(e?.message ?? 'Network error')
     } finally {
       setContextLoading(false)
+    }
+  }
+
+  // Cheap passive refresh — fetches just the summary block of the context
+  // endpoint so the ring button keeps its percentage in sync after the
+  // agent writes a new message. Debounced so streaming token bursts don't
+  // hammer the endpoint.
+  async function refreshContextSummary() {
+    if (!activeSession || !activeThread) return
+    try {
+      const qs = selectedModel
+        ? `?model=${encodeURIComponent(selectedModel)}`
+        : ''
+      const r = await authFetch(
+        `/api/sessions/${activeSession}/threads/${activeThread}/context${qs}`,
+      )
+      if (!r.ok) return
+      const data = await r.json()
+      setContextSummary({
+        total: Number(data?.total_tokens) || 0,
+        limit: Number(data?.context_limit) || 0,
+        percent: Number(data?.percent_used) || 0,
+      })
+    } catch {
+      // best-effort
     }
   }
   async function deleteContextMessage(messageId: number) {
@@ -704,12 +985,195 @@ export default function AppPage() {
     setMessages(await r.json())
   }
 
-  async function createProject(name: string, files: File[]) {
+  async function cancelChat() {
+    if (!activeSession || !activeThread) return
+    try {
+      const r = await authFetch('/api/chat/cancel', {
+        method: 'POST',
+        body: JSON.stringify({
+          session_id: activeSession,
+          thread_id: activeThread,
+        }),
+      })
+      if (!r.ok) {
+        let detail = `${r.status} ${r.statusText}`
+        try {
+          const body = await r.json()
+          if (body?.detail) detail = body.detail
+        } catch {}
+        setToast(`Cancel failed: ${detail.slice(0, 80)}`)
+        return
+      }
+      const body = await r.json().catch(() => ({}))
+      setToast(body?.killed ? 'Stopped running command' : 'Cancel sent')
+    } catch (e: any) {
+      setToast(`Cancel failed: ${e?.message ?? 'network'}`)
+    }
+  }
+
+  async function resolveApproval(approved: boolean, reason?: string) {
+    if (!activeSession || !activeThread || resolvingApproval) return
+    setResolvingApproval(true)
+    setSending(true)
+    try {
+      const r = await authFetch('/api/chat/resume', {
+        method: 'POST',
+        body: JSON.stringify({
+          session_id: activeSession,
+          thread_id: activeThread,
+          approved,
+          reason,
+          model: selectedModel || undefined,
+        }),
+      })
+      if (!r.ok) {
+        let detail = `${r.status} ${r.statusText}`
+        try {
+          const body = await r.json()
+          if (body?.detail) detail = body.detail
+        } catch {}
+        setToast(`Resume failed: ${detail.slice(0, 120)}`)
+        setPendingApproval(null)
+        setSending(false)
+        return
+      }
+      const body = await r.json()
+      if (body?.interrupted && body?.approval) {
+        // Chained interrupt — the agent paused again on a *different* tool
+        // call after we resumed. Show the new card.
+        setPendingApproval(body.approval)
+        setSending(false)
+      } else {
+        // Run finished cleanly. SSE will have flushed any new tool /
+        // assistant messages already.
+        setPendingApproval(null)
+        setSending(false)
+      }
+    } catch (e: any) {
+      setToast(`Resume failed: ${e?.message ?? 'network'}`)
+      setPendingApproval(null)
+      setSending(false)
+    } finally {
+      setResolvingApproval(false)
+    }
+  }
+
+  async function updateSessionMode(sid: string, mode: 'auto' | 'confirm') {
+    // Optimistic update — flip locally first, revert on failure.
+    const prev = sessions.find((s) => s.id === sid)?.mode
+    setSessions((all) =>
+      all.map((s) => (s.id === sid ? { ...s, mode } : s)),
+    )
+    try {
+      const r = await authFetch(`/api/sessions/${sid}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ mode }),
+      })
+      if (!r.ok) {
+        let detail = `${r.status} ${r.statusText}`
+        try {
+          const body = await r.json()
+          if (body?.detail) detail = body.detail
+        } catch {}
+        setToast(`Mode change failed: ${detail.slice(0, 80)}`)
+        setSessions((all) =>
+          all.map((s) => (s.id === sid ? { ...s, mode: prev } : s)),
+        )
+      }
+    } catch (e: any) {
+      setToast(`Mode change failed: ${e?.message ?? 'network'}`)
+      setSessions((all) =>
+        all.map((s) => (s.id === sid ? { ...s, mode: prev } : s)),
+      )
+    }
+  }
+
+  async function openWorkspaceHistory() {
+    if (!activeSession) return
+    setHistoryOpen(true)
+    setHistoryLoading(true)
+    setHistoryError(null)
+    try {
+      const r = await authFetch(`/api/sessions/${activeSession}/history`)
+      if (!r.ok) {
+        let detail = `${r.status} ${r.statusText}`
+        try {
+          const body = await r.json()
+          if (body?.detail) detail = body.detail
+        } catch {}
+        setHistoryError(detail)
+        return
+      }
+      setHistoryData(await r.json())
+    } catch (e: any) {
+      setHistoryError(e?.message ?? 'network error')
+    } finally {
+      setHistoryLoading(false)
+    }
+  }
+
+  async function revertCommit(commitId: number) {
+    if (!activeSession || revertingId !== null) return
+    setRevertingId(commitId)
+    try {
+      const r = await authFetch(
+        `/api/sessions/${activeSession}/history/${commitId}/revert`,
+        { method: 'POST' },
+      )
+      if (!r.ok) {
+        let detail = `${r.status} ${r.statusText}`
+        try {
+          const body = await r.json()
+          if (body?.detail) detail = body.detail
+        } catch {}
+        setToast(`Revert failed: ${detail.slice(0, 120)}`)
+        return
+      }
+      // Refresh history + files so the UI catches up.
+      await openWorkspaceHistory()
+      if (activeSession) await refreshFiles(activeSession)
+      setToast('Reverted')
+    } catch (e: any) {
+      setToast(`Revert failed: ${e?.message ?? 'network error'}`)
+    } finally {
+      setRevertingId(null)
+    }
+  }
+
+  type GithubOptions =
+    | { mode: 'none' }
+    | { mode: 'new_repo'; repoName: string; private: boolean }
+    | { mode: 'link_existing'; owner: string; repo: string; branch?: string }
+
+  async function createProject(
+    name: string,
+    files: File[],
+    github: GithubOptions = { mode: 'none' },
+  ) {
+    const payload: any = { name, kind: 'project' }
+    if (github.mode === 'new_repo') {
+      payload.github_mode = 'new_repo'
+      payload.github_repo_name = github.repoName
+      payload.github_private = github.private
+    } else if (github.mode === 'link_existing') {
+      payload.github_mode = 'link_existing'
+      payload.github_owner = github.owner
+      payload.github_repo = github.repo
+      if (github.branch) payload.github_branch = github.branch
+    }
     const r = await authFetch('/api/sessions', {
       method: 'POST',
-      body: JSON.stringify({ name, kind: 'project' }),
+      body: JSON.stringify(payload),
     })
-    if (!r.ok) return
+    if (!r.ok) {
+      let detail = `${r.status} ${r.statusText}`
+      try {
+        const body = await r.json()
+        if (body?.detail) detail = body.detail
+      } catch {}
+      setToast(`Project not created: ${detail.slice(0, 120)}`)
+      return
+    }
     const data = await r.json()
     const s: Session = {
       id: data.id,
@@ -803,9 +1267,15 @@ export default function AppPage() {
   }
 
   async function selectThread(sid: string, tid: string) {
+    setMcpsOpen(false)
     setActiveSession(sid)
     setActiveThread(tid)
     setMessages([])
+    setInflightTools([])
+    setLlmThinking(false)
+    setLiveTokens('')
+    setPendingApproval(null)
+    setReplayIdx(null)
     await loadHistory(sid, tid)
     // Sync file chips with backend reality (agent may have written files).
     refreshFiles(sid)
@@ -815,6 +1285,23 @@ export default function AppPage() {
     let threads = threadsMap[sid]
     if (!threads) threads = await loadThreads(sid)
     if (threads[0]) selectThread(sid, threads[0].id)
+  }
+
+  // Open the project landing pane: active session, no active thread.
+  // Clicking on a project row header should put the user here so they can
+  // see the project's files, threads, and metadata before diving in.
+  async function selectProject(sid: string) {
+    setMcpsOpen(false)
+    setActiveSession(sid)
+    setActiveThread(null)
+    setMessages([])
+    setInflightTools([])
+    setLlmThinking(false)
+    setLiveTokens('')
+    setPendingApproval(null)
+    setReplayIdx(null)
+    if (!threadsMap[sid]) await loadThreads(sid)
+    refreshFiles(sid)
   }
 
   async function send() {
@@ -898,6 +1385,7 @@ export default function AppPage() {
     // errors we know won't recover (auth, rate-limit, validation).
     let chatErrorDetail: string | null = null
     let chatStatus: number | null = null
+    let chatInterrupted = false
     authFetch('/api/chat', {
       method: 'POST',
       body: JSON.stringify({
@@ -917,7 +1405,18 @@ export default function AppPage() {
             if (body?.detail) detail = body.detail
           } catch {}
           chatErrorDetail = detail
+          return
         }
+        // Inspect the body — Confirm mode pauses the agent and returns
+        // `interrupted: true`. The matching SSE event fires the approval
+        // card; we just need to stop the polling loop.
+        try {
+          const body = await r.json()
+          if (body?.interrupted) {
+            chatInterrupted = true
+            if (body?.approval) setPendingApproval(body.approval)
+          }
+        } catch {}
       })
       .catch((e: any) => {
         chatErrorDetail = e?.message ?? String(e)
@@ -928,6 +1427,14 @@ export default function AppPage() {
 
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 1500))
+
+      // Confirm-mode interrupt — agent is paused waiting for the user's
+      // approval card to be answered. Stop polling and let the approval
+      // flow take over.
+      if (chatInterrupted) {
+        setSending(false)
+        return
+      }
 
       try {
         const r = await authFetch(
@@ -1002,6 +1509,10 @@ export default function AppPage() {
     ? (kinds[activeSession] ?? 'project')
     : 'project'
   const activeFiles = activeSession ? filesMap[activeSession] || [] : []
+  // In replay mode, slice messages to the scrubber position so the user
+  // can step through the conversation as if it were happening live.
+  const displayMessages =
+    replayIdx == null ? messages : messages.slice(0, replayIdx)
 
   if (!ready) {
     return (
@@ -1016,18 +1527,19 @@ export default function AppPage() {
     <div className="flex h-screen bg-ink-50 text-fog-100 overflow-hidden">
       {/* ────── Sidebar ────── */}
       <aside className="w-72 shrink-0 border-r border-line bg-ink-100/60 flex flex-col">
-        <div className="px-4 py-3 flex items-center gap-2 border-b border-line">
+        <div className="px-4 py-3 flex items-center justify-between gap-2 border-b border-line">
           <Link href="/" className="flex items-center gap-2 group">
             <Glyph />
             <span className="text-sm tracking-tight font-medium">agent</span>
           </Link>
+          <ThemeToggle />
         </div>
 
         {/* + New dropdown */}
         <div className="px-3 pt-3 relative" ref={newBtnWrapRef}>
           <button
             onClick={() => setNewMenuOpen((v) => !v)}
-            className="w-full flex items-center justify-between gap-2 bg-white text-black hover:bg-fog-50 transition px-3 py-2 rounded-lg text-sm font-medium"
+            className="w-full flex items-center justify-between gap-2 bg-accent text-ink-50 hover:bg-accent/90 transition px-3 py-2 rounded-lg text-sm font-medium"
           >
             <span className="flex items-center gap-2">
               <PlusIcon />
@@ -1043,7 +1555,7 @@ export default function AppPage() {
                   setNewMenuOpen(false)
                   setProjectModalOpen(true)
                 }}
-                className="w-full text-left px-3 py-2 rounded-md hover:bg-white/[0.06] flex items-center gap-2.5"
+                className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5"
               >
                 <IconFolder />
                 <div>
@@ -1058,7 +1570,7 @@ export default function AppPage() {
                   setNewMenuOpen(false)
                   createChat()
                 }}
-                className="w-full text-left px-3 py-2 rounded-md hover:bg-white/[0.06] flex items-center gap-2.5"
+                className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5"
               >
                 <IconChat />
                 <div>
@@ -1076,10 +1588,13 @@ export default function AppPage() {
         <div className="flex-1 overflow-y-auto pt-3 pb-4">
           {/* Projects */}
           <div className="px-4 mb-1.5 flex items-center justify-between">
-            <span className="text-[11px] uppercase tracking-widest text-fog-400">
+            <span className="text-[11px] uppercase tracking-widest text-fog-400 inline-flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-sm bg-amber-500/80" />
               Projects
             </span>
-            <span className="text-[11px] text-fog-500">{projects.length}</span>
+            <span className="text-[10px] text-fog-500 px-1.5 py-0.5 rounded-full bg-soft/[0.06] tabular-nums">
+              {projects.length}
+            </span>
           </div>
           <div className="px-1.5">
             {projects.length === 0 && (
@@ -1111,18 +1626,32 @@ export default function AppPage() {
                       }
                     />
                   ) : (
-                    <div className="group relative flex items-center rounded-md hover:bg-white/[0.04]">
+                    <div
+                      className={`group relative flex items-center rounded-md hover:bg-soft/[0.04] ${
+                        activeSession === s.id
+                          ? 'bg-soft/[0.05] ring-1 ring-amber-500/20'
+                          : ''
+                      }`}
+                    >
+                      {/* Left accent strip — visible whenever this project
+                         (or any thread inside it) is the active session. */}
+                      {activeSession === s.id && (
+                        <span className="absolute left-0 top-1 bottom-1 w-[2px] rounded-r bg-amber-500/70" />
+                      )}
                       <button
-                        onClick={() => toggleSession(s.id)}
-                        className="flex-1 min-w-0 px-2.5 py-1.5 text-left text-sm flex items-center gap-2 text-fog-100"
+                        onClick={() => {
+                          toggleSession(s.id)
+                          selectProject(s.id)
+                        }}
+                        className="flex-1 min-w-0 px-2.5 py-1.5 text-left text-sm flex items-center gap-2 text-fog-100 font-medium"
                       >
                         <Caret open={isOpen} className="text-fog-400" />
-                        <IconFolder className="shrink-0 text-fog-300" small />
+                        <IconFolder className="shrink-0 text-amber-500/80" small />
                         <span className="truncate flex-1">
                           {sessionDisplayName(s)}
                         </span>
                         {fileCount > 0 && (
-                          <span className="text-[10px] text-fog-500">
+                          <span className="text-[10px] text-fog-500 tabular-nums">
                             {fileCount}
                           </span>
                         )}
@@ -1133,7 +1662,7 @@ export default function AppPage() {
                           e.stopPropagation()
                           setRowMenuKey(menuOpen ? null : rk)
                         }}
-                        className={`shrink-0 mr-1 w-6 h-6 rounded hover:bg-white/[0.08] text-fog-300 flex items-center justify-center ${
+                        className={`shrink-0 mr-1 w-6 h-6 rounded hover:bg-soft/[0.08] text-fog-300 flex items-center justify-center ${
                           menuOpen
                             ? 'opacity-100'
                             : 'opacity-0 group-hover:opacity-100 focus:opacity-100'
@@ -1176,7 +1705,7 @@ export default function AppPage() {
                               <button
                                 key={`f:${f}`}
                                 onClick={() => openFileViewer(s.id, display)}
-                                className="w-full text-left px-2.5 py-1.5 rounded-md flex items-center gap-2.5 text-[13px] text-fog-200 hover:bg-white/[0.03] hover:text-white"
+                                className="w-full text-left px-2.5 py-1.5 rounded-md flex items-center gap-2.5 text-[13px] text-fog-200 hover:bg-soft/[0.03] hover:text-fog-50"
                                 title={`Open ${display}`}
                               >
                                 <IconFile />
@@ -1202,8 +1731,8 @@ export default function AppPage() {
                             data-row-menu={tMenuOpen ? '1' : undefined}
                             className={`group relative rounded-md flex items-center text-[13px] ${
                               active
-                                ? 'bg-white/[0.07] text-white'
-                                : 'text-fog-200 hover:bg-white/[0.03]'
+                                ? 'bg-soft/[0.07] text-fog-50'
+                                : 'text-fog-200 hover:bg-soft/[0.03]'
                             }`}
                           >
                             {tRenaming ? (
@@ -1224,7 +1753,7 @@ export default function AppPage() {
                               <>
                                 <button
                                   onClick={() => selectThread(s.id, t.id)}
-                                  className="flex-1 min-w-0 text-left px-2.5 py-1.5 flex items-center gap-2.5 hover:text-white"
+                                  className="flex-1 min-w-0 text-left px-2.5 py-1.5 flex items-center gap-2.5 hover:text-fog-50"
                                 >
                                   <span
                                     className={`dot shrink-0 ${
@@ -1249,7 +1778,7 @@ export default function AppPage() {
                                     e.stopPropagation()
                                     setRowMenuKey(tMenuOpen ? null : tk)
                                   }}
-                                  className={`shrink-0 mr-1 w-6 h-6 rounded hover:bg-white/[0.08] text-fog-300 flex items-center justify-center ${
+                                  className={`shrink-0 mr-1 w-6 h-6 rounded hover:bg-soft/[0.08] text-fog-300 flex items-center justify-center ${
                                     tMenuOpen
                                       ? 'opacity-100'
                                       : 'opacity-0 group-hover:opacity-100 focus:opacity-100'
@@ -1283,7 +1812,7 @@ export default function AppPage() {
                       })}
                       <button
                         onClick={() => createThread(s.id)}
-                        className="w-full text-left px-2.5 py-1.5 rounded-md text-[12px] text-fog-400 hover:text-white hover:bg-white/[0.03] flex items-center gap-2.5"
+                        className="w-full text-left px-2.5 py-1.5 rounded-md text-[12px] text-fog-400 hover:text-fog-50 hover:bg-soft/[0.03] flex items-center gap-2.5"
                       >
                         <PlusIcon small />
                         New chat
@@ -1297,10 +1826,13 @@ export default function AppPage() {
 
           {/* Chats */}
           <div className="px-4 mt-5 mb-1.5 flex items-center justify-between">
-            <span className="text-[11px] uppercase tracking-widest text-fog-400">
+            <span className="text-[11px] uppercase tracking-widest text-fog-400 inline-flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-fog-400" />
               Chats
             </span>
-            <span className="text-[11px] text-fog-500">{chats.length}</span>
+            <span className="text-[10px] text-fog-500 px-1.5 py-0.5 rounded-full bg-soft/[0.06] tabular-nums">
+              {chats.length}
+            </span>
           </div>
           <div className="px-1.5">
             {chats.length === 0 && (
@@ -1319,8 +1851,8 @@ export default function AppPage() {
                   data-row-menu={menuOpen ? '1' : undefined}
                   className={`group relative rounded-md flex items-center text-[13px] ${
                     active
-                      ? 'bg-white/[0.07] text-white'
-                      : 'text-fog-200 hover:bg-white/[0.03]'
+                      ? 'bg-soft/[0.07] text-fog-50'
+                      : 'text-fog-200 hover:bg-soft/[0.03]'
                   }`}
                 >
                   {renaming ? (
@@ -1340,7 +1872,7 @@ export default function AppPage() {
                     <>
                       <button
                         onClick={() => selectChat(s.id)}
-                        className="flex-1 min-w-0 text-left px-2.5 py-1.5 flex items-center gap-2.5 hover:text-white"
+                        className="flex-1 min-w-0 text-left px-2.5 py-1.5 flex items-center gap-2.5 hover:text-fog-50"
                       >
                         <IconChat
                           className="shrink-0 text-fog-400"
@@ -1364,7 +1896,7 @@ export default function AppPage() {
                           e.stopPropagation()
                           setRowMenuKey(menuOpen ? null : rk)
                         }}
-                        className={`shrink-0 mr-1 w-6 h-6 rounded hover:bg-white/[0.08] text-fog-300 flex items-center justify-center ${
+                        className={`shrink-0 mr-1 w-6 h-6 rounded hover:bg-soft/[0.08] text-fog-300 flex items-center justify-center ${
                           menuOpen
                             ? 'opacity-100'
                             : 'opacity-0 group-hover:opacity-100 focus:opacity-100'
@@ -1412,13 +1944,36 @@ export default function AppPage() {
           </div>
         </div>
 
+        {/* MCP inventory entry — sits above the user profile so it's
+            findable without diving into the user menu. Toggles the MCP
+            panel in the main pane (in place of chat). */}
+        <div className="px-3 pt-2">
+          <button
+            onClick={() => setMcpsOpen((v) => !v)}
+            aria-pressed={mcpsOpen}
+            className={`w-full flex items-center gap-3 px-2 py-2 rounded-md transition ${
+              mcpsOpen
+                ? 'bg-soft/[0.08] text-fog-50'
+                : 'hover:bg-soft/[0.04] text-fog-200'
+            }`}
+          >
+            <span className="w-7 h-7 rounded-md bg-soft/10 text-accent flex items-center justify-center">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+                <path d="M3.27 6.96L12 12.01l8.73-5.05M12 22.08V12" opacity="0.6" />
+              </svg>
+            </span>
+            <span className="text-sm flex-1 text-left">MCP Inventory</span>
+          </button>
+        </div>
+
         {/* User menu */}
         <div className="border-t border-line p-3 relative">
           <button
             onClick={() => setUserMenuOpen((v) => !v)}
-            className="w-full flex items-center gap-3 px-2 py-2 rounded-md hover:bg-white/[0.04]"
+            className="w-full flex items-center gap-3 px-2 py-2 rounded-md hover:bg-soft/[0.04]"
           >
-            <span className="w-7 h-7 rounded-full bg-white/10 flex items-center justify-center text-xs">
+            <span className="w-7 h-7 rounded-full bg-soft/10 flex items-center justify-center text-xs">
               {(userEmail ?? '?').slice(0, 1).toUpperCase()}
             </span>
             <span className="text-sm truncate flex-1 text-left">{userEmail}</span>
@@ -1428,7 +1983,7 @@ export default function AppPage() {
             <div className="absolute bottom-full left-3 right-3 mb-2 z-50 rounded-2xl border border-lineStrong bg-ink-200 p-1 text-sm shadow-2xl shadow-black/60">
               <Link
                 href="/"
-                className="block px-3 py-2 rounded-md hover:bg-white/[0.06]"
+                className="block px-3 py-2 rounded-md hover:bg-soft/[0.06]"
               >
                 Back to home
               </Link>
@@ -1437,7 +1992,7 @@ export default function AppPage() {
                   setUserMenuOpen(false)
                   setGithubModalOpen(true)
                 }}
-                className="w-full text-left px-3 py-2 rounded-md hover:bg-white/[0.06] flex items-center justify-between"
+                className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center justify-between"
               >
                 <span>GitHub</span>
                 <span className="text-[11px] text-fog-400 truncate ml-2">
@@ -1446,7 +2001,7 @@ export default function AppPage() {
               </button>
               <button
                 onClick={signOut}
-                className="w-full text-left px-3 py-2 rounded-md hover:bg-white/[0.06]"
+                className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06]"
               >
                 Sign out
               </button>
@@ -1457,25 +2012,37 @@ export default function AppPage() {
 
       {/* ────── Main ────── */}
       <main className="flex-1 flex flex-col min-w-0">
+        {mcpsOpen ? (
+          <MCPInventoryPanel embedded />
+        ) : (
+        <>
         {/* Top bar */}
         <header className="h-12 px-5 border-b border-line flex items-center justify-between">
           <div className="text-sm flex items-center gap-2 min-w-0">
-            {activeSessionObj && activeThreadObj ? (
+            {activeSessionObj ? (
               activeKind === 'project' ? (
                 <>
-                  <IconFolder small className="text-fog-400" />
-                  <span className="text-fog-300 truncate">
-                    {activeSessionObj.name}
-                  </span>
-                  <span className="text-fog-500">/</span>
-                  <span className="text-white truncate">
-                    {threadDisplayName(activeThreadObj)}
-                  </span>
+                  <IconFolder small className="text-amber-500/80" />
+                  <button
+                    onClick={() => selectProject(activeSessionObj.id)}
+                    className="text-fog-200 truncate hover:text-fog-50 transition"
+                    title="Open project home"
+                  >
+                    {sessionDisplayName(activeSessionObj)}
+                  </button>
+                  {activeThreadObj && (
+                    <>
+                      <span className="text-fog-500">/</span>
+                      <span className="text-fog-50 truncate">
+                        {threadDisplayName(activeThreadObj)}
+                      </span>
+                    </>
+                  )}
                 </>
               ) : (
                 <>
                   <IconChat small className="text-fog-400" />
-                  <span className="text-white truncate">
+                  <span className="text-fog-50 truncate">
                     {sessionDisplayName(activeSessionObj)}
                   </span>
                 </>
@@ -1485,6 +2052,29 @@ export default function AppPage() {
             )}
           </div>
           <div className="flex items-center gap-2">
+            {activeThread && messages.length > 0 && (
+              <ReplayControls
+                replayIdx={replayIdx}
+                total={messages.length}
+                onEnter={() => setReplayIdx(1)}
+                onExit={() => setReplayIdx(null)}
+                onStep={(d) =>
+                  setReplayIdx((cur) => {
+                    if (cur == null) return cur
+                    return Math.min(messages.length, Math.max(1, cur + d))
+                  })
+                }
+              />
+            )}
+            {activeSessionObj && activeKind === 'project' && (
+              <ViewToggle mode={viewMode} onChange={setViewMode} />
+            )}
+            {activeSessionObj && activeKind === 'project' && (
+              <ModeToggle
+                mode={activeSessionObj.mode ?? 'auto'}
+                onChange={(m) => updateSessionMode(activeSessionObj.id, m)}
+              />
+            )}
             {models.length > 0 ? (
               <div className="chip flex items-center gap-2 pr-1">
                 <span className="dot bg-emerald-400" />
@@ -1497,14 +2087,14 @@ export default function AppPage() {
                       localStorage.setItem('selected_model', v)
                     }
                   }}
-                  className="bg-transparent text-xs text-white outline-none max-w-[14rem] truncate"
+                  className="bg-transparent text-xs text-fog-50 outline-none max-w-[14rem] truncate"
                   title="Chat model (OpenRouter free tier)"
                 >
                   {models.map((m) => (
                     <option
                       key={m.id}
                       value={m.id}
-                      className="bg-ink-200 text-white"
+                      className="bg-ink-200 text-fog-50"
                     >
                       {m.name.replace(/\s*\(free\)\s*$/i, '')}
                     </option>
@@ -1536,7 +2126,7 @@ export default function AppPage() {
                       onClick={() =>
                         activeSession && openFileViewer(activeSession, display)
                       }
-                      className="chip text-[11px] py-0.5 hover:bg-white/[0.08] cursor-pointer"
+                      className="chip text-[11px] py-0.5 hover:bg-soft/[0.08] cursor-pointer"
                       title={`Open ${display}`}
                     >
                       <IconFile />
@@ -1556,36 +2146,123 @@ export default function AppPage() {
 
         {/* Conversation */}
         <div className="flex-1 overflow-y-auto relative">
-          <div className="mx-auto max-w-3xl px-6 py-10">
-            {!activeThread && <EmptyState onPick={(text) => setInput(text)} />}
-
-            <div className="space-y-7">
-              {messages
-                .filter(
-                  (m) =>
-                    m.role !== 'tool' &&
-                    !(m.role === 'assistant' && !m.content?.trim()) &&
-                    !(
-                      m.role === 'assistant' &&
-                      m.tool_calls &&
-                      m.tool_calls.length > 0
-                    ),
-                )
-                .map((m, i) => (
-                  <MessageBlock key={i} msg={m} />
+          {viewMode === 'task' && activeKind === 'project' && activeThread ? (
+            <TaskView
+              messages={displayMessages}
+              sessionId={activeSession}
+              sending={sending && replayIdx == null}
+              pendingApproval={replayIdx == null ? pendingApproval : null}
+              resolvingApproval={resolvingApproval}
+              onDecide={(approved, reason) => resolveApproval(approved, reason)}
+              onCancel={cancelChat}
+              endRef={endRef}
+              inflightTools={replayIdx == null ? inflightTools : []}
+              llmThinking={llmThinking}
+              liveTokens={replayIdx == null ? liveTokens : ''}
+            />
+          ) : (
+            <div className="mx-auto max-w-3xl px-6 py-10">
+              {!activeThread &&
+                (activeKind === 'project' && activeSessionObj ? (
+                  <ProjectLanding
+                    session={activeSessionObj}
+                    threads={threadsMap[activeSessionObj.id] || []}
+                    files={filesMap[activeSessionObj.id] || []}
+                    threadNames={threadNames}
+                    sessionName={sessionDisplayName(activeSessionObj)}
+                    onOpenThread={(tid) =>
+                      selectThread(activeSessionObj.id, tid)
+                    }
+                    onOpenFile={(name) => openFileViewer(activeSessionObj.id, name)}
+                    onNewThread={() => createThread(activeSessionObj.id)}
+                  />
+                ) : (
+                  <EmptyState onPick={(text) => setInput(text)} />
                 ))}
-              {sending && <TypingIndicator />}
-              <div ref={endRef} />
-            </div>
-          </div>
 
-          {/* Floating context-window button — right side, vertically centered */}
+              <div className="space-y-5">
+                {(() => {
+                  const args = pairToolArgs(displayMessages)
+                  return displayMessages
+                    .map((m, i) => ({ m, i, args: args[i] }))
+                    .filter(({ m }) =>
+                      !(
+                        m.role === 'assistant' &&
+                        !m.content?.trim() &&
+                        !(m.tool_calls && m.tool_calls.length > 0)
+                      ) &&
+                      !(
+                        m.role === 'assistant' &&
+                        m.tool_calls &&
+                        m.tool_calls.length > 0
+                      ),
+                    )
+                    .map(({ m, i, args }) => (
+                      <MessageBlock
+                        key={i}
+                        msg={m}
+                        sessionId={activeSession}
+                        toolArgs={args}
+                      />
+                    ))
+                })()}
+                {/* In-flight tools — shown live as they start, before the
+                   persisted message arrives. */}
+                {replayIdx == null && inflightTools.map((t) => (
+                  <InflightToolRow key={t.run_id} tool={t} />
+                ))}
+                {/* Live token preview — tokens stream in as the model
+                   generates; replaced by the canonical message when it
+                   lands in the DB. */}
+                {replayIdx == null && liveTokens && (
+                  <LiveAssistantPreview tokens={liveTokens} />
+                )}
+                {replayIdx == null && sending && !pendingApproval && !liveTokens && (
+                  <TypingIndicator label={llmThinking ? 'thinking' : 'working'} />
+                )}
+                {replayIdx == null && pendingApproval && (
+                  <ApprovalCard
+                    approval={pendingApproval}
+                    disabled={resolvingApproval}
+                    onDecide={(approved, reason) =>
+                      resolveApproval(approved, reason)
+                    }
+                  />
+                )}
+                {replayIdx == null && sending && (
+                  <div className="flex justify-end">
+                    <button
+                      onClick={cancelChat}
+                      className="text-[11px] px-2.5 py-1 rounded-md border border-line text-fog-300 hover:bg-soft/[0.06] hover:text-fog-50"
+                    >
+                      Stop
+                    </button>
+                  </div>
+                )}
+                <div ref={endRef} />
+              </div>
+            </div>
+          )}
+
+          {/* Floating context-window ring — right side, vertically centered.
+             Shows live token usage as a percentage with an arc that fills
+             proportionally and changes color as usage climbs. */}
           {activeThread && (
-            <button
+            <ContextRingButton
+              summary={contextSummary}
               onClick={openContextViewer}
-              className="fixed right-5 top-1/2 -translate-y-1/2 z-30 w-10 h-10 rounded-full bg-ink-200 border border-lineStrong text-fog-300 hover:text-white hover:bg-white/[0.06] shadow-xl shadow-black/40 flex items-center justify-center transition opacity-70 hover:opacity-100"
-              title="View context window"
-              aria-label="View context window"
+            />
+          )}
+
+          {/* Floating history button — only for project sessions. Sits below
+             the context-window button so the two stack on the right edge. */}
+          {activeThread && activeKind === 'project' && (
+            <button
+              onClick={openWorkspaceHistory}
+              className="fixed right-5 z-30 w-10 h-10 rounded-full bg-ink-200 border border-lineStrong text-fog-300 hover:text-fog-50 hover:bg-soft/[0.06] shadow-xl shadow-black/40 flex items-center justify-center transition opacity-70 hover:opacity-100"
+              style={{ top: 'calc(50% + 48px)' }}
+              title="Workspace history"
+              aria-label="Workspace history"
             >
               <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -1598,15 +2275,21 @@ export default function AppPage() {
                 strokeLinecap="round"
                 strokeLinejoin="round"
               >
-                <circle cx="12" cy="12" r="9" />
+                <path d="M3 12a9 9 0 1 0 3-6.7" />
+                <path d="M3 4v5h5" />
                 <path d="M12 7v5l3 2" />
               </svg>
             </button>
           )}
         </div>
 
-        {/* Composer */}
-        <footer className="border-t border-line">
+        {/* Composer — hidden on the project landing pane (no thread to
+           send into; user picks or creates a thread first). */}
+        <footer
+          className={`border-t border-line ${
+            activeKind === 'project' && !activeThread ? 'hidden' : ''
+          }`}
+        >
           <div className="mx-auto max-w-3xl px-6 py-4">
             <form
               onSubmit={(e) => {
@@ -1628,7 +2311,7 @@ export default function AppPage() {
                       <button
                         type="button"
                         onClick={() => removePendingFile(f.name)}
-                        className="ml-1 w-4 h-4 rounded-full text-fog-400 hover:text-white hover:bg-white/[0.1] flex items-center justify-center text-[10px]"
+                        className="ml-1 w-4 h-4 rounded-full text-fog-400 hover:text-fog-50 hover:bg-soft/[0.1] flex items-center justify-center text-[10px]"
                         aria-label={`Remove ${f.name}`}
                       >
                         ✕
@@ -1643,7 +2326,7 @@ export default function AppPage() {
                     type="button"
                     onClick={() => setComposerMenuOpen((v) => !v)}
                     disabled={!activeSession || uploading}
-                    className="w-9 h-9 rounded-full hover:bg-white/[0.06] text-fog-300 hover:text-white flex items-center justify-center transition disabled:opacity-30 disabled:cursor-not-allowed"
+                    className="w-9 h-9 rounded-full hover:bg-soft/[0.06] text-fog-300 hover:text-fog-50 flex items-center justify-center transition disabled:opacity-30 disabled:cursor-not-allowed"
                     title={
                       activeSession ? 'Attach files' : 'Pick a chat first'
                     }
@@ -1663,7 +2346,7 @@ export default function AppPage() {
                           setComposerMenuOpen(false)
                           fileInputRef.current?.click()
                         }}
-                        className="w-full text-left px-3 py-2 rounded-md hover:bg-white/[0.06] flex items-center gap-2.5"
+                        className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5"
                       >
                         <IconFile />
                         <div>
@@ -1679,7 +2362,7 @@ export default function AppPage() {
                           setComposerMenuOpen(false)
                           photoInputRef.current?.click()
                         }}
-                        className="w-full text-left px-3 py-2 rounded-md hover:bg-white/[0.06] flex items-center gap-2.5"
+                        className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5"
                       >
                         <IconImage />
                         <div>
@@ -1738,11 +2421,11 @@ export default function AppPage() {
                 <button
                   type="submit"
                   disabled={!activeThread || sending || !input.trim()}
-                  className="shrink-0 rounded-full bg-white text-black w-9 h-9 flex items-center justify-center disabled:opacity-30 disabled:cursor-not-allowed hover:bg-fog-50 transition"
+                  className="shrink-0 rounded-full bg-accent text-ink-50 w-9 h-9 flex items-center justify-center disabled:opacity-30 disabled:cursor-not-allowed hover:bg-accent/90 transition"
                   title="Send"
                 >
                   {sending ? (
-                    <span className="w-3 h-3 rounded-full border-2 border-black border-t-transparent animate-spin" />
+                    <span className="w-3 h-3 rounded-full border-2 border-ink-50 border-t-transparent animate-spin" />
                   ) : (
                     <ArrowUp />
                   )}
@@ -1754,15 +2437,22 @@ export default function AppPage() {
             </p>
           </div>
         </footer>
+        </>
+        )}
       </main>
 
       {/* New project modal */}
       {projectModalOpen && (
         <NewProjectModal
-          onClose={() => setProjectModalOpen(false)}
-          onCreate={async (name, files) => {
+          githubUsername={githubUsername}
+          onOpenGithub={() => {
             setProjectModalOpen(false)
-            await createProject(name, files)
+            setGithubModalOpen(true)
+          }}
+          onClose={() => setProjectModalOpen(false)}
+          onCreate={async (name, files, github) => {
+            setProjectModalOpen(false)
+            await createProject(name, files, github)
           }}
         />
       )}
@@ -1811,6 +2501,30 @@ export default function AppPage() {
         />
       )}
 
+      {/* Workspace history side panel */}
+      {historyOpen && (
+        <HistoryPanel
+          commits={historyData}
+          loading={historyLoading}
+          error={historyError}
+          revertingId={revertingId}
+          onClose={() => setHistoryOpen(false)}
+          onRefresh={openWorkspaceHistory}
+          onRevert={(id, msg) =>
+            setConfirmDialog({
+              title: 'Undo this change?',
+              message: `This will run \`git revert\` for "${msg}". The file(s) will return to the state before this commit. A new "Revert …" commit will be added to history.`,
+              confirmLabel: 'Undo',
+              danger: false,
+              onConfirm: () => {
+                setConfirmDialog(null)
+                revertCommit(id)
+              },
+            })
+          }
+        />
+      )}
+
       {/* Context window side panel */}
       {contextOpen && (
         <ContextViewer
@@ -1850,7 +2564,7 @@ export default function AppPage() {
 
       {/* Toast */}
       {toast && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] px-4 py-2 rounded-full bg-white text-black text-sm shadow-2xl animate-float-up">
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] px-4 py-2 rounded-full bg-accent text-ink-50 text-sm shadow-2xl animate-float-up">
           {toast}
         </div>
       )}
@@ -1863,7 +2577,7 @@ export default function AppPage() {
 function EmptyState({ onPick }: { onPick: (text: string) => void }) {
   return (
     <div className="text-center pt-16 pb-8 animate-float-up">
-      <div className="serif text-5xl tracking-tighter text-white mb-3">
+      <div className="serif text-5xl tracking-tighter text-fog-50 mb-3">
         Where should we begin?
       </div>
       <p className="text-fog-300 text-base mb-10 max-w-md mx-auto">
@@ -1875,9 +2589,9 @@ function EmptyState({ onPick }: { onPick: (text: string) => void }) {
           <button
             key={h.title}
             onClick={() => onPick(h.prompt)}
-            className="surface p-4 hover:bg-white/[0.03] transition cursor-pointer text-left"
+            className="surface p-4 hover:bg-soft/[0.03] transition cursor-pointer text-left"
           >
-            <div className="text-sm text-white mb-1">{h.title}</div>
+            <div className="text-sm text-fog-50 mb-1">{h.title}</div>
             <div className="text-xs text-fog-400 leading-relaxed">{h.body}</div>
           </button>
         ))}
@@ -1915,22 +2629,55 @@ const hints = [
 
 /* ─────────────────────────── messages ─────────────────────────── */
 
-function TypingIndicator() {
+function LiveAssistantPreview({ tokens }: { tokens: string }) {
   return (
-    <div className="flex items-center gap-1.5 text-fog-400 px-1">
-      <span className="w-1.5 h-1.5 rounded-full bg-fog-300 animate-bounce [animation-delay:-0.3s]" />
-      <span className="w-1.5 h-1.5 rounded-full bg-fog-300 animate-bounce [animation-delay:-0.15s]" />
-      <span className="w-1.5 h-1.5 rounded-full bg-fog-300 animate-bounce" />
-      <span className="ml-2 text-xs">thinking</span>
+    <div className="animate-float-up">
+      <div className="flex items-center gap-2 mb-2 text-[11px] uppercase tracking-widest text-fog-400">
+        <span className="w-5 h-5 rounded-full bg-soft/10 flex items-center justify-center">
+          <span className="w-1.5 h-1.5 bg-accent rounded-sm" />
+        </span>
+        Agent
+      </div>
+      <div className="text-[15px] leading-7 text-fog-100 whitespace-pre-wrap">
+        {tokens}
+        <span
+          className="inline-block w-[7px] h-[14px] -mb-[2px] ml-0.5 bg-fog-300 animate-pulse"
+          aria-hidden
+        />
+      </div>
     </div>
   )
 }
 
-function MessageBlock({ msg }: { msg: Message }) {
+function TypingIndicator({ label = 'thinking' }: { label?: string }) {
+  return (
+    <div className="flex gap-3 text-[13px] animate-float-up">
+      <div className="flex flex-col items-center pt-1.5 shrink-0">
+        <span className="relative w-2 h-2">
+          <span className="absolute inset-0 rounded-full bg-sky-300 animate-ping" />
+          <span className="relative w-2 h-2 rounded-full bg-sky-300 inline-block" />
+        </span>
+      </div>
+      <div className="flex items-center gap-2 text-fog-400">
+        <span className="italic">{label}…</span>
+      </div>
+    </div>
+  )
+}
+
+function MessageBlock({
+  msg,
+  sessionId,
+  toolArgs,
+}: {
+  msg: Message
+  sessionId: string | null
+  toolArgs?: Record<string, any>
+}) {
   if (msg.role === 'user') {
     return (
       <div className="flex justify-end animate-float-up">
-        <div className="max-w-[80%] rounded-3xl bg-white/[0.06] border border-line text-fog-100 px-4 py-2.5 text-[15px] leading-7 whitespace-pre-wrap">
+        <div className="max-w-[80%] rounded-3xl bg-soft/[0.06] border border-line text-fog-100 px-4 py-2.5 text-[15px] leading-7 whitespace-pre-wrap">
           {msg.content}
         </div>
       </div>
@@ -1938,19 +2685,14 @@ function MessageBlock({ msg }: { msg: Message }) {
   }
   if (msg.role === 'tool') {
     return (
-      <div className="text-xs font-mono text-fog-400">
-        <div className="text-fog-500 mb-1">↳ {msg.tool_name}</div>
-        <pre className="whitespace-pre-wrap rounded-lg border border-line bg-ink-100 p-3">
-          {msg.content}
-        </pre>
-      </div>
+      <ToolMessageCard msg={msg} sessionId={sessionId} args={toolArgs} />
     )
   }
   return (
     <div className="animate-float-up">
       <div className="flex items-center gap-2 mb-2 text-[11px] uppercase tracking-widest text-fog-400">
-        <span className="w-5 h-5 rounded-full bg-white/10 flex items-center justify-center">
-          <span className="w-1.5 h-1.5 bg-white rounded-sm" />
+        <span className="w-5 h-5 rounded-full bg-soft/10 flex items-center justify-center">
+          <span className="w-1.5 h-1.5 bg-accent rounded-sm" />
         </span>
         Agent
       </div>
@@ -1961,19 +2703,1083 @@ function MessageBlock({ msg }: { msg: Message }) {
   )
 }
 
+/* ─────────────────────────── approval card (Confirm mode) ─────────────────── */
+
+function ApprovalCard({
+  approval,
+  disabled,
+  onDecide,
+}: {
+  approval: PendingApproval
+  disabled: boolean
+  onDecide: (approved: boolean, reason?: string) => void
+}) {
+  const tool = approval.tool
+  return (
+    <div className="animate-float-up rounded-xl border border-amber-300/30 bg-amber-300/[0.04] p-3.5 text-[13px]">
+      <div className="flex items-center gap-2 mb-2 text-[11px] uppercase tracking-widest text-amber-300/90">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M12 9v3.75M12 20.25h.008v.008H12v-.008Z" />
+          <path d="M10.363 3.591 1.91 18.083a1.875 1.875 0 0 0 1.636 2.793h16.908a1.875 1.875 0 0 0 1.636-2.793L13.637 3.591a1.875 1.875 0 0 0-3.274 0Z" />
+        </svg>
+        Agent wants to {tool === 'write_project_file' ? 'edit a file' : tool === 'run_shell' ? 'run a command' : tool}
+      </div>
+
+      {tool === 'write_project_file' && (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 text-fog-100">
+            <span className="text-fog-400">Write</span>
+            <code className="font-mono text-fog-50">
+              {(approval as any).filename}
+            </code>
+            <span className="text-[11px] font-mono text-fog-500">
+              {(approval as any).size} bytes
+            </span>
+          </div>
+          {(approval as any).preview && (
+            <pre className="font-mono text-[12px] text-fog-200 bg-ink-100 border border-line rounded p-2 max-h-44 overflow-y-auto whitespace-pre-wrap">
+              {(approval as any).preview}
+            </pre>
+          )}
+        </div>
+      )}
+
+      {tool === 'run_shell' && (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 text-fog-100">
+            <span className="text-fog-400">Run in</span>
+            <code className="font-mono text-fog-200">{(approval as any).cwd}</code>
+          </div>
+          <pre className="font-mono text-[12px] text-fog-100 bg-ink-100 border border-line rounded p-2 whitespace-pre-wrap">
+            $ {(approval as any).cmd}
+          </pre>
+        </div>
+      )}
+
+      <div className="flex items-center justify-end gap-2 mt-3">
+        <button
+          onClick={() => onDecide(false, 'denied via confirm prompt')}
+          disabled={disabled}
+          className="text-[12px] px-3 py-1.5 rounded-md border border-line text-fog-300 hover:bg-soft/[0.06] hover:text-fog-50 disabled:opacity-40 transition"
+        >
+          Deny
+        </button>
+        <button
+          onClick={() => onDecide(true)}
+          disabled={disabled}
+          className="text-[12px] px-3 py-1.5 rounded-md bg-accent text-ink-100 hover:bg-fog-100 disabled:opacity-40 transition font-medium"
+        >
+          {disabled ? 'Working…' : 'Approve'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/* ─────────────────────────── three-pane task view ─────────────────────────── */
+
+function TaskView({
+  messages,
+  sessionId,
+  sending,
+  pendingApproval,
+  resolvingApproval,
+  onDecide,
+  onCancel,
+  endRef,
+  inflightTools,
+  llmThinking,
+  liveTokens,
+}: {
+  messages: Message[]
+  sessionId: string | null
+  sending: boolean
+  pendingApproval: PendingApproval | null
+  resolvingApproval: boolean
+  onDecide: (approved: boolean, reason?: string) => void
+  onCancel: () => void
+  endRef: React.RefObject<HTMLDivElement>
+  inflightTools: InflightTool[]
+  llmThinking: boolean
+  liveTokens: string
+}) {
+  const argsByIdx = pairToolArgs(messages)
+
+  const conversation = messages
+    .map((m, i) => ({ m, i }))
+    .filter(({ m }) =>
+      (m.role === 'user' || (m.role === 'assistant' && m.content?.trim())) &&
+      !(m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0),
+    )
+
+  const activity = messages
+    .map((m, i) => ({ m, i }))
+    .filter(({ m }) =>
+      m.role === 'tool' ||
+      (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0),
+    )
+
+  // Latest commit SHA — drives the diff pane. We watch messages for
+  // committed-as-... markers; the diff pane refetches on change.
+  const latestSha = (() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i]
+      if (m.tool_name === 'write_project_file' && m.content) {
+        const match = m.content.match(/committed as Agent: \w+ .+? \(([a-f0-9]+)\)/)
+        if (match) return match[1]
+      }
+    }
+    return null
+  })()
+
+  return (
+    <div className="grid grid-cols-[minmax(260px,1fr)_minmax(320px,1.4fr)_minmax(320px,1.2fr)] divide-x divide-line h-full min-h-0">
+      {/* Column 1: Activity feed */}
+      <div className="flex flex-col min-h-0">
+        <div className="px-3 py-2 border-b border-line text-[11px] uppercase tracking-widest text-fog-400 flex items-center justify-between">
+          <span>Activity</span>
+          <span className="text-fog-500 normal-case tracking-normal">
+            {activity.length} event{activity.length === 1 ? '' : 's'}
+          </span>
+        </div>
+        <div className="flex-1 overflow-y-auto px-3 py-3 space-y-3">
+          {activity.length === 0 && inflightTools.length === 0 && (
+            <div className="text-[12px] text-fog-500 px-1 py-4">
+              No tool calls yet. The agent's commands and file edits will
+              stream here as they happen.
+            </div>
+          )}
+          {activity.map(({ m, i }) =>
+            m.role === 'tool' ? (
+              <MessageBlock
+                key={i}
+                msg={m}
+                sessionId={sessionId}
+                toolArgs={argsByIdx[i]}
+              />
+            ) : (
+              <ActivityToolCallStub key={i} msg={m} />
+            ),
+          )}
+          {inflightTools.map((t) => (
+            <InflightToolRow key={t.run_id} tool={t} />
+          ))}
+          {sending && !pendingApproval && (
+            <TypingIndicator label={llmThinking ? 'thinking' : 'working'} />
+          )}
+        </div>
+      </div>
+
+      {/* Column 2: Diff pane */}
+      <div className="flex flex-col min-h-0">
+        <div className="px-3 py-2 border-b border-line text-[11px] uppercase tracking-widest text-fog-400">
+          Working diff
+        </div>
+        <div className="flex-1 overflow-y-auto p-3">
+          {latestSha && sessionId ? (
+            <DiffPane sessionId={sessionId} sha={latestSha} />
+          ) : (
+            <div className="text-[12px] text-fog-500">
+              No edits in this session yet. The most recent file change will
+              show its unified diff here.
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Column 3: Chat + composer */}
+      <div className="flex flex-col min-h-0">
+        <div className="px-3 py-2 border-b border-line text-[11px] uppercase tracking-widest text-fog-400">
+          Chat
+        </div>
+        <div className="flex-1 overflow-y-auto px-3 py-3 space-y-4">
+          {conversation.map(({ m, i }) => (
+            <MessageBlock
+              key={i}
+              msg={m}
+              sessionId={sessionId}
+              toolArgs={argsByIdx[i]}
+            />
+          ))}
+          {liveTokens && <LiveAssistantPreview tokens={liveTokens} />}
+          {sending && !pendingApproval && !liveTokens && (
+            <TypingIndicator label={llmThinking ? 'thinking' : 'working'} />
+          )}
+          {pendingApproval && (
+            <ApprovalCard
+              approval={pendingApproval}
+              disabled={resolvingApproval}
+              onDecide={onDecide}
+            />
+          )}
+          {sending && (
+            <div className="flex justify-end">
+              <button
+                onClick={onCancel}
+                className="text-[11px] px-2.5 py-1 rounded-md border border-line text-fog-300 hover:bg-soft/[0.06] hover:text-fog-50"
+              >
+                Stop
+              </button>
+            </div>
+          )}
+          <div ref={endRef} />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// One-line preview of an assistant tool-call intermediate — used in the
+// Activity column so the user sees what the agent decided to call.
+function ActivityToolCallStub({ msg }: { msg: Message }) {
+  const names = (msg.tool_calls ?? []).map((c) => c.name).join(', ')
+  return (
+    <div className="text-[11px] text-fog-400 font-mono px-2 py-1 rounded border border-line bg-ink-100/40">
+      → invoking {names || 'tool'}
+    </div>
+  )
+}
+
+// Tiny self-contained component that fetches and renders a single commit's
+// diff. Reuses the DiffBlock renderer.
+function DiffPane({ sessionId, sha }: { sessionId: string; sha: string }) {
+  const [diff, setDiff] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [err, setErr] = useState<string | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    setErr(null)
+    setDiff(null)
+    ;(async () => {
+      try {
+        const r = await authFetch(
+          `/api/sessions/${sessionId}/commits/${sha}/diff`,
+        )
+        if (cancelled) return
+        if (!r.ok) {
+          let detail = `${r.status} ${r.statusText}`
+          try {
+            const body = await r.json()
+            if (body?.detail) detail = body.detail
+          } catch {}
+          setErr(detail)
+          return
+        }
+        const body = await r.json()
+        setDiff(body.diff ?? '')
+      } catch (e: any) {
+        if (!cancelled) setErr(e?.message ?? 'network')
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [sessionId, sha])
+
+  if (loading) return <div className="text-[12px] text-fog-400">Loading diff…</div>
+  if (err)
+    return <div className="text-[12px] text-rose-300">Failed: {err}</div>
+  if (!diff) return <div className="text-[12px] text-fog-500">No diff content.</div>
+  return (
+    <div className="rounded border border-line bg-ink-100 overflow-hidden">
+      <div className="px-3 py-1.5 border-b border-line text-[11px] text-fog-500 font-mono">
+        {sha.slice(0, 7)}
+      </div>
+      <DiffBlock diff={diff} />
+    </div>
+  )
+}
+
+/* ─────────────────────────── replay scrubber ─────────────────────────────── */
+
+function ReplayControls({
+  replayIdx,
+  total,
+  onEnter,
+  onExit,
+  onStep,
+}: {
+  replayIdx: number | null
+  total: number
+  onEnter: () => void
+  onExit: () => void
+  onStep: (delta: number) => void
+}) {
+  if (replayIdx == null) {
+    return (
+      <button
+        onClick={onEnter}
+        className="text-[11px] px-2.5 py-1 rounded-full border border-line bg-ink-200 text-fog-300 hover:text-fog-50 hover:bg-soft/[0.06]"
+        title="Step through this thread message-by-message"
+      >
+        Replay
+      </button>
+    )
+  }
+  return (
+    <div className="flex items-center gap-1 rounded-full border border-amber-300/30 bg-amber-300/[0.06] p-0.5 text-[11px]">
+      <span className="px-2 text-amber-300/90 font-mono">
+        {replayIdx}/{total}
+      </span>
+      <button
+        onClick={() => onStep(-1)}
+        disabled={replayIdx <= 1}
+        className="px-2 py-1 rounded-full text-fog-200 hover:text-fog-50 hover:bg-soft/[0.06] disabled:opacity-40"
+        title="Previous"
+      >
+        ◀
+      </button>
+      <button
+        onClick={() => onStep(1)}
+        disabled={replayIdx >= total}
+        className="px-2 py-1 rounded-full text-fog-200 hover:text-fog-50 hover:bg-soft/[0.06] disabled:opacity-40"
+        title="Next"
+      >
+        ▶
+      </button>
+      <button
+        onClick={onExit}
+        className="px-2 py-1 rounded-full text-fog-300 hover:text-fog-50 hover:bg-soft/[0.06]"
+        title="Exit replay"
+      >
+        Live
+      </button>
+    </div>
+  )
+}
+
+/* ─────────────────────────── view toggle (Chat / Task) ───────────────────── */
+
+function ViewToggle({
+  mode,
+  onChange,
+}: {
+  mode: 'chat' | 'task'
+  onChange: (m: 'chat' | 'task') => void
+}) {
+  return (
+    <div
+      className="flex items-center rounded-full border border-line bg-ink-200 p-0.5 text-[11px]"
+      title={
+        mode === 'chat'
+          ? 'Chat view — linear conversation.'
+          : 'Task view — activity feed, live diff, and chat side by side.'
+      }
+    >
+      {(['chat', 'task'] as const).map((m) => (
+        <button
+          key={m}
+          onClick={() => mode !== m && onChange(m)}
+          className={`px-2.5 py-1 rounded-full transition ${
+            mode === m
+              ? 'bg-soft/[0.10] text-fog-50'
+              : 'text-fog-400 hover:text-fog-50'
+          }`}
+        >
+          {m === 'chat' ? 'Chat' : 'Task'}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/* ─────────────────────────── mode toggle (Auto / Confirm) ────────────────── */
+
+function ModeToggle({
+  mode,
+  onChange,
+}: {
+  mode: 'auto' | 'confirm'
+  onChange: (m: 'auto' | 'confirm') => void
+}) {
+  return (
+    <div
+      className="flex items-center rounded-full border border-line bg-ink-200 p-0.5 text-[11px]"
+      title={
+        mode === 'auto'
+          ? 'Auto: agent edits and runs commands freely.'
+          : 'Confirm: agent asks before each file edit or shell command.'
+      }
+    >
+      {(['auto', 'confirm'] as const).map((m) => (
+        <button
+          key={m}
+          onClick={() => mode !== m && onChange(m)}
+          className={`px-2.5 py-1 rounded-full transition ${
+            mode === m
+              ? 'bg-soft/[0.10] text-fog-50'
+              : 'text-fog-400 hover:text-fog-50'
+          }`}
+        >
+          {m === 'auto' ? 'Auto' : 'Confirm'}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/* ─────────────────────────── tool-message cards ─────────────────────────── */
+
+function ToolMessageCard({
+  msg,
+  sessionId,
+  args,
+}: {
+  msg: Message
+  sessionId: string | null
+  args?: Record<string, any>
+}) {
+  const name = msg.tool_name ?? ''
+  const content = msg.content ?? ''
+  const isError = content.startsWith('Error')
+
+  if (name === 'run_shell')
+    return <ShellEventRow content={content} cmdArg={args?.cmd} />
+  if (name === 'write_project_file')
+    return (
+      <WriteFileEventRow
+        content={content}
+        isError={isError}
+        sessionId={sessionId}
+        filenameArg={args?.filename}
+      />
+    )
+  if (name === 'read_project_file')
+    return (
+      <ReadFileEventRow
+        content={content}
+        isError={isError}
+        filenameArg={args?.filename}
+      />
+    )
+  if (name === 'list_project_files')
+    return <ListFilesEventRow content={content} isError={isError} />
+
+  return (
+    <EventRow icon={<ToolIcon />} verb={name || 'tool'} verbColor="text-fog-200">
+      <DetailsBlock content={content} />
+    </EventRow>
+  )
+}
+
+/** Compact one-row event in the activity timeline.
+ *  Left: status indicator (green dot when done, spinner when in-flight, red ×
+ *  on error). Middle: bold verb + target + small subtext. Right: optional
+ *  action button. Below: optional expandable details. */
+function EventRow({
+  status = 'done',
+  icon,
+  verb,
+  target,
+  verbColor = 'text-fog-300',
+  badge,
+  subtext,
+  action,
+  children,
+}: {
+  status?: 'done' | 'running' | 'error'
+  icon?: React.ReactNode
+  verb: string
+  target?: React.ReactNode
+  verbColor?: string
+  badge?: React.ReactNode
+  subtext?: React.ReactNode
+  action?: React.ReactNode
+  children?: React.ReactNode
+}) {
+  return (
+    <div className="flex gap-3 text-[13px] group animate-float-up">
+      {/* Status indicator + connecting line */}
+      <div className="flex flex-col items-center pt-1.5 shrink-0">
+        <StatusDot status={status} />
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
+          {icon && <span className="text-fog-500">{icon}</span>}
+          <span className={`font-medium ${verbColor}`}>{verb}</span>
+          {target && (
+            <code className="font-mono text-fog-50 text-[13px] truncate">
+              {target}
+            </code>
+          )}
+          {badge}
+          {action && <span className="ml-auto">{action}</span>}
+        </div>
+        {subtext && (
+          <div className="text-[11px] text-fog-500 mt-0.5">{subtext}</div>
+        )}
+        {children && <div className="mt-2">{children}</div>}
+      </div>
+    </div>
+  )
+}
+
+function StatusDot({ status }: { status: 'done' | 'running' | 'error' }) {
+  if (status === 'running') {
+    return (
+      <span className="relative w-2 h-2">
+        <span className="absolute inset-0 rounded-full bg-sky-300 animate-ping" />
+        <span className="relative w-2 h-2 rounded-full bg-sky-300 inline-block" />
+      </span>
+    )
+  }
+  if (status === 'error') {
+    return <span className="w-2 h-2 rounded-full bg-rose-400" />
+  }
+  return <span className="w-2 h-2 rounded-full bg-emerald-400" />
+}
+
+function ShellEventRow({
+  content,
+  cmdArg,
+}: {
+  content: string
+  cmdArg?: string
+}) {
+  const cmdMatch = content.match(/^\$ ([\s\S]*?)(?=\n\(exit |\n--- |$)/)
+  const exitMatch = content.match(/\(exit (\d+), (\d+) ms\)/)
+  const stdoutMatch = content.match(
+    /--- stdout ---\n([\s\S]*?)(?=\n--- stderr ---|$)/,
+  )
+  const stderrMatch = content.match(/--- stderr ---\n([\s\S]*)$/)
+  const noOutput = /\(no output\)/.test(content)
+
+  const cmd = (cmdMatch?.[1] ?? cmdArg ?? '').trim()
+  const exitCode = exitMatch ? Number(exitMatch[1]) : null
+  const duration = exitMatch ? Number(exitMatch[2]) : null
+  const stdout = (stdoutMatch?.[1] ?? '').replace(/\n+$/, '')
+  const stderr = (stderrMatch?.[1] ?? '').replace(/\n+$/, '')
+  const hasOutput = stdout || stderr || noOutput
+  const stdoutLines = stdout ? stdout.split('\n').length : 0
+
+  const [open, setOpen] = useState(false)
+  const status: 'done' | 'error' =
+    exitCode != null && exitCode !== 0 ? 'error' : 'done'
+
+  const subtext = (
+    <span className="font-mono">
+      {exitCode != null && (
+        <span className={exitCode === 0 ? 'text-fog-500' : 'text-rose-300'}>
+          exit {exitCode}
+        </span>
+      )}
+      {duration != null && <span className="text-fog-500"> · {duration} ms</span>}
+      {stdoutLines > 0 && (
+        <span className="text-fog-500"> · {stdoutLines} line{stdoutLines === 1 ? '' : 's'} of output</span>
+      )}
+    </span>
+  )
+
+  return (
+    <EventRow
+      status={status}
+      icon={<TerminalIcon />}
+      verb="Run"
+      target={cmd}
+      subtext={subtext}
+      action={
+        hasOutput && (
+          <button
+            onClick={() => setOpen((v) => !v)}
+            className="text-[11px] text-fog-400 hover:text-fog-50"
+          >
+            {open ? 'Hide output' : 'Show output'}
+          </button>
+        )
+      }
+    >
+      {open && hasOutput && (
+        <div className="rounded border border-line bg-ink-100/60 px-3 py-2 font-mono text-[12px] max-h-72 overflow-y-auto whitespace-pre-wrap">
+          {stdout && <span className="text-fog-200">{stdout}</span>}
+          {stdout && stderr && '\n'}
+          {stderr && <span className="text-rose-300/80">{stderr}</span>}
+          {!stdout && !stderr && noOutput && (
+            <span className="text-fog-500 italic">(no output)</span>
+          )}
+        </div>
+      )}
+    </EventRow>
+  )
+}
+
+function WriteFileEventRow({
+  content,
+  isError,
+  sessionId,
+  filenameArg,
+}: {
+  content: string
+  isError: boolean
+  sessionId: string | null
+  filenameArg?: string
+}) {
+  const [diffOpen, setDiffOpen] = useState(false)
+  const [diff, setDiff] = useState<string | null>(null)
+  const [diffLoading, setDiffLoading] = useState(false)
+  const [diffError, setDiffError] = useState<string | null>(null)
+
+  if (isError) return <ToolErrorRow verb="Edit" content={content} />
+
+  const sizeMatch = content.match(/^Wrote (\d+) bytes to (.+?)\./)
+  const commitMatch = content.match(
+    /committed as Agent: (created|updated) (.+?) \(([a-f0-9]+)\)/,
+  )
+  const bytes = sizeMatch ? Number(sizeMatch[1]) : 0
+  const fullPath = sizeMatch?.[2] ?? ''
+  const filename =
+    (fullPath.split('/').pop() ?? fullPath) || filenameArg || '(unnamed)'
+  const verb = commitMatch?.[1] // 'created' | 'updated' | undefined
+  const sha = commitMatch?.[3] ?? ''
+  const verbLabel = verb === 'created' ? 'Create' : 'Edit'
+
+  async function toggleDiff() {
+    if (diffOpen) {
+      setDiffOpen(false)
+      return
+    }
+    setDiffOpen(true)
+    if (diff !== null || !sha || !sessionId) return
+    setDiffLoading(true)
+    setDiffError(null)
+    try {
+      const r = await authFetch(
+        `/api/sessions/${sessionId}/commits/${sha}/diff`,
+      )
+      if (!r.ok) {
+        let detail = `${r.status} ${r.statusText}`
+        try {
+          const body = await r.json()
+          if (body?.detail) detail = body.detail
+        } catch {}
+        setDiffError(detail)
+        return
+      }
+      const body = await r.json()
+      setDiff(body.diff ?? '')
+    } catch (e: any) {
+      setDiffError(e?.message ?? 'network error')
+    } finally {
+      setDiffLoading(false)
+    }
+  }
+
+  const summary = (() => {
+    if (!diff) return null
+    let added = 0
+    let removed = 0
+    for (const line of diff.split('\n')) {
+      if (line.startsWith('+') && !line.startsWith('+++')) added++
+      else if (line.startsWith('-') && !line.startsWith('---')) removed++
+    }
+    return { added, removed }
+  })()
+
+  const subtext = (
+    <span className="font-mono">
+      {summary
+        ? (
+          <>
+            {summary.added > 0 && (
+              <span className="text-emerald-300">
+                +{summary.added} line{summary.added === 1 ? '' : 's'}
+              </span>
+            )}
+            {summary.added > 0 && summary.removed > 0 && (
+              <span className="text-fog-500"> · </span>
+            )}
+            {summary.removed > 0 && (
+              <span className="text-rose-300">
+                −{summary.removed} line{summary.removed === 1 ? '' : 's'}
+              </span>
+            )}
+            {sha && <span className="text-fog-500"> · {sha}</span>}
+          </>
+        )
+        : (
+          <>
+            {verb === 'created' ? 'Added' : 'Modified'}
+            {bytes ? <span className="text-fog-500"> · {bytes} bytes</span> : null}
+            {sha && <span className="text-fog-500"> · {sha}</span>}
+          </>
+        )}
+    </span>
+  )
+
+  return (
+    <EventRow
+      icon={<FileEditIcon />}
+      verb={verbLabel}
+      target={filename}
+      subtext={subtext}
+      action={
+        sha && sessionId ? (
+          <button
+            onClick={toggleDiff}
+            className="text-[11px] text-fog-400 hover:text-fog-50"
+          >
+            {diffOpen ? 'Hide diff' : diff ? 'Show diff' : 'View diff'}
+          </button>
+        ) : undefined
+      }
+    >
+      {diffOpen && (
+        <div>
+          {diffLoading && (
+            <div className="text-[12px] text-fog-400 px-1">Loading diff…</div>
+          )}
+          {diffError && (
+            <div className="text-[12px] text-rose-300 px-1">
+              Failed to load diff: {diffError}
+            </div>
+          )}
+          {diff !== null && !diffLoading && !diffError && (
+            <SplitDiffBlock diff={diff} />
+          )}
+        </div>
+      )}
+    </EventRow>
+  )
+}
+
+/** Side-by-side diff renderer.
+ *
+ *  Parses a unified diff into per-hunk rows. Each row pairs a "before" line
+ *  (with deletions shown in red) and an "after" line (with additions in
+ *  green). Pure-context lines appear on both sides; sequences of pure
+ *  deletes get paired with the corresponding adds when possible. */
+function SplitDiffBlock({ diff }: { diff: string }) {
+  type Row = { left: string | null; right: string | null; kind: 'context' | 'change' }
+  const rows: Row[] = []
+
+  let dels: string[] = []
+  let adds: string[] = []
+  const flush = () => {
+    const n = Math.max(dels.length, adds.length)
+    for (let i = 0; i < n; i++) {
+      rows.push({ left: dels[i] ?? null, right: adds[i] ?? null, kind: 'change' })
+    }
+    dels = []
+    adds = []
+  }
+
+  for (const raw of diff.split('\n')) {
+    if (raw.startsWith('@@')) {
+      flush()
+      rows.push({ left: raw, right: raw, kind: 'context' })
+      continue
+    }
+    if (
+      raw.startsWith('diff --git') ||
+      raw.startsWith('index ') ||
+      raw.startsWith('+++') ||
+      raw.startsWith('---') ||
+      raw.startsWith('new file mode') ||
+      raw.startsWith('deleted file mode')
+    ) {
+      flush()
+      continue
+    }
+    if (raw.startsWith('+')) {
+      adds.push(raw.slice(1))
+    } else if (raw.startsWith('-')) {
+      dels.push(raw.slice(1))
+    } else {
+      flush()
+      rows.push({ left: raw.slice(1), right: raw.slice(1), kind: 'context' })
+    }
+  }
+  flush()
+
+  return (
+    <div className="rounded border border-line bg-ink-100 overflow-hidden">
+      <div className="grid grid-cols-2 divide-x divide-line font-mono text-[12px] max-h-80 overflow-y-auto">
+        <div>
+          {rows.map((r, i) => (
+            <div
+              key={i}
+              className={`px-2 py-0.5 whitespace-pre overflow-x-auto ${
+                r.left == null
+                  ? ''
+                  : r.kind === 'change' && r.left
+                    ? 'bg-rose-500/[0.08] text-rose-300'
+                    : r.left.startsWith('@@')
+                      ? 'text-sky-300'
+                      : 'text-fog-400'
+              }`}
+            >
+              {r.left == null ? ' ' : r.left || ' '}
+            </div>
+          ))}
+        </div>
+        <div>
+          {rows.map((r, i) => (
+            <div
+              key={i}
+              className={`px-2 py-0.5 whitespace-pre overflow-x-auto ${
+                r.right == null
+                  ? ''
+                  : r.kind === 'change' && r.right
+                    ? 'bg-emerald-500/[0.08] text-emerald-300'
+                    : r.right.startsWith('@@')
+                      ? 'text-sky-300'
+                      : 'text-fog-400'
+              }`}
+            >
+              {r.right == null ? ' ' : r.right || ' '}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// Old DiffBlock kept for backwards compat (HistoryPanel / DiffPane in
+// TaskView still call it). Wraps the split view.
+function DiffBlock({ diff }: { diff: string }) {
+  return <SplitDiffBlock diff={diff} />
+}
+
+function ReadFileEventRow({
+  content,
+  isError,
+  filenameArg,
+}: {
+  content: string
+  isError: boolean
+  filenameArg?: string
+}) {
+  if (isError) return <ToolErrorRow verb="Read" content={content} />
+  const bytes = new Blob([content]).size
+  const lines = content.split('\n').length
+  return (
+    <EventRow
+      icon={<ReadIcon />}
+      verb="Read"
+      target={filenameArg || '(unnamed)'}
+      subtext={
+        <span className="font-mono">
+          {lines} line{lines === 1 ? '' : 's'}
+          <span className="text-fog-500"> · {bytes} bytes</span>
+        </span>
+      }
+    />
+  )
+}
+
+function ListFilesEventRow({
+  content,
+  isError,
+}: {
+  content: string
+  isError: boolean
+}) {
+  if (isError) return <ToolErrorRow verb="List" content={content} />
+  const lines = content.split('\n')
+  const fileLines = lines.filter((l) => /^- /.test(l.trim()))
+  const [open, setOpen] = useState(false)
+  return (
+    <EventRow
+      icon={<ListIcon />}
+      verb="List"
+      target="project files"
+      subtext={
+        <span className="font-mono">
+          {fileLines.length} file{fileLines.length === 1 ? '' : 's'}
+        </span>
+      }
+      action={
+        fileLines.length > 0 ? (
+          <button
+            onClick={() => setOpen((v) => !v)}
+            className="text-[11px] text-fog-400 hover:text-fog-50"
+          >
+            {open ? 'Hide' : 'Show'}
+          </button>
+        ) : undefined
+      }
+    >
+      {open && (
+        <pre className="font-mono text-[12px] text-fog-200 rounded border border-line bg-ink-100/60 px-3 py-2 whitespace-pre-wrap max-h-64 overflow-y-auto">
+          {content}
+        </pre>
+      )}
+    </EventRow>
+  )
+}
+
+function ToolErrorRow({
+  verb,
+  content,
+}: {
+  verb: string
+  content: string
+}) {
+  return (
+    <EventRow
+      status="error"
+      icon={<ErrorIcon />}
+      verb={verb}
+      verbColor="text-rose-300"
+      subtext={
+        <span className="font-mono text-rose-300/80 whitespace-pre-wrap">
+          {content}
+        </span>
+      }
+    />
+  )
+}
+
+/** Tool whose result hasn't landed yet — shown with a spinner. */
+function InflightToolRow({ tool }: { tool: InflightTool }) {
+  const args = tool.args || {}
+  const name = tool.tool_name
+  let verb = name
+  let target: string | undefined
+  let icon: React.ReactNode = <ToolIcon />
+  if (name === 'run_shell') {
+    verb = 'Run'
+    target = String(args.cmd ?? '')
+    icon = <TerminalIcon />
+  } else if (name === 'write_project_file') {
+    verb = 'Edit'
+    target = String(args.filename ?? '')
+    icon = <FileEditIcon />
+  } else if (name === 'read_project_file') {
+    verb = 'Read'
+    target = String(args.filename ?? '')
+    icon = <ReadIcon />
+  } else if (name === 'list_project_files') {
+    verb = 'List'
+    target = 'project files'
+    icon = <ListIcon />
+  }
+  return (
+    <EventRow
+      status="running"
+      icon={icon}
+      verb={verb}
+      target={target}
+      subtext={<span className="text-fog-500 italic">running…</span>}
+    />
+  )
+}
+
+function DetailsBlock({ content }: { content: string }) {
+  return (
+    <pre className="font-mono text-[12px] text-fog-200 whitespace-pre-wrap rounded border border-line bg-ink-100/60 px-3 py-2 max-h-64 overflow-y-auto">
+      {content}
+    </pre>
+  )
+}
+
+function TerminalIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-fog-400">
+      <polyline points="4 17 10 11 4 5" />
+      <line x1="12" y1="19" x2="20" y2="19" />
+    </svg>
+  )
+}
+function FileEditIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-fog-400">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+      <polyline points="14 2 14 8 20 8" />
+      <path d="m18 14-3 3v3h3l3-3-3-3z" />
+    </svg>
+  )
+}
+function ReadIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-fog-400">
+      <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
+      <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
+    </svg>
+  )
+}
+function ListIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-fog-400">
+      <line x1="8" y1="6" x2="21" y2="6" />
+      <line x1="8" y1="12" x2="21" y2="12" />
+      <line x1="8" y1="18" x2="21" y2="18" />
+      <line x1="3" y1="6" x2="3.01" y2="6" />
+      <line x1="3" y1="12" x2="3.01" y2="12" />
+      <line x1="3" y1="18" x2="3.01" y2="18" />
+    </svg>
+  )
+}
+function ToolIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+    </svg>
+  )
+}
+function ErrorIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-rose-300">
+      <circle cx="12" cy="12" r="10" />
+      <line x1="12" y1="8" x2="12" y2="12" />
+      <line x1="12" y1="16" x2="12.01" y2="16" />
+    </svg>
+  )
+}
+
 /* ─────────────────────────── modal ─────────────────────────── */
 
+type GithubMode = 'none' | 'new_repo' | 'link_existing'
+type ModalGithub =
+  | { mode: 'none' }
+  | { mode: 'new_repo'; repoName: string; private: boolean }
+  | { mode: 'link_existing'; owner: string; repo: string; branch?: string }
+
 function NewProjectModal({
+  githubUsername,
+  onOpenGithub,
   onClose,
   onCreate,
 }: {
+  githubUsername: string | null
+  onOpenGithub: () => void
   onClose: () => void
-  onCreate: (name: string, files: File[]) => void | Promise<void>
+  onCreate: (
+    name: string,
+    files: File[],
+    github: ModalGithub,
+  ) => void | Promise<void>
 }) {
   const [name, setName] = useState('')
   const [files, setFiles] = useState<File[]>([])
   const [submitting, setSubmitting] = useState(false)
   const nameRef = useRef<HTMLInputElement>(null)
+
+  // GitHub linkage
+  const [ghMode, setGhMode] = useState<GithubMode>('none')
+  const [ghRepoName, setGhRepoName] = useState('')
+  const [ghPrivate, setGhPrivate] = useState(true)
+  const [ghOwner, setGhOwner] = useState('')
+  const [ghRepo, setGhRepo] = useState('')
+  const [ghBranch, setGhBranch] = useState('')
+  const ghConnected = Boolean(githubUsername)
+
+  // Slugified placeholder for the "new repo" name input — only used when the
+  // user hasn't typed one. Spaces → hyphens, strip illegal chars.
+  const slugDefault = name
+    .trim()
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
 
   useEffect(() => {
     nameRef.current?.focus()
@@ -1984,11 +3790,32 @@ function NewProjectModal({
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
 
+  function buildGithub(): ModalGithub {
+    if (ghMode === 'new_repo') {
+      return {
+        mode: 'new_repo',
+        repoName: (ghRepoName.trim() || slugDefault) || 'project',
+        private: ghPrivate,
+      }
+    }
+    if (ghMode === 'link_existing') {
+      return {
+        mode: 'link_existing',
+        owner: ghOwner.trim(),
+        repo: ghRepo.trim(),
+        branch: ghBranch.trim() || undefined,
+      }
+    }
+    return { mode: 'none' }
+  }
+
   async function submit(e: React.FormEvent) {
     e.preventDefault()
     if (!name.trim() || submitting) return
+    if (ghMode !== 'none' && !ghConnected) return
+    if (ghMode === 'link_existing' && (!ghOwner.trim() || !ghRepo.trim())) return
     setSubmitting(true)
-    await onCreate(name.trim(), files)
+    await onCreate(name.trim(), files, buildGithub())
   }
 
   function onPickFiles(e: React.ChangeEvent<HTMLInputElement>) {
@@ -2007,7 +3834,7 @@ function NewProjectModal({
       <div className="relative w-full max-w-md rounded-2xl border border-lineStrong bg-ink-200 shadow-2xl shadow-black/80 p-6">
         <div className="flex items-start justify-between mb-1">
           <div>
-            <h2 className="serif text-2xl tracking-tighter text-white">
+            <h2 className="serif text-2xl tracking-tighter text-fog-50">
               New project
             </h2>
             <p className="text-xs text-fog-400 mt-0.5">
@@ -2016,7 +3843,7 @@ function NewProjectModal({
           </div>
           <button
             onClick={onClose}
-            className="w-8 h-8 rounded-full hover:bg-white/[0.06] text-fog-400 hover:text-white flex items-center justify-center transition"
+            className="w-8 h-8 rounded-full hover:bg-soft/[0.06] text-fog-400 hover:text-fog-50 flex items-center justify-center transition"
             aria-label="Close"
           >
             ×
@@ -2092,6 +3919,120 @@ function NewProjectModal({
             )}
           </div>
 
+          {/* GitHub linkage — optional rollback / history layer */}
+          <div>
+            <span className="block text-xs text-fog-400 mb-1.5">
+              Save history to GitHub{' '}
+              <span className="text-fog-500">(optional)</span>
+            </span>
+            <div className="grid grid-cols-3 gap-1.5 rounded-lg border border-line bg-ink-200/40 p-1">
+              {(
+                [
+                  ['none', "Don't link"],
+                  ['new_repo', 'Create new repo'],
+                  ['link_existing', 'Use existing repo'],
+                ] as [GithubMode, string][]
+              ).map(([m, label]) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setGhMode(m)}
+                  className={`text-[12px] py-1.5 rounded-md transition ${
+                    ghMode === m
+                      ? 'bg-soft/[0.10] text-fog-50'
+                      : 'text-fog-300 hover:text-fog-50 hover:bg-soft/[0.04]'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {ghMode !== 'none' && !ghConnected && (
+              <div className="mt-2 text-[11px] text-amber-300/90 flex items-center gap-2">
+                <span>
+                  Connect a GitHub PAT first to enable this option.
+                </span>
+                <button
+                  type="button"
+                  onClick={onOpenGithub}
+                  className="underline underline-offset-2 hover:text-fog-50"
+                >
+                  Connect now
+                </button>
+              </div>
+            )}
+
+            {ghMode === 'new_repo' && ghConnected && (
+              <div className="mt-2 space-y-2">
+                <label className="block">
+                  <span className="block text-[11px] text-fog-400 mb-1">
+                    Repo name
+                  </span>
+                  <input
+                    value={ghRepoName}
+                    onChange={(e) => setGhRepoName(e.target.value)}
+                    placeholder={slugDefault || 'project-name'}
+                    className="w-full bg-ink-200 border border-line focus:border-lineStrong rounded-md px-2.5 py-1.5 text-[13px] outline-none transition placeholder:text-fog-500"
+                  />
+                  <span className="block text-[10px] text-fog-500 mt-0.5">
+                    Will be created under{' '}
+                    <code className="font-mono">{githubUsername}/</code>
+                    {ghRepoName.trim() || slugDefault || 'project-name'}
+                  </span>
+                </label>
+                <label className="flex items-center gap-2 text-[12px] text-fog-200 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={ghPrivate}
+                    onChange={(e) => setGhPrivate(e.target.checked)}
+                    className="accent-white"
+                  />
+                  Private repo
+                </label>
+              </div>
+            )}
+
+            {ghMode === 'link_existing' && ghConnected && (
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <label className="block">
+                  <span className="block text-[11px] text-fog-400 mb-1">
+                    Owner
+                  </span>
+                  <input
+                    value={ghOwner}
+                    onChange={(e) => setGhOwner(e.target.value)}
+                    placeholder={githubUsername || 'octocat'}
+                    className="w-full bg-ink-200 border border-line focus:border-lineStrong rounded-md px-2.5 py-1.5 text-[13px] outline-none transition placeholder:text-fog-500"
+                  />
+                </label>
+                <label className="block">
+                  <span className="block text-[11px] text-fog-400 mb-1">
+                    Repo
+                  </span>
+                  <input
+                    value={ghRepo}
+                    onChange={(e) => setGhRepo(e.target.value)}
+                    placeholder="hello-world"
+                    className="w-full bg-ink-200 border border-line focus:border-lineStrong rounded-md px-2.5 py-1.5 text-[13px] outline-none transition placeholder:text-fog-500"
+                  />
+                </label>
+                <label className="block col-span-2">
+                  <span className="block text-[11px] text-fog-400 mb-1">
+                    Branch{' '}
+                    <span className="text-fog-500">(defaults to main)</span>
+                  </span>
+                  <input
+                    value={ghBranch}
+                    onChange={(e) => setGhBranch(e.target.value)}
+                    placeholder="main"
+                    className="w-full bg-ink-200 border border-line focus:border-lineStrong rounded-md px-2.5 py-1.5 text-[13px] outline-none transition placeholder:text-fog-500"
+                  />
+                </label>
+              </div>
+            )}
+          </div>
+
           <div className="flex items-center justify-end gap-2 pt-2">
             <button
               type="button"
@@ -2102,7 +4043,13 @@ function NewProjectModal({
             </button>
             <button
               type="submit"
-              disabled={!name.trim() || submitting}
+              disabled={
+                !name.trim() ||
+                submitting ||
+                (ghMode !== 'none' && !ghConnected) ||
+                (ghMode === 'link_existing' &&
+                  (!ghOwner.trim() || !ghRepo.trim()))
+              }
               className="btn-white text-sm disabled:opacity-50"
             >
               {submitting ? 'Creating…' : 'Create project'}
@@ -2114,13 +4061,249 @@ function NewProjectModal({
   )
 }
 
+/* ─────────────────────────── project landing pane ─────────────────────────── */
+
+function ProjectLanding({
+  session,
+  threads,
+  files,
+  threadNames,
+  sessionName,
+  onOpenThread,
+  onOpenFile,
+  onNewThread,
+}: {
+  session: Session
+  threads: Thread[]
+  files: string[]
+  threadNames: Record<string, string>
+  sessionName: string
+  onOpenThread: (tid: string) => void
+  onOpenFile: (name: string) => void
+  onNewThread: () => void
+}) {
+  const mode = session.mode || 'auto'
+  return (
+    <div className="animate-float-up">
+      <div className="flex items-start justify-between gap-4 mb-6">
+        <div className="min-w-0">
+          <div className="text-[11px] uppercase tracking-widest text-fog-400 mb-1 inline-flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-sm bg-amber-500/80" />
+            Project
+          </div>
+          <h1 className="serif text-3xl tracking-tighter text-fog-50 truncate">
+            {sessionName}
+          </h1>
+          <div className="flex items-center gap-2 mt-2 text-[11px] text-fog-400">
+            <span
+              className={`chip ${
+                mode === 'confirm'
+                  ? 'border-amber-500/40 text-amber-300'
+                  : ''
+              }`}
+            >
+              {mode === 'confirm' ? 'Confirm mode' : 'Auto mode'}
+            </span>
+            <span className="chip">
+              {threads.length} {threads.length === 1 ? 'thread' : 'threads'}
+            </span>
+            <span className="chip">
+              {files.length} {files.length === 1 ? 'file' : 'files'}
+            </span>
+          </div>
+        </div>
+        <button
+          onClick={onNewThread}
+          className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-accent text-ink-50 text-sm font-medium hover:bg-accent/90 transition"
+        >
+          <PlusIcon small />
+          New thread
+        </button>
+      </div>
+
+      {/* Files */}
+      <section className="mb-6">
+        <h2 className="text-[11px] uppercase tracking-widest text-fog-400 mb-2">
+          Files
+        </h2>
+        {files.length === 0 ? (
+          <p className="text-sm text-fog-500 px-2">
+            No files yet. Upload one from a thread or have the agent write some.
+          </p>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {files.map((f) => {
+              const display = f.split('/').pop() || f
+              return (
+                <button
+                  key={f}
+                  onClick={() => onOpenFile(display)}
+                  className="surface flex items-center gap-2.5 px-3 py-2 text-left hover:bg-soft/[0.03] transition"
+                  title={`Open ${display}`}
+                >
+                  <IconFile />
+                  <span className="text-[13px] text-fog-100 truncate flex-1">
+                    {display}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+        )}
+      </section>
+
+      {/* Threads */}
+      <section>
+        <h2 className="text-[11px] uppercase tracking-widest text-fog-400 mb-2">
+          Threads
+        </h2>
+        {threads.length === 0 ? (
+          <p className="text-sm text-fog-500 px-2">
+            No threads yet. Start one with the button above.
+          </p>
+        ) : (
+          <div className="space-y-1">
+            {threads.map((t) => (
+              <button
+                key={t.id}
+                onClick={() => onOpenThread(t.id)}
+                className="w-full surface flex items-center gap-3 px-3 py-2.5 text-left hover:bg-soft/[0.03] transition"
+              >
+                <IconChat className="shrink-0 text-fog-400" small />
+                <span className="flex-1 truncate text-[14px] text-fog-100">
+                  {threadNames[t.id] || t.name || 'New chat'}
+                </span>
+                {!!t.tokens && (
+                  <span
+                    className="text-[10px] text-fog-500 tabular-nums"
+                    title={`${t.tokens.toLocaleString()} tokens`}
+                  >
+                    {fmtTokens(t.tokens)}
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
+
+/* ─────────────────────────── context ring button ─────────────────────────── */
+
+function ContextRingButton({
+  summary,
+  onClick,
+}: {
+  summary: { total: number; limit: number; percent: number } | null
+  onClick: () => void
+}) {
+  const pct = summary?.percent ?? 0
+  // Clamp so an unexpectedly-large total never wraps the arc.
+  const clamped = Math.max(0, Math.min(100, pct))
+  // Threshold colors — green → amber → orange → red as usage climbs.
+  const color =
+    clamped < 50
+      ? '#22c55e'
+      : clamped < 80
+        ? '#f59e0b'
+        : clamped < 95
+          ? '#f97316'
+          : '#ef4444'
+  // SVG arc geometry. r=15 gives ~94 circumference at strokeWidth=3, which
+  // leaves enough room for the percentage label inside a 40px button.
+  const r = 15
+  const c = 2 * Math.PI * r
+  const dash = (clamped / 100) * c
+  const offset = c - dash
+  const hasData = summary != null && summary.limit > 0
+  const label = hasData ? `${Math.round(clamped)}%` : '—'
+  const title = hasData
+    ? `${summary!.total.toLocaleString()} / ${summary!.limit.toLocaleString()} tokens (${clamped.toFixed(1)}%)`
+    : 'Context window'
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      aria-label={title}
+      className="fixed right-5 top-1/2 -translate-y-1/2 z-30 w-11 h-11 rounded-full bg-ink-200 border border-lineStrong shadow-xl shadow-black/40 flex items-center justify-center transition hover:bg-soft/[0.06]"
+    >
+      <svg width="40" height="40" viewBox="0 0 40 40" className="-rotate-90">
+        {/* track */}
+        <circle
+          cx="20"
+          cy="20"
+          r={r}
+          fill="none"
+          stroke="currentColor"
+          strokeOpacity="0.18"
+          strokeWidth="3"
+          className="text-fog-300"
+        />
+        {/* progress arc */}
+        {hasData && (
+          <circle
+            cx="20"
+            cy="20"
+            r={r}
+            fill="none"
+            stroke={color}
+            strokeWidth="3"
+            strokeLinecap="round"
+            strokeDasharray={c}
+            strokeDashoffset={offset}
+            style={{ transition: 'stroke-dashoffset 0.4s ease, stroke 0.3s' }}
+          />
+        )}
+      </svg>
+      <span
+        className={`absolute font-mono tabular-nums leading-none ${
+          hasData ? 'text-fog-100' : 'text-fog-400'
+        }`}
+        style={{ fontSize: clamped >= 100 ? 9 : 10 }}
+      >
+        {label}
+      </span>
+    </button>
+  )
+}
+
+/* ─────────────────────────── theme toggle ─────────────────────────── */
+
+function ThemeToggle() {
+  const [theme, setTheme] = useTheme()
+  const dark = theme === 'dark'
+  return (
+    <button
+      onClick={() => setTheme(dark ? 'light' : 'dark')}
+      title={dark ? 'Switch to light mode' : 'Switch to dark mode'}
+      aria-label="Toggle color theme"
+      className="w-7 h-7 rounded-full text-fog-300 hover:text-fog-50 hover:bg-soft/[0.08] flex items-center justify-center transition"
+    >
+      {dark ? (
+        // moon
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
+        </svg>
+      ) : (
+        // sun
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="4" />
+          <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+        </svg>
+      )}
+    </button>
+  )
+}
+
 /* ─────────────────────────── icons ─────────────────────────── */
 
 function Glyph() {
   return (
     <span className="relative w-6 h-6 inline-flex items-center justify-center">
-      <span className="absolute inset-0 rounded-md bg-white/10" />
-      <span className="relative w-2 h-2 rounded-sm bg-white" />
+      <span className="absolute inset-0 rounded-md bg-soft/10" />
+      <span className="relative w-2 h-2 rounded-sm bg-accent" />
     </span>
   )
 }
@@ -2334,7 +4517,7 @@ function RowMenu({ items }: { items: MenuItem[] }) {
           className={`w-full text-left px-3 py-2 rounded-md flex items-center gap-2.5 ${
             item.danger
               ? 'text-red-300 hover:bg-red-500/10'
-              : 'text-fog-100 hover:bg-white/[0.06]'
+              : 'text-fog-100 hover:bg-soft/[0.06]'
           }`}
         >
           {item.icon && <span className="text-fog-300">{item.icon}</span>}
@@ -2434,12 +4617,12 @@ function ConfirmDialog({
 }) {
   return (
     <ModalShell onClose={onCancel}>
-      <h3 className="text-base font-medium text-white mb-2">{title}</h3>
+      <h3 className="text-base font-medium text-fog-50 mb-2">{title}</h3>
       <p className="text-sm text-fog-300 leading-relaxed mb-5">{message}</p>
       <div className="flex justify-end gap-2">
         <button
           onClick={onCancel}
-          className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-white/[0.06]"
+          className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-soft/[0.06]"
         >
           Cancel
         </button>
@@ -2448,8 +4631,8 @@ function ConfirmDialog({
           autoFocus
           className={`px-4 py-2 rounded-lg text-sm font-medium ${
             danger
-              ? 'bg-red-500/90 hover:bg-red-500 text-white'
-              : 'bg-white text-black hover:bg-white/90'
+              ? 'bg-red-500/90 hover:bg-red-500 text-fog-50'
+              : 'bg-accent text-ink-50 hover:bg-soft/90'
           }`}
         >
           {confirmLabel}
@@ -2484,7 +4667,7 @@ function PromptDialog({
   }, [])
   return (
     <ModalShell onClose={onCancel}>
-      <h3 className="text-base font-medium text-white mb-2">{title}</h3>
+      <h3 className="text-base font-medium text-fog-50 mb-2">{title}</h3>
       {message && (
         <p className="text-sm text-fog-300 leading-relaxed mb-3">{message}</p>
       )}
@@ -2499,19 +4682,19 @@ function PromptDialog({
           }
         }}
         placeholder={placeholder}
-        className="w-full bg-ink-300 border border-lineStrong rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-white/40 mb-5"
+        className="w-full bg-ink-300 border border-lineStrong rounded-lg px-3 py-2 text-sm text-fog-50 outline-none focus:border-lineStrong mb-5"
       />
       <div className="flex justify-end gap-2">
         <button
           onClick={onCancel}
-          className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-white/[0.06]"
+          className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-soft/[0.06]"
         >
           Cancel
         </button>
         <button
           onClick={() => onConfirm(value)}
           disabled={!value.trim()}
-          className="px-4 py-2 rounded-lg text-sm font-medium bg-white text-black hover:bg-white/90 disabled:opacity-40 disabled:cursor-not-allowed"
+          className="px-4 py-2 rounded-lg text-sm font-medium bg-accent text-ink-50 hover:bg-soft/90 disabled:opacity-40 disabled:cursor-not-allowed"
         >
           {confirmLabel}
         </button>
@@ -2566,7 +4749,7 @@ function FileViewer({
         <header className="flex items-center justify-between px-4 py-3 border-b border-line">
           <div className="flex items-center gap-2 min-w-0">
             <IconFile />
-            <span className="text-sm text-white truncate">{name}</span>
+            <span className="text-sm text-fog-50 truncate">{name}</span>
             {!loading && !error && (
               <span className="text-[11px] text-fog-500 shrink-0 ml-2">
                 {lines.length} line{lines.length === 1 ? '' : 's'}
@@ -2577,13 +4760,13 @@ function FileViewer({
             <button
               onClick={copyAll}
               disabled={loading || !!error}
-              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-white/[0.06] disabled:opacity-40"
+              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-soft/[0.06] disabled:opacity-40"
             >
               Copy
             </button>
             <button
               onClick={onClose}
-              className="w-7 h-7 rounded hover:bg-white/[0.06] text-fog-300 flex items-center justify-center"
+              className="w-7 h-7 rounded hover:bg-soft/[0.06] text-fog-300 flex items-center justify-center"
               aria-label="Close"
             >
               ✕
@@ -2622,6 +4805,145 @@ function FileViewer({
 }
 
 /* ─────────────────────────── GitHub connect ─────────────────────────── */
+
+/* ─────────────────────────── workspace history panel ───────────────────────── */
+
+function HistoryPanel({
+  commits,
+  loading,
+  error,
+  revertingId,
+  onClose,
+  onRefresh,
+  onRevert,
+}: {
+  commits: WorkspaceCommit[] | null
+  loading: boolean
+  error: string | null
+  revertingId: number | null
+  onClose: () => void
+  onRefresh: () => void
+  onRevert: (id: number, message: string) => void
+}) {
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  return (
+    <div
+      className="fixed inset-0 z-[70] flex justify-end bg-black/40"
+      onClick={onClose}
+    >
+      <aside
+        onClick={(e) => e.stopPropagation()}
+        className="w-[min(560px,90vw)] h-full bg-ink-200 border-l border-lineStrong flex flex-col shadow-2xl shadow-black/60"
+      >
+        <header className="flex items-center justify-between px-4 py-3 border-b border-line">
+          <div className="text-sm text-fog-50 font-medium">Workspace history</div>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={onRefresh}
+              disabled={loading}
+              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-soft/[0.06] disabled:opacity-40"
+            >
+              {loading ? 'Loading…' : 'Refresh'}
+            </button>
+            <button
+              onClick={onClose}
+              className="w-7 h-7 rounded hover:bg-soft/[0.06] text-fog-300 flex items-center justify-center"
+              aria-label="Close"
+            >
+              ✕
+            </button>
+          </div>
+        </header>
+
+        <div className="flex-1 overflow-y-auto p-3">
+          {loading && (
+            <div className="text-sm text-fog-400 px-2 py-4">Loading history…</div>
+          )}
+          {error && (
+            <div className="text-sm text-red-300 px-2 py-4">
+              Failed to load history: {error}
+            </div>
+          )}
+          {!loading && !error && commits && commits.length === 0 && (
+            <div className="text-sm text-fog-400 px-2 py-4">
+              No commits yet. The agent's file changes will show up here as they
+              happen.
+            </div>
+          )}
+          {!loading && !error && commits && commits.length > 0 && (
+            <ul className="space-y-1.5">
+              {commits.map((c) => (
+                <li
+                  key={c.id}
+                  className="rounded-md border border-line bg-ink-200/40 hover:border-lineStrong px-3 py-2.5 transition"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2 text-[11px] text-fog-500">
+                        <code className="font-mono">{c.sha.slice(0, 7)}</code>
+                        <span>{new Date(c.created_at).toLocaleString()}</span>
+                        <StatusBadge status={c.status} />
+                      </div>
+                      <div className="text-[13px] text-fog-100 mt-1 break-words">
+                        {c.message}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => onRevert(c.id, c.message)}
+                      disabled={
+                        c.status === 'reverted' ||
+                        revertingId !== null ||
+                        c.message === 'Initial commit'
+                      }
+                      className="shrink-0 text-[11px] px-2 py-1 rounded border border-line text-fog-200 hover:bg-soft/[0.06] hover:text-fog-50 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                      title={
+                        c.status === 'reverted'
+                          ? 'Already reverted'
+                          : c.message === 'Initial commit'
+                            ? 'Cannot undo the initial commit'
+                            : 'Undo this change'
+                      }
+                    >
+                      {revertingId === c.id ? 'Undoing…' : 'Undo'}
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <footer className="px-4 py-2.5 border-t border-line text-[11px] text-fog-500">
+          Commits sync at the end of every chat turn. Click Refresh after a
+          manual git operation.
+        </footer>
+      </aside>
+    </div>
+  )
+}
+
+function StatusBadge({ status }: { status: WorkspaceCommit['status'] }) {
+  const styles =
+    status === 'reverted'
+      ? 'text-rose-300/90 bg-rose-300/10 border-rose-300/20'
+      : status === 'pushed'
+        ? 'text-emerald-300/90 bg-emerald-300/10 border-emerald-300/20'
+        : 'text-fog-400 bg-soft/[0.04] border-line'
+  return (
+    <span
+      className={`text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded border ${styles}`}
+    >
+      {status}
+    </span>
+  )
+}
 
 /* ─────────────────────────── context window viewer ─────────────────────────── */
 
@@ -2689,12 +5011,12 @@ function ContextViewer({
         className="w-[min(640px,92vw)] h-full bg-ink-200 border-l border-lineStrong flex flex-col shadow-2xl shadow-black/60"
       >
         <header className="flex items-center justify-between px-4 py-3 border-b border-line">
-          <div className="text-sm text-white font-medium">Context window</div>
+          <div className="text-sm text-fog-50 font-medium">Context window</div>
           <div className="flex items-center gap-1">
             <button
               onClick={() => setRawMode((v) => !v)}
               disabled={loading || !data}
-              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-white/[0.06] disabled:opacity-40"
+              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-soft/[0.06] disabled:opacity-40"
               title="See system prompt + every message as one block"
             >
               {rawMode ? 'Summary' : 'View raw'}
@@ -2702,13 +5024,13 @@ function ContextViewer({
             <button
               onClick={onRefresh}
               disabled={loading}
-              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-white/[0.06] disabled:opacity-40"
+              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-soft/[0.06] disabled:opacity-40"
             >
               Refresh
             </button>
             <button
               onClick={onClose}
-              className="w-7 h-7 rounded hover:bg-white/[0.06] text-fog-300 flex items-center justify-center"
+              className="w-7 h-7 rounded hover:bg-soft/[0.06] text-fog-300 flex items-center justify-center"
               aria-label="Close"
             >
               ✕
@@ -2732,7 +5054,7 @@ function ContextViewer({
                       navigator.clipboard.writeText(rawText)
                     }
                   }}
-                  className="text-[11px] px-2 py-0.5 rounded text-fog-300 hover:bg-white/[0.06]"
+                  className="text-[11px] px-2 py-0.5 rounded text-fog-300 hover:bg-soft/[0.06]"
                 >
                   Copy
                 </button>
@@ -2762,7 +5084,7 @@ function ContextViewer({
                     {pct.toFixed(1)}%
                   </span>
                 </div>
-                <div className="h-2 rounded-full bg-white/[0.06] overflow-hidden">
+                <div className="h-2 rounded-full bg-soft/[0.06] overflow-hidden">
                   <div
                     className={`h-full ${barColor}`}
                     style={{ width: `${Math.min(100, pct)}%` }}
@@ -2817,7 +5139,7 @@ function ContextViewer({
                     {data.files.map((f: any) => (
                       <div
                         key={f.name}
-                        className="flex items-center justify-between text-[12.5px] py-1 px-2 rounded hover:bg-white/[0.03]"
+                        className="flex items-center justify-between text-[12.5px] py-1 px-2 rounded hover:bg-soft/[0.03]"
                       >
                         <span className="text-fog-200 truncate">{f.name}</span>
                         <span className="text-fog-500 text-[11px] shrink-0 ml-2">
@@ -2865,7 +5187,7 @@ function ContextMessageRow({
 
   return (
     <div className="rounded-md border border-line bg-ink-300/40 group">
-      <div className="w-full flex items-center gap-2 hover:bg-white/[0.03]">
+      <div className="w-full flex items-center gap-2 hover:bg-soft/[0.03]">
         <button
           onClick={() => setOpen((v) => !v)}
           className="text-left px-3 py-2 flex items-center gap-2 flex-1 min-w-0"
@@ -2907,7 +5229,7 @@ function ContextMessageRow({
             <div className="mb-2 border border-line rounded bg-ink-300/60">
               <button
                 onClick={() => setTokensOpen((v) => !v)}
-                className="w-full text-left px-2 py-1.5 flex items-center gap-2 hover:bg-white/[0.03] text-[11px] text-fog-300"
+                className="w-full text-left px-2 py-1.5 flex items-center gap-2 hover:bg-soft/[0.03] text-[11px] text-fog-300"
               >
                 <span className="text-fog-500 w-3 inline-block">
                   {tokensOpen ? '▾' : '▸'}
@@ -2997,19 +5319,19 @@ function GithubConnectModal({
 
   return (
     <ModalShell onClose={onClose}>
-      <h3 className="text-base font-medium text-white mb-2">GitHub</h3>
+      <h3 className="text-base font-medium text-fog-50 mb-2">GitHub</h3>
       {username ? (
         <>
           <p className="text-sm text-fog-300 leading-relaxed mb-4">
             Connected as{' '}
-            <span className="text-white font-medium">@{username}</span>. The
+            <span className="text-fog-50 font-medium">@{username}</span>. The
             agent can now read, push to, and revert files in repos you grant
             access to.
           </p>
           <div className="flex justify-end gap-2">
             <button
               onClick={onClose}
-              className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-white/[0.06]"
+              className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-soft/[0.06]"
             >
               Close
             </button>
@@ -3018,7 +5340,7 @@ function GithubConnectModal({
                 await onDisconnect()
                 onClose()
               }}
-              className="px-4 py-2 rounded-lg text-sm font-medium bg-red-500/90 hover:bg-red-500 text-white"
+              className="px-4 py-2 rounded-lg text-sm font-medium bg-red-500/90 hover:bg-red-500 text-fog-50"
             >
               Disconnect
             </button>
@@ -3046,7 +5368,7 @@ function GithubConnectModal({
               if (e.key === 'Enter' && token.trim()) handleSave()
             }}
             placeholder="ghp_..."
-            className="w-full bg-ink-300 border border-lineStrong rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-white/40 mb-3 font-mono"
+            className="w-full bg-ink-300 border border-lineStrong rounded-lg px-3 py-2 text-sm text-fog-50 outline-none focus:border-lineStrong mb-3 font-mono"
           />
           {error && (
             <p className="text-sm text-red-400 mb-3">{error}</p>
@@ -3055,14 +5377,14 @@ function GithubConnectModal({
             <button
               onClick={onClose}
               disabled={saving}
-              className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-white/[0.06] disabled:opacity-40"
+              className="px-4 py-2 rounded-lg text-sm text-fog-200 hover:bg-soft/[0.06] disabled:opacity-40"
             >
               Cancel
             </button>
             <button
               onClick={handleSave}
               disabled={saving || !token.trim()}
-              className="px-4 py-2 rounded-lg text-sm font-medium bg-white text-black hover:bg-white/90 disabled:opacity-40 disabled:cursor-not-allowed"
+              className="px-4 py-2 rounded-lg text-sm font-medium bg-accent text-ink-50 hover:bg-soft/90 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {saving ? 'Verifying…' : 'Connect'}
             </button>

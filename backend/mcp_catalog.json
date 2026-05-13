@@ -1,0 +1,542 @@
+{
+  "version": 1,
+  "updated": "2026-05-13",
+  "entries": [
+    {
+      "slug": "filesystem",
+      "name": "Filesystem",
+      "description": "Read, write and search files. Scope: the active workspace's /workspace directory.",
+      "publisher": "Anthropic (modelcontextprotocol)",
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem",
+      "docs_url": "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem#readme",
+      "icon": "filesystem",
+      "tags": ["files", "official"],
+      "category": "tools",
+      "default_transport": "stdio",
+      "transports": {
+        "stdio": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+          "env_schema": []
+        }
+      },
+      "auth": "none",
+      "needs_outbound_network": false,
+      "warnings": []
+    },
+    {
+      "slug": "fetch",
+      "name": "Fetch",
+      "description": "Make HTTP requests and pull web pages. No JavaScript execution.",
+      "publisher": "Anthropic (modelcontextprotocol)",
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/fetch",
+      "icon": "fetch",
+      "tags": ["http", "web", "official"],
+      "category": "tools",
+      "default_transport": "stdio",
+      "transports": {
+        "stdio": {
+          "command": "uvx",
+          "args": ["mcp-server-fetch"],
+          "env_schema": []
+        }
+      },
+      "auth": "none",
+      "needs_outbound_network": true,
+      "warnings": []
+    },
+    {
+      "slug": "github",
+      "name": "GitHub",
+      "description": "Repos, issues, PRs and code search via GitHub's official remote MCP server.",
+      "publisher": "GitHub",
+      "homepage": "https://github.com/github/github-mcp-server",
+      "docs_url": "https://docs.github.com/en/copilot/customizing-copilot/extending-copilot-chat-with-mcp",
+      "icon": "github",
+      "tags": ["git", "vcs", "official"],
+      "category": "dev",
+      "default_transport": "streamable_http",
+      "transports": {
+        "streamable_http": {
+          "url_template": "https://api.githubcopilot.com/mcp/",
+          "url_help": "GitHub's hosted MCP endpoint. Paste a fine-grained or classic PAT (with repo + read:user scopes) as the Bearer token.",
+          "auth": "bearer"
+        }
+      },
+      "auth": "bearer",
+      "needs_outbound_network": true,
+      "warnings": ["The reference @modelcontextprotocol/server-github npm package was archived. This uses GitHub's official hosted MCP server instead."]
+    },
+    {
+      "slug": "postgres",
+      "name": "Postgres",
+      "description": "Read-only SQL queries against a Postgres database.",
+      "publisher": "Anthropic (modelcontextprotocol)",
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/postgres",
+      "icon": "postgres",
+      "tags": ["database", "sql", "official"],
+      "category": "data",
+      "default_transport": "stdio",
+      "transports": {
+        "stdio": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-postgres"],
+          "env_schema": [
+            {
+              "name": "POSTGRES_URL",
+              "label": "Postgres connection URL",
+              "help": "Example: postgresql://user:pass@host:5432/dbname",
+              "required": true,
+              "secret": true
+            }
+          ]
+        }
+      },
+      "auth": "api_key_env",
+      "needs_outbound_network": true,
+      "warnings": []
+    },
+    {
+      "slug": "sqlite",
+      "name": "SQLite",
+      "description": "Query a local SQLite database file.",
+      "publisher": "Anthropic (modelcontextprotocol)",
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/sqlite",
+      "icon": "sqlite",
+      "tags": ["database", "sql", "official"],
+      "category": "data",
+      "default_transport": "stdio",
+      "transports": {
+        "stdio": {
+          "command": "uvx",
+          "args": ["mcp-server-sqlite", "--db-path", "/workspace/db.sqlite"],
+          "env_schema": []
+        }
+      },
+      "auth": "none",
+      "needs_outbound_network": false,
+      "warnings": []
+    },
+    {
+      "slug": "git",
+      "name": "Git",
+      "description": "Run git commands against a repository path.",
+      "publisher": "Anthropic (modelcontextprotocol)",
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/git",
+      "icon": "git",
+      "tags": ["git", "vcs", "official"],
+      "category": "dev",
+      "default_transport": "stdio",
+      "transports": {
+        "stdio": {
+          "command": "uvx",
+          "args": ["mcp-server-git", "--repository", "/workspace"],
+          "env_schema": []
+        }
+      },
+      "auth": "none",
+      "needs_outbound_network": false,
+      "warnings": []
+    },
+    {
+      "slug": "memory",
+      "name": "Memory",
+      "description": "Persistent knowledge-graph memory the agent can read and update across sessions.",
+      "publisher": "Anthropic (modelcontextprotocol)",
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/memory",
+      "icon": "memory",
+      "tags": ["memory", "knowledge", "official"],
+      "category": "knowledge",
+      "default_transport": "stdio",
+      "transports": {
+        "stdio": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-memory"],
+          "env_schema": []
+        }
+      },
+      "auth": "none",
+      "needs_outbound_network": false,
+      "warnings": []
+    },
+    {
+      "slug": "sequential-thinking",
+      "name": "Sequential Thinking",
+      "description": "Structured reasoning helper that breaks problems into sequential thought steps.",
+      "publisher": "Anthropic (modelcontextprotocol)",
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/sequentialthinking",
+      "icon": "sequential",
+      "tags": ["reasoning", "official"],
+      "category": "tools",
+      "default_transport": "stdio",
+      "transports": {
+        "stdio": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+          "env_schema": []
+        }
+      },
+      "auth": "none",
+      "needs_outbound_network": false,
+      "warnings": []
+    },
+    {
+      "slug": "time",
+      "name": "Time",
+      "description": "Timezone conversion and time-math.",
+      "publisher": "Anthropic (modelcontextprotocol)",
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/time",
+      "icon": "time",
+      "tags": ["utility", "official"],
+      "category": "tools",
+      "default_transport": "stdio",
+      "transports": {
+        "stdio": {
+          "command": "uvx",
+          "args": ["mcp-server-time"],
+          "env_schema": []
+        }
+      },
+      "auth": "none",
+      "needs_outbound_network": false,
+      "warnings": []
+    },
+    {
+      "slug": "everything",
+      "name": "Everything (test)",
+      "description": "Reference test server. Useful for exercising the MCP plumbing — not for production.",
+      "publisher": "Anthropic (modelcontextprotocol)",
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/everything",
+      "icon": "generic",
+      "tags": ["test", "official"],
+      "category": "tools",
+      "default_transport": "stdio",
+      "transports": {
+        "stdio": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-everything"],
+          "env_schema": []
+        }
+      },
+      "auth": "none",
+      "needs_outbound_network": false,
+      "warnings": ["Reference / test server. Disable in production."]
+    },
+    {
+      "slug": "playwright",
+      "name": "Playwright",
+      "description": "Headless browser automation — navigate, click, screenshot, extract text.",
+      "publisher": "Microsoft",
+      "homepage": "https://github.com/microsoft/playwright-mcp",
+      "icon": "playwright",
+      "tags": ["browser", "automation", "scraping"],
+      "category": "tools",
+      "default_transport": "stdio",
+      "transports": {
+        "stdio": {
+          "command": "npx",
+          "args": ["-y", "@playwright/mcp@latest"],
+          "env_schema": []
+        },
+        "streamable_http": {
+          "url_template": "",
+          "url_help": "Self-hosted Playwright MCP endpoint, e.g. https://my-host/playwright-mcp",
+          "auth": "bearer"
+        }
+      },
+      "auth": "none",
+      "needs_outbound_network": true,
+      "warnings": ["First run downloads ~150MB of browser binaries."]
+    },
+    {
+      "slug": "outline",
+      "name": "Outline",
+      "description": "Search and edit your Outline knowledge base.",
+      "publisher": "Outline",
+      "homepage": "https://www.getoutline.com/",
+      "docs_url": "https://www.getoutline.com/developers",
+      "icon": "outline",
+      "tags": ["docs", "knowledge"],
+      "category": "knowledge",
+      "default_transport": "streamable_http",
+      "transports": {
+        "streamable_http": {
+          "url_template": "https://app.getoutline.com/api/mcp",
+          "url_help": "Your Outline instance's MCP endpoint. Self-hosted instances use https://<your-host>/api/mcp.",
+          "auth": "api_key_header",
+          "auth_header": "Authorization",
+          "auth_value_prefix": "Bearer "
+        }
+      },
+      "auth": "api_key_header",
+      "needs_outbound_network": true,
+      "warnings": []
+    },
+    {
+      "slug": "notion",
+      "name": "Notion",
+      "description": "Read and write Notion pages, databases and comments.",
+      "publisher": "Notion",
+      "homepage": "https://www.notion.so/",
+      "docs_url": "https://developers.notion.com/docs/mcp",
+      "icon": "notion",
+      "tags": ["docs", "knowledge"],
+      "category": "knowledge",
+      "default_transport": "streamable_http",
+      "transports": {
+        "streamable_http": {
+          "url_template": "https://mcp.notion.com/mcp",
+          "url_help": "Notion's hosted MCP endpoint. OAuth in production; use an internal integration token for now.",
+          "auth": "bearer"
+        }
+      },
+      "auth": "bearer",
+      "needs_outbound_network": true,
+      "warnings": ["Paste an internal-integration token for now — OAuth flow coming soon."]
+    },
+    {
+      "slug": "linear",
+      "name": "Linear",
+      "description": "Browse and update Linear issues, projects and cycles.",
+      "publisher": "Linear",
+      "homepage": "https://linear.app/",
+      "docs_url": "https://linear.app/docs/mcp",
+      "icon": "linear",
+      "tags": ["issues", "project-mgmt"],
+      "category": "dev",
+      "default_transport": "sse",
+      "transports": {
+        "sse": {
+          "url_template": "https://mcp.linear.app/sse",
+          "url_help": "Linear's hosted MCP endpoint. OAuth flow coming — use a personal API key for now.",
+          "auth": "bearer"
+        }
+      },
+      "auth": "bearer",
+      "needs_outbound_network": true,
+      "warnings": ["Paste your Linear personal API key for now — OAuth flow coming soon."]
+    },
+    {
+      "slug": "cloudflare-docs",
+      "name": "Cloudflare Docs",
+      "description": "Search Cloudflare's documentation, including Workers, Pages and R2.",
+      "publisher": "Cloudflare",
+      "homepage": "https://developers.cloudflare.com/",
+      "icon": "cloudflare",
+      "tags": ["docs", "reference"],
+      "category": "knowledge",
+      "default_transport": "streamable_http",
+      "transports": {
+        "streamable_http": {
+          "url_template": "https://docs.mcp.cloudflare.com/sse",
+          "url_help": "Cloudflare's public docs MCP endpoint.",
+          "auth": "none"
+        }
+      },
+      "auth": "none",
+      "needs_outbound_network": true,
+      "warnings": []
+    },
+    {
+      "slug": "sentry",
+      "name": "Sentry",
+      "description": "Investigate Sentry issues, events and releases.",
+      "publisher": "Sentry",
+      "homepage": "https://sentry.io/",
+      "docs_url": "https://docs.sentry.io/product/sentry-mcp/",
+      "icon": "sentry",
+      "tags": ["monitoring", "errors"],
+      "category": "dev",
+      "default_transport": "sse",
+      "transports": {
+        "sse": {
+          "url_template": "https://mcp.sentry.dev/sse",
+          "url_help": "Sentry's hosted MCP endpoint. Paste a user-auth-token for now (OAuth flow coming).",
+          "auth": "bearer"
+        }
+      },
+      "auth": "bearer",
+      "needs_outbound_network": true,
+      "warnings": []
+    },
+    {
+      "slug": "stripe",
+      "name": "Stripe",
+      "description": "Read customers, charges and subscriptions via the Stripe API.",
+      "publisher": "Stripe",
+      "homepage": "https://stripe.com/",
+      "docs_url": "https://docs.stripe.com/mcp",
+      "icon": "stripe",
+      "tags": ["payments", "billing"],
+      "category": "data",
+      "default_transport": "streamable_http",
+      "transports": {
+        "streamable_http": {
+          "url_template": "https://mcp.stripe.com/",
+          "url_help": "Stripe's hosted MCP endpoint. Use a restricted-access key — never your live secret.",
+          "auth": "bearer"
+        }
+      },
+      "auth": "bearer",
+      "needs_outbound_network": true,
+      "warnings": ["Use a restricted-access key, not your live secret. Defaults to test-mode if your key starts with rk_test_."]
+    },
+    {
+      "slug": "atlassian",
+      "name": "Atlassian (Jira + Confluence)",
+      "description": "Browse and update Jira issues and Confluence pages.",
+      "publisher": "Atlassian",
+      "homepage": "https://www.atlassian.com/",
+      "icon": "atlassian",
+      "tags": ["issues", "docs"],
+      "category": "dev",
+      "default_transport": "streamable_http",
+      "transports": {
+        "streamable_http": {
+          "url_template": "https://mcp.atlassian.com/v1/sse",
+          "url_help": "Atlassian's hosted MCP endpoint. Paste an API token for now (OAuth flow coming).",
+          "auth": "bearer"
+        }
+      },
+      "auth": "bearer",
+      "needs_outbound_network": true,
+      "warnings": []
+    },
+    {
+      "slug": "huggingface",
+      "name": "Hugging Face",
+      "description": "Search models, datasets and spaces on Hugging Face.",
+      "publisher": "Hugging Face",
+      "homepage": "https://huggingface.co/",
+      "icon": "huggingface",
+      "tags": ["ml", "models"],
+      "category": "knowledge",
+      "default_transport": "streamable_http",
+      "transports": {
+        "streamable_http": {
+          "url_template": "https://huggingface.co/mcp",
+          "url_help": "Hugging Face's hosted MCP endpoint. Bearer token is your HF access token.",
+          "auth": "bearer"
+        }
+      },
+      "auth": "bearer",
+      "needs_outbound_network": true,
+      "warnings": []
+    },
+    {
+      "slug": "brave-search",
+      "name": "Brave Search",
+      "description": "Web and local search via the Brave Search API.",
+      "publisher": "Anthropic (modelcontextprotocol)",
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/brave-search",
+      "icon": "brave",
+      "tags": ["search", "web", "power"],
+      "category": "tools",
+      "default_transport": "stdio",
+      "transports": {
+        "stdio": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+          "env_schema": [
+            {
+              "name": "BRAVE_API_KEY",
+              "label": "Brave API key",
+              "help": "Free tier available at https://brave.com/search/api/",
+              "required": true,
+              "secret": true
+            }
+          ]
+        }
+      },
+      "auth": "api_key_env",
+      "needs_outbound_network": true,
+      "warnings": []
+    },
+    {
+      "slug": "puppeteer",
+      "name": "Puppeteer",
+      "description": "Headless Chrome control. Prefer Playwright for new setups.",
+      "publisher": "Anthropic (modelcontextprotocol)",
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/puppeteer",
+      "icon": "puppeteer",
+      "tags": ["browser", "automation", "power"],
+      "category": "tools",
+      "default_transport": "stdio",
+      "transports": {
+        "stdio": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-puppeteer"],
+          "env_schema": []
+        }
+      },
+      "auth": "none",
+      "needs_outbound_network": true,
+      "warnings": ["Heavy. Use Playwright unless you need Puppeteer specifically."]
+    },
+    {
+      "slug": "slack",
+      "name": "Slack",
+      "description": "Read channels and post messages via a Slack bot token.",
+      "publisher": "Anthropic (modelcontextprotocol)",
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/slack",
+      "icon": "slack",
+      "tags": ["comms", "power"],
+      "category": "comms",
+      "default_transport": "stdio",
+      "transports": {
+        "stdio": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-slack"],
+          "env_schema": [
+            {
+              "name": "SLACK_BOT_TOKEN",
+              "label": "Bot token",
+              "help": "Slack bot token (xoxb-…) with channels:read, chat:write scopes.",
+              "required": true,
+              "secret": true
+            },
+            {
+              "name": "SLACK_TEAM_ID",
+              "label": "Team ID",
+              "help": "Your Slack workspace's team id (T…).",
+              "required": true,
+              "secret": false
+            }
+          ]
+        }
+      },
+      "auth": "api_key_env",
+      "needs_outbound_network": true,
+      "warnings": []
+    },
+    {
+      "slug": "redis",
+      "name": "Redis",
+      "description": "Read and write Redis keys.",
+      "publisher": "Anthropic (modelcontextprotocol)",
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/redis",
+      "icon": "redis",
+      "tags": ["database", "cache", "power"],
+      "category": "data",
+      "default_transport": "stdio",
+      "transports": {
+        "stdio": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-redis"],
+          "env_schema": [
+            {
+              "name": "REDIS_URL",
+              "label": "Redis URL",
+              "help": "Example: redis://default:password@host:6379",
+              "required": true,
+              "secret": true
+            }
+          ]
+        }
+      },
+      "auth": "api_key_env",
+      "needs_outbound_network": true,
+      "warnings": []
+    }
+  ]
+}

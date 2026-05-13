@@ -52,11 +52,39 @@ A self-hosted, Codex-like coding platform delivered as a **web application** (Ne
 - [x] Attached filenames embedded in LLM prompt
 - [x] Intermediate assistant messages filtered from chat view
 
-### GitHub (Phase 1 of 4)
+### GitHub
 - [x] Tables: `github_credentials`, `github_owner/repo/branch` on `sessions`
 - [x] Endpoints: `/github/status`, `POST /github/token`, `DELETE /github/token`
 - [x] UI: GitHub item in user menu → PAT management modal
 - [x] PAT verification against GitHub `/user`
+- [x] **`POST /github/repo`** — server-side new-repo creation; scope verification with `repo` requirement; fine-grained PATs rejected with actionable error
+- [x] **Project-creation flow with GitHub linkage** — `POST /sessions` accepts `github_mode` (`none` / `new_repo` / `link_existing`); UI has a 3-segment selector with inline "Connect PAT" prompt when missing; persists via existing `github_owner/repo/branch` columns
+
+### Sandboxed workspaces (Phase 1)
+- [x] **Sandbox image** — [sandbox/Dockerfile](sandbox/Dockerfile) with Python 3.13, Node 20, git, build tools; non-root `agent` user; `acm-workspace:latest`
+- [x] **Pluggable backend** — [backend/sandbox_client.py](backend/sandbox_client.py): `SandboxBackend` ABC + `DockerBackend` (host-socket) + `E2BBackend` (Firecracker microVM); `SANDBOX_BACKEND` env-var-selected; PAT redaction
+- [x] **`workspaces` table** — `id, user_id, session_id, backend, backend_ref, status, created_at, last_used_at, expires_at`; indexes for GC scan, idle-pause, per-user cap, session lookup
+- [x] **Workspace endpoints** — `POST/GET/DELETE /workspaces`; lazy-create + auto-resume + drift reconciliation between DB and backend
+- [x] **GC loop + quotas** — 5-min cadence, pause idle >15 min, destroy past `expires_at`; 3 concurrent active per user
+- [x] **`run_shell` agent tool** — full bash inside the workspace, output formatted for the LLM with `(exit N, M ms)` headers, 16 KB stream caps, deadline-enforced timeout
+- [x] **`/chat` workspace wiring** — project sessions lazy-create a workspace and inject `workspace_ref` into the agent's runnable config
+- [x] **Workspace bootstrap** — fresh workspaces auto-clone the linked GitHub repo (PAT embedded then stripped from remote) or `git init` an empty repo + initial commit so HEAD exists for rollback; shell-injection defenses
+
+### MCP inventory
+- [x] **Curated catalog** ([backend/mcp_catalog.json](backend/mcp_catalog.json)) — 23 official, publicly available servers (filesystem, fetch, github, postgres, sqlite, git, memory, sequential-thinking, time, everything, playwright, outline, notion, linear, cloudflare-docs, sentry, stripe, atlassian, huggingface, brave-search, puppeteer, slack, redis). Each entry declares supported transports and per-transport auth.
+- [x] **All four transports supported** — `streamable_http` (preferred for hosted MCPs), `sse`, `http`, `stdio`. Multi-transport entries let the user pick at enable time. Tools bind to a connection spec (no long-lived session) so each invocation opens its own short-lived MCP session — no pool to drain, no leaks across requests.
+- [x] **Per-user enable/disable + custom MCPs** — `mcp_servers` table (`db/init.sql`) keyed on `(user_id, catalog_slug)` for catalog entries plus a custom-MCP path with arbitrary command/URL. Hard cap: `MAX_MCPS_PER_USER=20`.
+- [x] **Endpoints** ([backend/routes_mcp.py](backend/routes_mcp.py)) — `GET /mcp/catalog` (mtime-cached so JSON edits hot-reload), `GET/POST/PATCH/DELETE /mcp/servers`, `POST /mcp/servers/{id}/test` (15s timeout, persists discovered tools + `last_error`).
+- [x] **Secret encryption** — Fernet-encrypted `secret_blob`, key from `MCP_SECRET_KEY` env (stable across restarts; ephemeral fallback warned). API responses redact to `has_secret: bool`.
+- [x] **Security hardening** ([backend/mcp_security.py](backend/mcp_security.py)) — https-only URLs, private-IP / link-local / loopback blocked, DNS-rebind defence (re-resolves hostname right before connect), stdio command allowlist (`npx, uvx, python, python3, node`), shell-metacharacter rejection. Catalog domains get a narrower allowlist.
+- [x] **Agent integration** — `_get_agent_for_request(model, user_id)` discovers the user's enabled MCP tools via `langchain-mcp-adapters` and rebuilds the agent with built-ins + MCP tools. LRU cache keyed on `(model, user, tool-name fingerprint)` so toggling rebuilds without churning unrelated users.
+- [x] **Async invocation path** — `/chat` and `/chat/resume` now run `asyncio.run(agent.ainvoke(...))` because MCP tools are async-only (`StructuredTool` with `coroutine` only). `HybridPostgresSaver` extends `PostgresSaver` with `aget_tuple`/`aput`/`aput_writes`/`alist` delegating to the sync methods via `asyncio.to_thread` so a single saver backs both `invoke` and `ainvoke`. ExceptionGroup unwrapping surfaces the real underlying error from anyio TaskGroups in chat replies + logs.
+- [x] **UI** ([ui/app/app/mcps/page.tsx](ui/app/app/mcps/page.tsx)) — Catalog tab (with a collapsible Power-tools section) and Yours tab. `EnableModal` collects transport choice + secrets; `CustomMCPModal` for hand-rolled servers. Window-focus refresh, toast notifications, SSE `mcp_updated` listener hook.
+- [x] **Official brand icons** — `simple-icons` (CC0) path data baked into [ui/components/mcp-brand-icons.ts](ui/components/mcp-brand-icons.ts) via `scripts/gen-mcp-icons.py`; hand-rolled Lucide-style outlines for generics (filesystem, fetch, memory, sequential, time) and brands not in simple-icons (Playwright, Outline, Slack).
+
+### UI polish
+- [x] **Light / dark theme toggle** — CSS-variable-backed Tailwind palette ([ui/tailwind.config.ts](ui/tailwind.config.ts)), `:root[data-theme=…]` blocks in `globals.css`, inline boot script in `layout.tsx` to avoid flash, `useTheme()` hook in `ui/lib/theme.ts` persists choice in localStorage.
+- [x] **Context window ring button** — header button shows percent-used of the model's context length as a colored arc (`stroke-dasharray`/`stroke-dashoffset`), turning amber → red as it fills.
 
 ### Docs + skills
 - [x] `architecture.md` with Mermaid diagram of the current system
@@ -65,8 +93,10 @@ A self-hosted, Codex-like coding platform delivered as a **web application** (Ne
 
 ## 🔄 In progress
 
-- Auto-maintain `architecture.md` + `report.md` on project file changes (system prompt is live; behavior still needs reinforcement on small models)
-- README sync after the docker-compose / MinIO landing (run `/update-readme`)
+- **Phase 2A — git workflow** — Steps 2.1–2.3 + 2.5 done. **Step 2.4** (git tools — `git_status`/`git_diff`/`git_branch`/`git_log`) is the remaining 2A item; lower priority now that auto-commit is in.
+- **Phase 2B — rollback + history** — Steps 2.6, 2.7, 2.8, 2.10 all done. Rollback is fully usable end-to-end: edit → auto-commit → see in history → undo → file reverts. **Step 2.9** (push flow) is the only 2B item remaining; the GitHub MCP now covers push/PR creation for users who enable it, so the bespoke push endpoint is parked unless we need the explicit approval gate.
+- **Phase 1 — Step 1.8** — E2B-side smoke test pending until a real `E2B_API_KEY` is plugged in. Docker side fully validated. E2BBackend code updated to use `Sandbox.create()` classmethod (2026 SDK shape) — untested but should now match the installed signature.
+- Auto-maintain `architecture.md` + `report.md` on project file changes (system prompt is live; behavior still needs reinforcement on small models).
 
 ---
 
@@ -78,78 +108,143 @@ A staged path to turn the current chat agent into a Codex-like coding platform. 
 
 ---
 
-## Phase 1 — Sandboxed code execution
+## Phase 1 — Sandboxed code execution (pluggable backend)
 
-**Goal:** the agent can run arbitrary shell commands inside an isolated container with CPU/RAM/network/time limits.
+**Goal:** the agent can run arbitrary shell commands inside an isolated workspace with CPU/RAM/network/time limits. Two backends behind one interface — Docker socket for local solo dev (fast, free, unsafe), E2B microVMs for multi-user production (safe, costs money beyond free tier).
 
 **Why first:** every later phase (git ops, tests, PR creation, review) depends on it. Without sandboxing, a `shell` tool is a remote code execution gift to anyone who can sign up.
 
+### Backend strategy: pluggable, env-var-selected
+
+`SANDBOX_BACKEND=docker` (default in dev) | `SANDBOX_BACKEND=e2b` (production multi-user).
+
+`backend/sandbox_client.py` exposes the same surface either way: `create`, `exec`, `read_file`, `write_file`, `pause`, `resume`, `destroy`. Every other module (`shell_tool`, file tools, GC loop, git tools in Phase 2) talks to the abstraction — swapping backends is a one-line config change, not a code rewrite.
+
+> **🚨 Safety boundary:** the Docker-socket backend is for **local-host, single-user development only**. A container escape with `/var/run/docker.sock` mounted = root on the host. Before letting any second person hit this app — even a friend testing it — flip `SANDBOX_BACKEND=e2b`. This is the hard line between "dev tool I use" and "service other people touch".
+
+### Backend A — Docker (local dev, default now)
+
+Researched 2026-05-13. Plain Docker via the host socket is the fastest, cheapest path while it's just you on localhost.
+
+- **Why:** zero new infra (Docker already installed), instant feedback loop (no API roundtrips), free, easy to inspect (`docker ps`, `docker logs`, `docker exec`).
+- **Image:** `acm-workspace:latest` — Python 3.13, Node 20, git, common build tools. Built by `sandbox/Dockerfile`.
+- **Trade-offs:**
+  - **Unsafe for multi-tenant.** Container escape = host root because we mount the Docker socket. Solo-dev only.
+  - No native pause/resume — we just stop/start containers (state survives on volumes, memory does not).
+  - No outbound network gating by default; locked down per-image if/when we need it.
+
+### Backend B — E2B (multi-user production, swap-in)
+
+Researched 2026-05-13. Multi-user threat model rules out plain Docker / Docker-socket / Sysbox (all share host kernel). Real isolation requires microVMs (Firecracker/Kata) or user-space syscall interception (gVisor).
+
+- **Chosen runtime: E2B Hobby → Pro** ([e2b.dev](https://e2b.dev/pricing)).
+  - **Why:** Firecracker microVM isolation (same tech as AWS Lambda), $100 free credit with no credit card, 20 concurrent sandboxes free, pause/resume preserves filesystem + memory state (matches our 24h-TTL-after-last-use exactly), Python SDK drops straight into the FastAPI backend, full Linux with git/python/node, ~150ms cold start.
+  - **Free-tier cost projection:** at 10 users × 10 tasks/day × 2 min ≈ $10/mo of credit → ~10 months free. At 100 users × 50 tasks/day, ~$650/mo on E2B Pro.
+  - **Trade-offs:** 1-hour single-session cap on Hobby (chain via pause/resume); no built-in egress allowlisting (wire ourselves later).
+- **Scale-up path** when E2B costs cross ~$300/mo: migrate to **self-hosted Firecracker on Hetzner CCX33** (~€30/mo for ~30 concurrent microVMs). Same `sandbox_client.py` interface, third backend implementation.
+- **Rejected:** Modal (3× pricier sandbox tier + 2–5s cold starts), Daytona (cheaper but shared-kernel isolation), Fly Machines (no free tier as of 2024), Cloudflare Containers (Worker-bound model + $5/mo floor).
+
 ### Deliverables
 
-- [ ] **Decision:** sandbox technology — Docker-in-Docker (DinD) vs Firecracker / gVisor / Kata. Default: DinD on a dedicated host. Firecracker only if multi-tenant untrusted.
-- [ ] `sandbox/` service: thin Go/Python wrapper around the chosen runtime exposing `POST /workspaces`, `POST /workspaces/{id}/exec`, `DELETE /workspaces/{id}`. Streams stdout/stderr on exec.
-- [ ] `workspaces` table: `{id, user_id, task_id?, session_id?, container_id, image, status, cpu_limit, mem_limit_mb, created_at, last_used_at, expires_at}`.
-- [ ] Container base image: Python 3.13, Node 20, git, common build tools, pre-warmed package caches. One image per repo language family; start with a single "kitchen sink" image.
-- [ ] Backend wrapper `backend/sandbox_client.py`: typed Python client for the sandbox service. Handles container lifecycle, exec, file copy in/out.
-- [ ] New agent tool `shell_tool.py`: `run_shell(cmd, cwd=".", timeout=60)` → executes in the caller's workspace, returns `{stdout, stderr, exit_code, duration_ms}`. Streams events to the event bus (see Phase 4).
-- [ ] Per-user quotas: max concurrent workspaces, max workspace lifetime, max exec time per call.
-- [ ] Garbage collector: cron-ish task that tears down workspaces past `expires_at`.
+- [x] **Step 1.1** — `sandbox/Dockerfile` and `sandbox/build.sh` for the local workspace image (Python 3.13 + Node 20 + git + build tools), tagged `acm-workspace:latest`. Plus E2B account creation and SDK install for backend B (`pip install e2b`); `E2B_API_KEY` env var stubbed.
+- [x] **Step 1.2** — `backend/sandbox_client.py` — abstract base class `SandboxBackend` with `create`, `exec`, `read_file`, `write_file`, `pause`, `resume`, `destroy`. Two implementations:
+  - `DockerBackend` — uses the Docker SDK against the host socket. Image: `acm-workspace:latest`. `pause`/`resume` map to `docker stop`/`docker start`.
+  - `E2BBackend` — uses the E2B Python SDK. Native pause/resume preserves filesystem + memory.
+  - A `get_backend()` factory returns the right one based on `SANDBOX_BACKEND` env var. Secrets redacted in all logs from both backends.
+- [x] **Step 1.3** — `workspaces` table in `db/init.sql`: `{id, user_id, session_id, backend (text), backend_ref (text), status (running|paused|destroyed), created_at, last_used_at, expires_at}`. `backend_ref` stores the Docker container ID or E2B sandbox ID — interpretation depends on `backend`.
+- [x] **Step 1.4** — Endpoints `POST /workspaces`, `GET /workspaces/{id}`, `DELETE /workspaces/{id}`. Every call bumps `last_used_at` and sets `expires_at = now() + 24h`. `exec` auto-resumes if paused.
+- [x] **Step 1.5** — GC loop in `lifespan()` (5-min cadence): pause workspaces idle >15 min (frees compute — matters more on E2B than Docker), destroy ones past `expires_at`. Per-user cap: 3 concurrent active sandboxes (429 above that).
+- [x] **Step 1.6** — `shell_tool` (`run_shell(cmd, cwd=".", timeout=60)`). Resolves `workspace_id` from agent config, calls `sandbox_client.exec`, returns stringified output. Register in `Tools/__init__.py`.
+- [x] **Step 1.7** — Wire to chat: when `/chat` runs on a `kind="project"` session, lazy-create a workspace and pass `workspace_id` into the agent's runnable config alongside `user_id`/`session_id`.
+- [ ] **Step 1.8** — Smoke test against both backends: same script (create → exec → destroy) runs green with `SANDBOX_BACKEND=docker` and `SANDBOX_BACKEND=e2b`. Proves the abstraction holds. _(Docker side green via [sandbox/smoke_test.py](sandbox/smoke_test.py) and [sandbox/test_chat_flow.py](sandbox/test_chat_flow.py); E2B side pending a real API key.)_
 
 ### Changes to existing code
 
-- `backend/api.py` — agent runnable config gains `workspace_id` alongside `user_id`/`session_id`. New endpoints `POST /workspaces` (create per task) and `DELETE /workspaces/{id}`.
+- `backend/api.py` — agent runnable config gains `workspace_id` alongside `user_id`/`session_id`. New `/workspaces/*` endpoints. `lifespan()` starts the GC loop.
 - `backend/Tools/__init__.py` — register `shell_tool`.
-- `docker-compose.yml` — add the `sandbox` service.
+- `backend/requirements.txt` — add `docker` (Python SDK) and `e2b`.
+- `backend/.env.example` — add `SANDBOX_BACKEND=docker` (default), `E2B_API_KEY=` (optional, required only when backend=e2b), `WORKSPACE_TTL_HOURS=24`, `WORKSPACE_IDLE_PAUSE_MIN=15`, `WORKSPACE_MAX_PER_USER=3`.
 
-### Open decisions
+### Open decisions (resolved)
 
-- **Network access from sandbox?** Default deny; allowlist `pypi.org`, `registry.npmjs.org`, `github.com`. Else `npm install` can't work.
-- **Volume model?** Per-workspace named volume (persistent across exec calls within the workspace lifetime; destroyed when workspace dies).
-- **Image-build pipeline?** Manual `docker build` for now; later a CI job.
+| Decision | Resolution |
+| --- | --- |
+| Sandbox tech | **Pluggable**: Docker socket for solo local dev, E2B (Firecracker microVM) for any multi-user deployment. Same `SandboxBackend` interface. |
+| Default backend | `SANDBOX_BACKEND=docker` |
+| Multi-user trigger | Flip to `SANDBOX_BACKEND=e2b` before anyone besides the developer hits the URL. Non-negotiable. |
+| TTL | 24h after last use; pause when idle >15 min |
+| Concurrency cap | 3 active sandboxes per user |
+| Network egress | Default allow everything; tighten when we deploy multi-user |
+| Image | `acm-workspace:latest` (local Dockerfile) for Docker backend; E2B default `base` for E2B backend |
 
 ### Acceptance
 
-The agent can be asked "run `ls -la` in a fresh workspace" via a chat message, sees the real output, and the workspace tears down 30 min later. Quotas are enforced.
+With `SANDBOX_BACKEND=docker`: the agent in a project session can be asked "run `ls -la /` in the workspace" via chat and sees real output. Workspaces past 24h get destroyed within 5 minutes. A 4th concurrent workspace per user returns 429.
+
+With `SANDBOX_BACKEND=e2b`: same smoke test passes against an E2B microVM. No code changes required to swap.
 
 ### Estimate
 
-~2–3 weeks for one developer including hardening.
+~4–6 days. Dockerfile + Docker backend is fast (~1 day); E2B backend is ~1 day on top; the rest (table, endpoints, GC, tool, wiring) is the same regardless of backend.
 
 ---
 
-## Phase 2 — Real git workflow
+## Phase 2 — Real git workflow + hybrid rollback
 
-**Goal:** a task can clone a GitHub repo into a workspace, branch, edit, commit, push.
+**Goal:** every workspace is a real git repo from minute one (so rollback works for everyone). GitHub linkage is optional; when present, the user explicitly approves each push.
 
-**Why now:** with Phase 1's sandbox + the user's existing PAT, this is just wiring. Unlocks every "do something to my code" use case.
+### Rollback model: hybrid (local-always + GitHub-on-permission)
 
-### Deliverables
+- **Local commits are silent and automatic.** Every agent file write triggers an auto-commit in the workspace's local git repo, regardless of whether GitHub is connected. Rollback works for everyone, every time.
+- **GitHub pushes are opt-in and per-permission.** When a session has a linked repo, the user gets a prompt at natural state-points (end of chat turn, end of task, manual "save my work" click) listing the unpushed commits — they confirm to push or defer to push later in a batch.
+- **GitHub repo creation is offered during project creation.** Three choices: create a new repo for me (we call GitHub API; needs `repo` PAT scope), link an existing repo, or skip entirely.
 
-- [ ] On workspace creation for a repo-linked session: `git clone https://<token>@github.com/<owner>/<repo>.git /workspace`. PAT pulled from `github_credentials`, scoped to least-privilege.
-- [ ] Tools: `git_status`, `git_diff`, `git_branch(name)`, `git_commit(message)`, `git_push(branch)`. Each is a thin wrapper over `run_shell` but emits a structured event (so the audit log shows "agent created branch X" not "agent ran `git checkout -b X`").
-- [ ] Dual-backend file tools: `read_project_file` / `write_project_file` / `list_project_files` check whether a workspace is attached and, if so, read/write the workspace filesystem instead of S3. S3 stays for "loose" files (uploaded PDFs, attachments).
-- [ ] `repo_links` becomes load-bearing — when a session has `github_owner/repo`, task workspaces auto-clone it; otherwise an empty workspace is created.
-- [ ] PAT redaction in all logs and event streams — never let a token leak into chat history.
+### Phase 2A — Git workflow
+
+- [x] **Step 2.1** — `backend/github_client.py`: add `verify_token_scopes(token) → [scopes]` and `create_repo(token, name, private=True) → {owner, repo, default_branch}`. New endpoint `POST /github/repo`.
+- [x] **Step 2.2** — Project creation flow. Extend `POST /sessions` with `github_mode: "none" | "new_repo" | "link_existing"`. UI: project modal gains a "Save history to GitHub?" step with three buttons. For `new_repo`, verify the PAT has `repo` scope first; if missing, prompt inline for a re-paste (don't kick out to the user-menu modal). Persist the link via existing `github_owner/repo/branch` columns.
+- [x] **Step 2.3** — Auto-init/clone on workspace start. For repo-linked sessions: `git clone https://<token>@github.com/<owner>/<repo>.git /workspace`. For unlinked: `git init /workspace`. Both paths leave the workspace as a valid git repo from minute one. Configure committer identity per session.
+- [ ] **Step 2.4** — Git tools in `backend/Tools/git_tools.py`: `git_status`, `git_diff`, `git_branch`, `git_log`. Thin wrappers over `run_shell` that parse output into structured dicts (easier for the agent to reason about than raw text).
+- [x] **Step 2.5** — Dual-backend file tools. `get_workspace_ref(config)` in [backend/Tools/_paths.py](backend/Tools/_paths.py); workspace-aware [list_files_tool.py](backend/Tools/list_files_tool.py) / [read_file_tool.py](backend/Tools/read_file_tool.py) / [write_file_tool.py](backend/Tools/write_file_tool.py). Reads try workspace then fall through to S3; writes go to workspace (committed) when a workspace is attached, S3 otherwise. Listing shows both surfaces with clear separation.
+
+### Phase 2B — Rollback + history UI
+
+- [x] **Step 2.6** — Auto-commit on every workspace file write. After `write_project_file` succeeds in a workspace, runs `git add + git commit` via an env-var-passed inline script (`$ACM_FILE`). Verb derived from `git status --porcelain` ("created" for `A`, "updated" for `M`, skip on no-change). Best-effort: commit failure is logged but write still reported as successful. Surfaces `(committed as Agent: updated hello.py (a1b2c3d))` in the tool response.
+- [x] **Step 2.7** — `workspace_commits` table (`id, workspace_id, session_id, user_id, sha, message, pushed_at, reverted_at, created_at`; `UNIQUE (workspace_id, sha)`). End-of-turn `_sync_workspace_commits` in `/chat` mirrors the workspace's `git log` into the table (idempotent via `ON CONFLICT DO NOTHING`, oldest-first insertion so newer commits get higher serial ids). `GET /sessions/{id}/history` returns the timeline newest-first with `status` of `local | pushed | reverted`.
+- [x] **Step 2.8** — Undo endpoint `POST /sessions/{id}/history/{commit_id}/revert`. Runs `git revert --no-edit <sha>` inside the workspace; aborts cleanly on conflict and returns 409. Stamps `reverted_at` on the original row; the new revert commit appears via the next sync. Refuses to revert an already-reverted commit (409) or a workspace that's been destroyed (410).
+- [ ] **Step 2.9** — Push flow with permission gate. `GET /sessions/{id}/unpushed-commits` returns rows where `pushed_at IS NULL AND reverted_at IS NULL`. `POST /sessions/{id}/push` runs `git push origin <branch>`, stamps `pushed_at` on the included rows. End-of-turn auto-prompt: when chat finishes and unpushed count > 0, emit a UI event ("N changes ready to push to <repo>") with [Push now] / [Later] buttons. **Defer to user always** — never push without explicit confirmation.
+- [x] **Step 2.10** — History panel UI. Floating button on the right edge (project sessions only) opens a slide-in panel that lists commits newest-first with short SHA, timestamp, message, and a status badge (local / pushed / reverted). Each row has an `Undo` button that opens a confirm modal and then POSTs to the revert endpoint; the panel + file sidebar refresh on success. Already-reverted commits and the initial commit are disabled. Push buttons / "Push all" deferred along with Step 2.9.
 
 ### Changes to existing code
 
-- `backend/Tools/_paths.py` — add `get_workspace(config) -> Optional[str]` resolver.
+- `backend/Tools/_paths.py` — add `get_workspace_id(config)`.
 - `backend/Tools/read_file_tool.py`, `write_file_tool.py`, `list_files_tool.py` — branch on workspace presence.
-- `backend/api.py` — `_seed_project_files` writes architecture.md / report.md into the workspace (committed as the initial commit) when the project is repo-linked.
+- `backend/api.py` — `_seed_project_files` writes architecture.md / report.md into the workspace as the initial commit when repo-linked.
+- `backend/github_client.py` — `verify_token_scopes`, `create_repo`.
+- `db/init.sql` — add `workspace_commits` table.
 
-### Open decisions
+### Open decisions (resolved)
 
-- **Branch naming convention** for agent commits? Default: `agent/<task-id-short>`.
-- **Commit author?** `<user-email> via Agent <agent@…>` so PR history is honest.
-- **Squash on push, or push every commit?** Squash by default; preserve the granular commits as event-log entries.
+| Decision | Resolution |
+| --- | --- |
+| Rollback model | **Hybrid**: local commits always (silent, automatic), GitHub pushes opt-in and per-permission |
+| Push trigger | At end of chat turn / task / state-point → prompt user → push or defer |
+| New-repo-on-creation | **Offered** during project creation (needs `repo` PAT scope; inline re-paste if missing) |
+| Commit message style | **One-line template** (e.g. `Agent: updated <file>`); no extra LLM call |
+| Branch for agent commits | `main` for new repos, default branch for linked repos. Branch-per-task comes in Phase 5 (PR creation). |
+| PAT scope handling | Verify before offering `new_repo`; prompt inline for re-paste if missing `repo` scope |
 
 ### Acceptance
 
-User can say in chat "fix the typo in README", agent clones, edits, commits, pushes a branch. `git log` on GitHub shows the commit with a sensible message.
+1. User creates a project with "create new repo" → a private repo appears on their GitHub.
+2. User asks in chat to "create a README"; the agent writes it; the file appears in the workspace.
+3. The History panel shows one entry: "Agent: updated README.md — local".
+4. The end-of-turn prompt asks "1 change ready to push to <repo>"; the user clicks Push; the commit appears on GitHub.
+5. The user clicks Undo on a different commit; the file reverts in the workspace; a new "Undo: …" entry appears.
 
 ### Estimate
 
-~1–2 weeks.
+~1–2 weeks across Phase 2A + 2B.
 
 ---
 
@@ -199,15 +294,21 @@ User types a task; the task runs to completion or step-limit; the events log sho
 
 ### Deliverables
 
-- [ ] Event stream endpoint: `GET /tasks/{id}/events/stream` (Server-Sent Events). Subscribers get every new `task_event` row in real time.
-- [ ] Approval gates — agent tool `request_approval(action, rationale)` sets task status to `needs_approval` and emits an approval event. `POST /tasks/{id}/approve` or `/deny` resumes the loop.
-- [ ] Approval policy: configurable list of always-requires-approval actions — `git push`, anything writing outside the workspace, `pip install` of an unpinned package, network requests to non-allowlisted domains.
-- [ ] Task detail page (UI) — three-pane layout:
-  - **Left:** live event log (tool calls, shell output, LLM thoughts collapsible)
-  - **Middle:** current working diff (`git diff` rendered with syntax highlighting)
-  - **Right:** chat with the agent ("look at this commit also" → agent picks it up next step)
-- [ ] Cancel button — sends SIGTERM to the running shell command, marks task `cancelled`.
-- [ ] Replay mode — given a finished task, scrub through the event log step-by-step.
+**Path A (prompt-based, shipped now):**
+
+- [x] **Rich tool-message cards** in chat — `run_shell` as terminal card (parsed `$ cmd / exit N / M ms / stdout / stderr`); `write_project_file` as edit card with Created/Edited verb badge, byte count, and short SHA; `read_project_file` and `list_project_files` as compact cards; errors as red cards. Thinking indicator now labelled "Agent — thinking…".
+- [x] **Auto / Confirm mode toggle** in the project header — `mode` column on sessions, `PATCH /sessions/{id}` endpoint, `/chat` prepends a confirmation-mode preamble to the user message when set. Prompt-based enforcement (the model is asked to ask first); not bulletproof, but covers the demo path.
+- [x] **Diff expander** on file-edit cards — `View diff` button fetches `GET /sessions/{id}/commits/{sha}/diff` (which runs `git show --no-color` in the workspace) and renders a colored unified diff with `+N/-M` summary in the card header.
+
+**Path B (hard interrupts):**
+
+- [x] **SSE event stream** — `GET /sessions/{id}/threads/{tid}/stream?token=<jwt>` (JWT in query because EventSource can't send headers). [backend/event_bus.py](backend/event_bus.py) implements an in-memory per-key pub/sub; `_record_message` and `_sync_workspace_commits` publish on insert. UI's `EventSource` subscription replaces the mid-turn polling for *display*; the existing send-time polling stays only as a completion-detection backstop.
+- [x] **Hard approval gates via LangGraph `interrupt()`** — `write_project_file` and `run_shell` call `interrupt(...)` before any side effect when `session_mode='confirm'`. `_pending_approval` inspects post-invoke state for pending interrupts and returns `{interrupted: true, approval}` to the UI; an SSE `approval_request` event flushes the card in real time. **`POST /chat/resume`** continues the run via `Command(resume={approved, reason})`. Chained interrupts are handled — multi-write turns surface one approval at a time.
+- [x] **Approval UI card** — amber `ApprovalCard` renders inline in chat for the active pending interrupt. For `write_project_file` shows filename, byte count, and a content preview; for `run_shell` shows the cwd and the command. `[Approve]` / `[Deny]` buttons POST to `/chat/resume`.
+- [x] **Approval policy** — `_ALWAYS_CONFIRM_PATTERNS` in [shell_tool.py](backend/Tools/shell_tool.py) escalates `git push`, `git reset --hard`, force-push, `sudo`, `rm -rf /`, redirects outside `/workspace`/`/tmp`/`/dev/null`, and `curl|wget` with write methods to a hard approval gate even in Auto mode. The pattern label is forwarded as `policy_reason` so the approval card can explain *why* it's asking.
+- [x] **Task detail layout** — `ViewToggle` (Chat / Task) in the project header. Task view is a 3-col grid: **Activity** (tool messages + bare-tool-call stubs), **Working diff** (auto-fetched for the most recent commit SHA seen in messages), **Chat** (user + assistant prose only, with approval card + Stop button + composer). All three columns scroll independently and share the same SSE feed.
+- [x] **Cancel button** — `POST /chat/cancel` runs `pkill -KILL -P 1` inside the session's workspace, killing any in-flight shell process. UI surfaces a `Stop` button while `sending` is true; toast confirms whether it actually killed processes. Doesn't cancel the upstream LLM call (no handle on the OpenRouter request) but the shell-kill is usually enough to abort the agent loop.
+- [x] **Replay mode** — `ReplayControls` in the header. Enter to freeze rendering at `displayMessages = messages.slice(0, replayIdx)`; `◀ / ▶` step through; `Live` exits. Works in both Chat and Task views. While replaying, the typing indicator, approval card, and Stop button are hidden to make clear you're viewing history, not the live state.
 
 ### Changes to existing code
 
@@ -294,9 +395,9 @@ A running task shows live output. A `git push` triggers an approval modal. The d
 
 - [ ] **`AGENTS.md` parsing** — on workspace init, read repo-root `AGENTS.md` / `CLAUDE.md` and inject into the system prompt. Per-directory `AGENTS.md` supported via nearest-ancestor lookup.
 - [ ] **Model role split** — `PLANNER_MODEL`, `EXECUTOR_MODEL`, `REVIEWER_MODEL` env vars (with sensible defaults). Planner = smart+slow, executor = fast, reviewer = smart. Each used in the right place.
-- [ ] **Generic MCP loader** — list MCP servers in env (`MCP_SERVERS=shell,github,filesystem,notion,…`), spawn each at backend startup, auto-discover their tools, adapt MCP tool schemas → LangChain tools, register dynamically. Per-user enable/disable in settings.
+- [x] **Generic MCP loader** — delivered as the [MCP inventory](#mcp-inventory) above. Richer than originally scoped: per-user toggleable, catalog of 23 servers, custom MCP support, all four transports (stdio + streamable_http + sse + http), Fernet-encrypted secrets, DNS-rebind defence, command allowlist.
 - [ ] **Token-reduction via summarization** — LangGraph `SummarizationNode` for long conversations; show active summary in the context viewer.
-- [ ] **Context window viewer** — floating button in the web UI → side panel showing system prompt, full message history, files in scope, per-message tokens, % of model limit used.
+- [x] **Context window indicator** — header button shows percent-used as a colored arc. Full side-panel viewer (system prompt, message history, files in scope, per-message tokens) still pending.
 - [ ] **In-browser logs viewer** — searchable per-task log of every shell command, tool call, and LLM exchange. Replaces "open a terminal to see what happened" since we're web-only.
 
 ### Deferred (web-compatible but lower priority)
@@ -315,7 +416,7 @@ These shape architecture; deciding late is expensive. Tracked here as standing d
 
 | Decision | Options considered | Current default |
 | --- | --- | --- |
-| Sandbox isolation | DinD / Firecracker / gVisor / Kata | **DinD** — single-host, single-trust-domain users |
+| Sandbox isolation | Docker socket / DinD / gVisor / Kata / Firecracker (self-hosted) / E2B (managed) / Modal / Daytona | **Pluggable backend**: Docker socket for local solo dev (default), E2B (managed Firecracker) for any multi-user deploy. Same `SandboxBackend` interface — flip via `SANDBOX_BACKEND` env var. Self-hosted Firecracker on Hetzner is the scale-up target after ~$300/mo on E2B. |
 | Background workers | Asyncio in-process / RQ+Redis / Celery / Temporal | **Asyncio → RQ+Redis from Phase 6** |
 | Event transport | SSE / WebSocket / Postgres LISTEN+poll | **SSE** — one-way is enough |
 | Auth model | Keep Supabase / move to local OIDC / add OAuth (GitHub) | **Keep Supabase**, add GitHub OAuth as a stretch goal |

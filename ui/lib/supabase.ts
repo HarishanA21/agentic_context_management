@@ -10,6 +10,16 @@ export const supabase = createClient(url, anon, {
   },
 })
 
+/** Return the current Supabase access token (JWT), or null if signed out.
+ *  Used by EventSource subscribers — `EventSource` cannot send headers,
+ *  so the token has to ride along in the query string. */
+export async function authToken(): Promise<string | null> {
+  const {
+    data: { session },
+  } = await supabase.auth.getSession()
+  return session?.access_token ?? null
+}
+
 export async function authFetch(input: string, init: RequestInit = {}) {
   const {
     data: { session },
