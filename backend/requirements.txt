@@ -28,3 +28,11 @@ e2b             # backend=e2b: managed Firecracker microVMs
 # GitHub integration
 PyGithub
 
+# MCP inventory — adapter for stdio + SSE servers, plus the raw Python
+# SDK for streamable_http connections.
+langchain-mcp-adapters>=0.1
+mcp>=1.0
+
+# Secret-blob encryption for stored MCP API tokens / env-var values.
+cryptography
+

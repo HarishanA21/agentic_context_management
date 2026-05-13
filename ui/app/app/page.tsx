@@ -7,6 +7,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { supabase, authFetch, authToken } from '@/lib/supabase'
 import { useTheme } from '@/lib/theme'
+import { MCPInventoryPanel } from '@/components/mcp-inventory'
 
 /* ─────────────────────────── types ─────────────────────────── */
 
@@ -227,6 +228,9 @@ export default function AppPage() {
 
   const [newMenuOpen, setNewMenuOpen] = useState(false)
   const [userMenuOpen, setUserMenuOpen] = useState(false)
+  // MCP inventory takes over the main pane when open — exclusive with the
+  // chat view; clicking any session/project/chat row closes it.
+  const [mcpsOpen, setMcpsOpen] = useState(false)
   const [projectModalOpen, setProjectModalOpen] = useState(false)
 
   // Per-row "⋯" menu — keyed by `${kind}:${id}` so chats and threads don't collide
@@ -1263,6 +1267,7 @@ export default function AppPage() {
   }
 
   async function selectThread(sid: string, tid: string) {
+    setMcpsOpen(false)
     setActiveSession(sid)
     setActiveThread(tid)
     setMessages([])
@@ -1286,6 +1291,7 @@ export default function AppPage() {
   // Clicking on a project row header should put the user here so they can
   // see the project's files, threads, and metadata before diving in.
   async function selectProject(sid: string) {
+    setMcpsOpen(false)
     setActiveSession(sid)
     setActiveThread(null)
     setMessages([])
@@ -1938,6 +1944,29 @@ export default function AppPage() {
           </div>
         </div>
 
+        {/* MCP inventory entry — sits above the user profile so it's
+            findable without diving into the user menu. Toggles the MCP
+            panel in the main pane (in place of chat). */}
+        <div className="px-3 pt-2">
+          <button
+            onClick={() => setMcpsOpen((v) => !v)}
+            aria-pressed={mcpsOpen}
+            className={`w-full flex items-center gap-3 px-2 py-2 rounded-md transition ${
+              mcpsOpen
+                ? 'bg-soft/[0.08] text-fog-50'
+                : 'hover:bg-soft/[0.04] text-fog-200'
+            }`}
+          >
+            <span className="w-7 h-7 rounded-md bg-soft/10 text-accent flex items-center justify-center">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+                <path d="M3.27 6.96L12 12.01l8.73-5.05M12 22.08V12" opacity="0.6" />
+              </svg>
+            </span>
+            <span className="text-sm flex-1 text-left">MCP Inventory</span>
+          </button>
+        </div>
+
         {/* User menu */}
         <div className="border-t border-line p-3 relative">
           <button
@@ -1983,6 +2012,10 @@ export default function AppPage() {
 
       {/* ────── Main ────── */}
       <main className="flex-1 flex flex-col min-w-0">
+        {mcpsOpen ? (
+          <MCPInventoryPanel embedded />
+        ) : (
+        <>
         {/* Top bar */}
         <header className="h-12 px-5 border-b border-line flex items-center justify-between">
           <div className="text-sm flex items-center gap-2 min-w-0">
@@ -2404,6 +2437,8 @@ export default function AppPage() {
             </p>
           </div>
         </footer>
+        </>
+        )}
       </main>
 
       {/* New project modal */}
