@@ -6,11 +6,12 @@ A full-stack LangGraph agent with per-user authentication, persistent multi-proj
 
 - **Backend** — FastAPI + LangGraph (`create_agent`) + LangChain
 - **Model** — OpenRouter (chat + vision)
-- **Persistence** — Postgres (LangGraph checkpoints + sessions/threads/messages, plus `github_credentials`)
+- **Persistence** — Postgres (LangGraph checkpoints + sessions/threads/messages/workspaces, plus `github_credentials`)
 - **Object storage** — S3-compatible: MinIO locally via docker-compose, AWS S3 / R2 in prod (`boto3`)
 - **Auth** — Supabase Auth (email/password, JWT verified server-side via JWKS)
+- **Sandboxed workspaces** — pluggable backend (`SANDBOX_BACKEND=docker|e2b`): local Docker socket for solo dev (`docker` SDK + the `acm-workspace` image), E2B Firecracker microVMs for multi-user (`e2b` SDK)
 - **File parsing** — `pypdf`, `python-docx`, `openpyxl`
-- **GitHub integration** — `PyGithub` with per-user PATs
+- **GitHub integration** — `PyGithub` with per-user PATs (read, link, and server-side repo creation)
 - **Frontend** — Next.js 14 (App Router) + Tailwind + TypeScript
 - **Markdown** — `react-markdown` + `remark-gfm`
 
@@ -20,35 +21,45 @@ See [architecture.md](architecture.md) for the full component breakdown.
 
 ```
 agentic_context_management/
-├── backend/                # FastAPI + LangGraph agent
-│   ├── api.py              # FastAPI app, auth, sessions/threads/messages, files, chat, github
-│   ├── agent_callbacks.py  # LangGraph callbacks
-│   ├── storage.py          # S3-compatible bucket facade (MinIO / S3)
-│   ├── github_client.py    # PyGithub wrapper, per-user PAT storage
-│   ├── Tools/              # Tools registered with the agent
-│   │   ├── __init__.py     # all_tools registry
-│   │   ├── _paths.py
+├── backend/                  # FastAPI + LangGraph agent
+│   ├── api.py                # FastAPI app, auth, sessions/threads/messages, files, chat, workspaces, github
+│   ├── agent_callbacks.py    # LangGraph callbacks
+│   ├── storage.py            # S3-compatible bucket facade (MinIO / S3)
+│   ├── sandbox_client.py     # SandboxBackend ABC + DockerBackend + E2BBackend + factory
+│   ├── github_client.py      # PyGithub wrapper, per-user PAT storage, repo creation
+│   ├── Tools/                # Tools registered with the agent
+│   │   ├── __init__.py       # all_tools registry
+│   │   ├── _paths.py         # config-scoped helpers (user_id, session_id, workspace_ref)
 │   │   ├── calculator_tool.py
 │   │   ├── weather_tool.py
 │   │   ├── list_files_tool.py
 │   │   ├── read_file_tool.py
-│   │   └── write_file_tool.py
+│   │   ├── write_file_tool.py
+│   │   └── shell_tool.py     # run_shell inside the session's sandboxed workspace
 │   ├── requirements.txt
 │   ├── pyproject.toml
 │   └── .env.example
-├── ui/                     # Next.js frontend
+├── ui/                       # Next.js frontend
 │   ├── app/
-│   │   ├── page.tsx        # landing
-│   │   ├── app/            # chat workspace
-│   │   ├── login/          # login + signup
+│   │   ├── page.tsx          # landing
+│   │   ├── app/              # chat workspace
+│   │   ├── login/            # login + signup
+│   │   ├── layout.tsx
 │   │   └── globals.css
 │   ├── lib/supabase.ts
 │   └── .env.local.example
+├── sandbox/                  # Workspace runtime + diagnostic scripts
+│   ├── Dockerfile            # `acm-workspace` image: Python 3.13 + Node 20 + git
+│   ├── build.sh              # builds + smoke-tests the image
+│   ├── smoke_test.py         # exercises SandboxBackend end-to-end (create→exec→destroy)
+│   ├── test_chat_flow.py     # exercises the lazy-create + run_shell wiring
+│   └── diagnose_model.py     # one-shot OpenRouter reachability check
 ├── db/
-│   └── init.sql            # Postgres schema, auto-loaded by docker-compose
-├── docker-compose.yml      # Postgres + MinIO (+ bucket init)
-├── .env.example            # docker-compose overrides
+│   └── init.sql              # Postgres schema, auto-loaded by docker-compose
+├── docker-compose.yml        # Postgres + MinIO (+ bucket init)
+├── .env.example              # docker-compose overrides
 ├── architecture.md
+├── PROJECT.md                # roadmap + phase plan
 └── README.md
 ```
 
@@ -80,7 +91,19 @@ This brings up:
 
 LangGraph's checkpoint tables are created on first backend startup via `PostgresSaver.setup()`.
 
-### 2. Backend
+### 2. Workspace image (Docker backend only)
+
+Project sessions get a sandboxed workspace from the configured `SANDBOX_BACKEND`. The default (`docker`) needs the `acm-workspace` image — Python 3.13 + Node 20 + git + build tools — built locally once:
+
+```bash
+./sandbox/build.sh
+```
+
+The build script also runs a smoke test (`python -V`, `node -v`, `git --version`) so failures surface immediately. Skip this step if you set `SANDBOX_BACKEND=e2b` instead.
+
+> The Docker backend mounts the host's Docker socket and is only safe for solo / localhost use — a container escape gives host root. Flip to `e2b` before exposing this app to anyone else. See [PROJECT.md](PROJECT.md).
+
+### 3. Backend
 
 Copy `backend/.env.example` to `backend/.env` and fill in the secrets. Minimum required for local dev:
 
@@ -96,6 +119,14 @@ S3_SECRET_KEY=minioadmin
 S3_REGION=us-east-1
 S3_BUCKET=project-files
 
+# Sandboxed workspaces
+SANDBOX_BACKEND=docker          # or 'e2b' for multi-user; needs E2B_API_KEY
+E2B_API_KEY=                    # leave blank for the docker backend
+WORKSPACE_TTL_HOURS=24
+WORKSPACE_IDLE_PAUSE_MIN=15
+WORKSPACE_MAX_PER_USER=3
+WORKSPACE_IMAGE=acm-workspace:latest
+
 # Optional — LangSmith tracing
 LANGSMITH_TRACING=false
 LANGSMITH_API_KEY=
@@ -110,7 +141,7 @@ source .venv/bin/activate
 uv pip install -r backend/requirements.txt
 ```
 
-### 3. Frontend
+### 4. Frontend
 
 Copy `ui/.env.local.example` to `ui/.env.local` and fill in your Supabase project keys:
 
@@ -151,11 +182,13 @@ Then open http://localhost:3000.
 
 ## How it works
 
-- A **project** (session) groups one or more **threads**. Each thread is its own conversation.
+- A **project** (session) groups one or more **threads**. Each thread is its own conversation. Sessions are typed `chat` or `project`; only `project` sessions get a sandboxed workspace.
 - Every chat request is authenticated with a Supabase JWT, verified server-side via JWKS.
 - LangGraph state is checkpointed in Postgres, scoped by `{user_id}:{session_id}` so users can never see each other's state.
 - User isolation is enforced in Python (`_verify_session`, `_verify_thread`, and the `user_id` prefix on every S3 key). On Supabase deployments RLS adds a second layer; the local Postgres image does not enable RLS because the backend connects with full privileges.
 - Uploaded files live in S3 under `{user_id}/{session_id}/{filename}` so the agent's file tools are naturally scoped to the project.
+- **Sandboxed workspaces** lazy-create on the first chat turn in a project session — either a Docker container or an E2B microVM depending on `SANDBOX_BACKEND`. The workspace auto-clones a linked GitHub repo (or `git init`s) on first boot, so rollback works from minute one. The agent reaches it through the `run_shell` tool. A GC loop pauses idle workspaces (>15 min) and destroys expired ones (>24h after last use). Per-user concurrency is capped (default 3).
+- Project creation can simultaneously **create a new GitHub repo** for you (or link to an existing one) via `POST /sessions` with `github_mode=new_repo|link_existing` — needs a PAT with the `repo` scope.
 - The frontend fires the `/api/chat` request and polls `/api/sessions/<sid>/threads/<tid>/history` until a new assistant message appears, so transient model errors (e.g. free-tier rate limits) don't surface as UI errors.
 
 ## Choosing a model
@@ -178,4 +211,8 @@ If `OPENROUTER_API_KEY` isn't set or the catalog fetch fails, the picker stays e
 - **`ECONNREFUSED 127.0.0.1:8000`** — backend isn't running, or you ran `uvicorn` from the wrong directory (run it from `backend/`).
 - **`could not connect to server` / Postgres errors on startup** — docker-compose isn't running. Start it with `docker compose up -d`.
 - **`FATAL: role "postgres" does not exist`** — a host-level Postgres (Postgres.app / Homebrew) is already bound to `127.0.0.1:5432` and is intercepting the connection before it reaches Docker. Remap the container port: set `POSTGRES_PORT=5433` in the root `.env`, update `SUPABASE_DB_URL` in `backend/.env` to `postgresql://postgres:postgres@localhost:5433/acm`, and `docker compose down && docker compose up -d`.
-- **HTTP 429 from the model** — OpenRouter free-tier daily quota. Wait or add credit.
+- **HTTP 429 from the model** — OpenRouter free-tier daily quota. Wait or add credit. Run [sandbox/diagnose_model.py](sandbox/diagnose_model.py) for a one-shot reachability check.
+- **`Workspace image not found: acm-workspace:latest`** — you haven't built the workspace image. Run `./sandbox/build.sh`.
+- **Agent says "this chat does not have a sandboxed workspace attached"** — the session is `kind='chat'`, not `'project'`. Workspaces are only provisioned for project sessions. Create a new project (or update the row's `kind` column).
+- **`Cannot connect to the Docker daemon`** — Docker Desktop / colima isn't running. The backend connects via the host socket when `SANDBOX_BACKEND=docker`.
+- **Next.js logs `Failed to proxy ... socket hang up` / `ECONNRESET`** on every `/api/*` call — Node 17+ resolves `localhost` to `::1` (IPv6) first on macOS, and our uvicorn only binds IPv4. [ui/next.config.mjs](ui/next.config.mjs) pins the proxy to `127.0.0.1:8000` to avoid this. If you've customised the proxy target back to `localhost`, change it back, or run uvicorn with `--host ::` to listen on both stacks.
