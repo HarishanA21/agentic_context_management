@@ -28,23 +28,23 @@ function Nav() {
         </Link>
 
         <nav className="hidden md:flex items-center gap-7 text-sm text-fog-200">
-          <a href="#features" className="hover:text-white transition">
+          <a href="#features" className="hover:text-fog-50 transition">
             Product
           </a>
-          <a href="#how" className="hover:text-white transition">
+          <a href="#how" className="hover:text-fog-50 transition">
             How it works
           </a>
-          <a href="#use-cases" className="hover:text-white transition">
+          <a href="#use-cases" className="hover:text-fog-50 transition">
             Use cases
           </a>
-          <a href="#faq" className="hover:text-white transition">
+          <a href="#faq" className="hover:text-fog-50 transition">
             FAQ
           </a>
           <a
             href="https://github.com"
             target="_blank"
             rel="noreferrer"
-            className="hover:text-white transition"
+            className="hover:text-fog-50 transition"
           >
             Docs
           </a>
@@ -53,7 +53,7 @@ function Nav() {
         <div className="flex items-center gap-2">
           <Link
             href="/login"
-            className="hidden sm:inline-flex text-sm text-fog-200 hover:text-white px-3 py-1.5 transition"
+            className="hidden sm:inline-flex text-sm text-fog-200 hover:text-fog-50 px-3 py-1.5 transition"
           >
             Sign in
           </Link>
@@ -83,7 +83,7 @@ function Hero() {
           Now in private preview
         </div>
 
-        <h1 className="serif text-5xl sm:text-7xl leading-[1.02] tracking-tighter text-white">
+        <h1 className="serif text-5xl sm:text-7xl leading-[1.02] tracking-tighter text-fog-50">
           An agent that keeps
           <br />
           <span className="italic text-fog-200">your context.</span>
@@ -121,9 +121,9 @@ function ProductPreview() {
         <div className="surface shadow-glow overflow-hidden">
           {/* Window chrome */}
           <div className="flex items-center gap-2 px-4 py-3 border-b border-line">
-            <span className="w-2.5 h-2.5 rounded-full bg-[#3a3a3e]" />
-            <span className="w-2.5 h-2.5 rounded-full bg-[#3a3a3e]" />
-            <span className="w-2.5 h-2.5 rounded-full bg-[#3a3a3e]" />
+            <span className="w-2.5 h-2.5 rounded-full bg-ink-600" />
+            <span className="w-2.5 h-2.5 rounded-full bg-ink-600" />
+            <span className="w-2.5 h-2.5 rounded-full bg-ink-600" />
             <div className="ml-3 text-xs text-fog-400 font-mono">
               agent.app/app
             </div>
@@ -139,7 +139,7 @@ function ProductPreview() {
                 <div
                   key={i}
                   className={`flex items-start gap-2 px-2 py-2 rounded-lg mb-1 ${
-                    i === 0 ? 'bg-white/5' : 'hover:bg-white/[0.03]'
+                    i === 0 ? 'bg-soft/5' : 'hover:bg-soft/[0.03]'
                   }`}
                 >
                   <span
@@ -147,7 +147,7 @@ function ProductPreview() {
                     aria-hidden
                   />
                   <div className="min-w-0">
-                    <div className="text-sm text-white truncate">{t.title}</div>
+                    <div className="text-sm text-fog-50 truncate">{t.title}</div>
                     <div className="text-[11px] text-fog-400 truncate">
                       {t.sub}
                     </div>
@@ -163,7 +163,7 @@ function ProductPreview() {
               </div>
 
               <div className="flex justify-end mb-4">
-                <div className="max-w-md text-sm bg-white/[0.06] border border-line rounded-2xl rounded-br-md px-4 py-2.5">
+                <div className="max-w-md text-sm bg-soft/[0.06] border border-line rounded-2xl rounded-br-md px-4 py-2.5">
                   Walk me through migrating from custom JWT to Supabase auth in
                   this repo.
                 </div>
@@ -177,9 +177,9 @@ function ProductPreview() {
                 <ol className="list-decimal pl-5 space-y-1 text-fog-200">
                   <li>Replace the JWT middleware with a Supabase JWKS check.</li>
                   <li>
-                    Move user creation flow to <code className="font-mono text-xs px-1.5 py-0.5 bg-white/[0.06] rounded">supabase.auth.signUp</code>.
+                    Move user creation flow to <code className="font-mono text-xs px-1.5 py-0.5 bg-soft/[0.06] rounded">supabase.auth.signUp</code>.
                   </li>
-                  <li>Drop the legacy <code className="font-mono text-xs px-1.5 py-0.5 bg-white/[0.06] rounded">users</code> table once backfill is verified.</li>
+                  <li>Drop the legacy <code className="font-mono text-xs px-1.5 py-0.5 bg-soft/[0.06] rounded">users</code> table once backfill is verified.</li>
                 </ol>
                 <p className="text-fog-300 text-sm">
                   I'll run a search to find all current JWT references…
@@ -192,7 +192,7 @@ function ProductPreview() {
                     Send a message…
                   </div>
                   <span className="chip">glm-4.5-air</span>
-                  <button className="rounded-full bg-white text-black w-8 h-8 flex items-center justify-center">
+                  <button className="rounded-full bg-accent text-ink-50 w-8 h-8 flex items-center justify-center">
                     <ArrowUp />
                   </button>
                 </div>
@@ -223,7 +223,7 @@ function Features() {
           <p className="text-xs uppercase tracking-[0.2em] text-fog-400 mb-3">
             Built for serious work
           </p>
-          <h2 className="serif text-4xl sm:text-5xl leading-[1.05] tracking-tighter text-white">
+          <h2 className="serif text-4xl sm:text-5xl leading-[1.05] tracking-tighter text-fog-50">
             Context is the product.
           </h2>
           <p className="mt-4 text-fog-200 text-lg">
@@ -235,10 +235,10 @@ function Features() {
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-px bg-line rounded-2xl overflow-hidden border border-line">
           {features.map((f) => (
             <div key={f.title} className="bg-ink-50 p-7">
-              <div className="w-9 h-9 rounded-lg border border-line bg-white/[0.03] flex items-center justify-center mb-5 text-fog-100">
+              <div className="w-9 h-9 rounded-lg border border-line bg-soft/[0.03] flex items-center justify-center mb-5 text-fog-100">
                 {f.icon}
               </div>
-              <h3 className="text-base font-medium text-white mb-1.5">
+              <h3 className="text-base font-medium text-fog-50 mb-1.5">
                 {f.title}
               </h3>
               <p className="text-sm text-fog-300 leading-relaxed">{f.body}</p>
@@ -293,7 +293,7 @@ function HowItWorks() {
           <p className="text-xs uppercase tracking-[0.2em] text-fog-400 mb-3">
             How it works
           </p>
-          <h2 className="serif text-4xl sm:text-5xl leading-[1.05] tracking-tighter text-white">
+          <h2 className="serif text-4xl sm:text-5xl leading-[1.05] tracking-tighter text-fog-50">
             Four steps to flow.
           </h2>
         </div>
@@ -305,7 +305,7 @@ function HowItWorks() {
                 {String(i + 1).padStart(2, '0')}
               </div>
               <div>
-                <h3 className="text-lg text-white mb-1">{s.title}</h3>
+                <h3 className="text-lg text-fog-50 mb-1">{s.title}</h3>
                 <p className="text-fog-300 leading-relaxed">{s.body}</p>
               </div>
             </div>
@@ -345,7 +345,7 @@ function UseCases() {
           <p className="text-xs uppercase tracking-[0.2em] text-fog-400 mb-3">
             Use cases
           </p>
-          <h2 className="serif text-4xl sm:text-5xl leading-[1.05] tracking-tighter text-white">
+          <h2 className="serif text-4xl sm:text-5xl leading-[1.05] tracking-tighter text-fog-50">
             One agent. Many surfaces.
           </h2>
         </div>
@@ -354,10 +354,10 @@ function UseCases() {
           {useCases.map((u) => (
             <div
               key={u.title}
-              className="surface p-7 hover:bg-white/[0.02] transition-colors"
+              className="surface p-7 hover:bg-soft/[0.02] transition-colors"
             >
               <div className="text-xs text-fog-400 mb-2">{u.tag}</div>
-              <h3 className="serif text-2xl text-white tracking-tight mb-3">
+              <h3 className="serif text-2xl text-fog-50 tracking-tight mb-3">
                 {u.title}
               </h3>
               <p className="text-fog-300 leading-relaxed text-sm">{u.body}</p>
@@ -396,7 +396,7 @@ function FAQ() {
         <p className="text-xs uppercase tracking-[0.2em] text-fog-400 mb-3 text-center">
           FAQ
         </p>
-        <h2 className="serif text-4xl sm:text-5xl leading-[1.05] tracking-tighter text-white text-center mb-12">
+        <h2 className="serif text-4xl sm:text-5xl leading-[1.05] tracking-tighter text-fog-50 text-center mb-12">
           Questions, answered.
         </h2>
 
@@ -404,7 +404,7 @@ function FAQ() {
           {faq.map((q) => (
             <details key={q.q} className="group py-5">
               <summary className="cursor-pointer list-none flex items-center justify-between gap-6">
-                <span className="text-white text-base">{q.q}</span>
+                <span className="text-fog-50 text-base">{q.q}</span>
                 <span className="text-fog-400 text-2xl leading-none transition-transform group-open:rotate-45">
                   +
                 </span>
@@ -449,7 +449,7 @@ function CTA() {
   return (
     <section className="py-28 px-6 border-t border-line">
       <div className="mx-auto max-w-3xl text-center">
-        <h2 className="serif text-5xl sm:text-6xl leading-[1.02] tracking-tighter text-white">
+        <h2 className="serif text-5xl sm:text-6xl leading-[1.02] tracking-tighter text-fog-50">
           Ready when you are.
         </h2>
         <p className="mt-5 text-fog-200 text-lg">
@@ -483,10 +483,10 @@ function Footer() {
           </span>
         </div>
         <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm text-fog-300">
-          <a href="#features" className="hover:text-white">Product</a>
-          <a href="#how" className="hover:text-white">How it works</a>
-          <a href="#faq" className="hover:text-white">FAQ</a>
-          <Link href="/login" className="hover:text-white">Sign in</Link>
+          <a href="#features" className="hover:text-fog-50">Product</a>
+          <a href="#how" className="hover:text-fog-50">How it works</a>
+          <a href="#faq" className="hover:text-fog-50">FAQ</a>
+          <Link href="/login" className="hover:text-fog-50">Sign in</Link>
         </div>
       </div>
     </footer>
@@ -498,8 +498,8 @@ function Footer() {
 function Glyph() {
   return (
     <span className="relative w-6 h-6 inline-flex items-center justify-center">
-      <span className="absolute inset-0 rounded-md bg-white/10 group-hover:bg-white/20 transition" />
-      <span className="relative w-2 h-2 rounded-sm bg-white" />
+      <span className="absolute inset-0 rounded-md bg-soft/10 group-hover:bg-soft/20 transition" />
+      <span className="relative w-2 h-2 rounded-sm bg-accent" />
     </span>
   )
 }

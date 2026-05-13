@@ -2,15 +2,80 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  --bg: #0a0a0a;
-  --bg-elev: #0f0f10;
-  --bg-elev-2: #141416;
-  --line: rgba(255, 255, 255, 0.08);
-  --line-strong: rgba(255, 255, 255, 0.14);
-  --text: #ededed;
-  --text-dim: #a3a3a3;
-  --text-faint: #6b6b6b;
+/* ── Theme tokens ───────────────────────────────────────────────────
+   All `ink-*` / `fog-*` / `line` / `lineStrong` Tailwind classes are
+   backed by CSS variables. Flipping `data-theme` on <html> remaps the
+   entire palette without touching call sites. Values are space-separated
+   RGB triples so Tailwind can append `/ <alpha-value>` for transparency.
+   ───────────────────────────────────────────────────────────────── */
+:root,
+:root[data-theme='dark'] {
+  /* surfaces (darkest → lightest) */
+  --ink-0: 0 0 0;
+  --ink-50: 10 10 10;
+  --ink-100: 15 15 16;
+  --ink-200: 20 20 22;
+  --ink-300: 26 26 29;
+  --ink-400: 31 31 35;
+  --ink-500: 42 42 46;
+  --ink-600: 58 58 62;
+  /* text (lightest → faint) */
+  --fog-50: 245 245 245;
+  --fog-100: 230 230 230;
+  --fog-200: 189 189 189;
+  --fog-300: 138 138 138;
+  --fog-400: 107 107 107;
+  --fog-500: 74 74 74;
+  /* lines / accents — `line-rgb` is the base, alpha set by tailwind config */
+  --line-rgb: 255 255 255;
+  --line-a: 0.08;
+  --line-strong-a: 0.14;
+  --accent: 255 255 255;
+
+  /* legacy aliases still used by hand-written CSS below */
+  --bg: rgb(var(--ink-50));
+  --bg-elev: rgb(var(--ink-100));
+  --bg-elev-2: rgb(var(--ink-200));
+  --line: rgb(var(--line-rgb) / var(--line-a));
+  --line-strong: rgb(var(--line-rgb) / var(--line-strong-a));
+  --text: rgb(var(--fog-100));
+  --text-dim: rgb(var(--fog-200));
+  --text-faint: rgb(var(--fog-400));
+}
+
+:root[data-theme='light'] {
+  /* surfaces — for light mode, "ink-0" is the brightest white and the
+     scale gets slightly darker so existing layering (sidebar = ink-100/60
+     over ink-50) still produces visible separation. */
+  --ink-0: 255 255 255;
+  --ink-50: 252 252 252;
+  --ink-100: 246 246 247;
+  --ink-200: 240 240 242;
+  --ink-300: 232 232 235;
+  --ink-400: 222 222 226;
+  --ink-500: 200 200 205;
+  --ink-600: 170 170 178;
+  /* text — fog-100 is the darkest (primary text), fog-500 is faintest */
+  --fog-50: 28 28 30;
+  --fog-100: 38 38 42;
+  --fog-200: 70 70 78;
+  --fog-300: 110 110 118;
+  --fog-400: 142 142 150;
+  --fog-500: 175 175 184;
+  /* lines are dark on light surface */
+  --line-rgb: 0 0 0;
+  --line-a: 0.08;
+  --line-strong-a: 0.14;
+  --accent: 18 18 20;
+
+  --bg: rgb(var(--ink-50));
+  --bg-elev: rgb(var(--ink-100));
+  --bg-elev-2: rgb(var(--ink-200));
+  --line: rgb(var(--line-rgb) / var(--line-a));
+  --line-strong: rgb(var(--line-rgb) / var(--line-strong-a));
+  --text: rgb(var(--fog-100));
+  --text-dim: rgb(var(--fog-200));
+  --text-faint: rgb(var(--fog-400));
 }
 
 html {
@@ -33,8 +98,8 @@ body {
 }
 
 ::selection {
-  background: rgba(255, 255, 255, 0.18);
-  color: #fff;
+  background: rgb(var(--line-rgb) / 0.18);
+  color: var(--text);
 }
 
 ::-webkit-scrollbar {
@@ -42,13 +107,13 @@ body {
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.08);
+  background: rgb(var(--line-rgb) / 0.16);
   border-radius: 999px;
   border: 2px solid transparent;
   background-clip: padding-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.16);
+  background: rgb(var(--line-rgb) / 0.28);
   background-clip: padding-box;
   border: 2px solid transparent;
 }
@@ -66,8 +131,8 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
-  background: #fff;
-  color: #000;
+  background: rgb(var(--accent));
+  color: rgb(var(--ink-50));
   padding: 0.65rem 1.1rem;
   border-radius: 999px;
   font-weight: 500;
@@ -76,7 +141,7 @@ body {
   transition: background 0.15s ease, transform 0.15s ease;
 }
 .btn-white:hover {
-  background: #e5e5e5;
+  background: rgb(var(--accent) / 0.88);
 }
 .btn-white:active {
   transform: translateY(1px);
@@ -87,17 +152,17 @@ body {
   align-items: center;
   gap: 0.5rem;
   background: transparent;
-  color: #ededed;
+  color: var(--text);
   padding: 0.65rem 1.1rem;
   border-radius: 999px;
   font-weight: 500;
   font-size: 0.92rem;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--line-strong);
   transition: background 0.15s ease, border-color 0.15s ease;
 }
 .btn-ghost:hover {
-  background: rgba(255, 255, 255, 0.04);
-  border-color: rgba(255, 255, 255, 0.22);
+  background: rgb(var(--line-rgb) / 0.04);
+  border-color: rgb(var(--line-rgb) / 0.22);
 }
 
 .chip {
@@ -108,9 +173,9 @@ body {
   border-radius: 999px;
   font-size: 0.75rem;
   letter-spacing: 0.01em;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  color: #d4d4d4;
-  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgb(var(--line-rgb) / 0.1);
+  color: var(--text-dim);
+  background: rgb(var(--line-rgb) / 0.02);
 }
 
 .dot {
@@ -121,16 +186,16 @@ body {
 }
 
 .hairline {
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--line);
 }
 
 .surface {
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.02),
-    rgba(255, 255, 255, 0)
+    rgb(var(--line-rgb) / 0.02),
+    rgb(var(--line-rgb) / 0)
   );
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--line);
   border-radius: 16px;
 }
 
@@ -170,7 +235,7 @@ body {
 }
 .markdown-body strong {
   font-weight: 600;
-  color: #fff;
+  color: var(--text);
 }
 .markdown-body em {
   font-style: italic;
@@ -189,15 +254,15 @@ body {
   margin: 0.2em 0;
 }
 .markdown-body code {
-  background: rgba(255, 255, 255, 0.06);
+  background: rgb(var(--line-rgb) / 0.08);
   padding: 0.12em 0.4em;
   border-radius: 5px;
   font-family: ui-monospace, Menlo, Consolas, monospace;
   font-size: 0.88em;
 }
 .markdown-body pre {
-  background: #111114;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgb(var(--ink-200));
+  border: 1px solid var(--line);
   padding: 0.85em 1em;
   border-radius: 10px;
   overflow-x: auto;
@@ -210,19 +275,19 @@ body {
   padding: 0;
 }
 .markdown-body a {
-  color: #d4d4d4;
+  color: var(--text-dim);
   text-decoration: underline;
   text-underline-offset: 3px;
-  text-decoration-color: rgba(255, 255, 255, 0.25);
+  text-decoration-color: rgb(var(--line-rgb) / 0.3);
 }
 .markdown-body a:hover {
-  color: #fff;
-  text-decoration-color: rgba(255, 255, 255, 0.7);
+  color: var(--text);
+  text-decoration-color: rgb(var(--line-rgb) / 0.7);
 }
 .markdown-body blockquote {
-  border-left: 2px solid rgba(255, 255, 255, 0.18);
+  border-left: 2px solid rgb(var(--line-rgb) / 0.22);
   padding-left: 0.9em;
-  color: #b0b0b0;
+  color: var(--text-dim);
   margin: 0.7em 0;
 }
 .markdown-body table {
@@ -231,12 +296,12 @@ body {
 }
 .markdown-body th,
 .markdown-body td {
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--line);
   padding: 0.4em 0.7em;
 }
 .markdown-body hr {
   border: none;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-top: 1px solid var(--line);
   margin: 1em 0;
 }
 

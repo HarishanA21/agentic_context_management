@@ -60,15 +60,15 @@ export default function LoginPage() {
         className="absolute top-6 left-6 flex items-center gap-2 group"
       >
         <span className="relative w-6 h-6 inline-flex items-center justify-center">
-          <span className="absolute inset-0 rounded-md bg-white/10 group-hover:bg-white/20 transition" />
-          <span className="relative w-2 h-2 rounded-sm bg-white" />
+          <span className="absolute inset-0 rounded-md bg-soft/10 group-hover:bg-soft/20 transition" />
+          <span className="relative w-2 h-2 rounded-sm bg-accent" />
         </span>
         <span className="text-sm tracking-tight">agent</span>
       </Link>
 
       <div className="relative w-full max-w-sm">
         <div className="text-center mb-8">
-          <h1 className="serif text-4xl tracking-tighter text-white mb-2">
+          <h1 className="serif text-4xl tracking-tighter text-fog-50 mb-2">
             {mode === 'signin' ? 'Welcome back.' : 'Create your account.'}
           </h1>
           <p className="text-fog-300 text-sm">
@@ -110,7 +110,7 @@ export default function LoginPage() {
             <button
               type="submit"
               disabled={loading}
-              className="w-full bg-white text-black hover:bg-fog-50 disabled:opacity-50 transition rounded-lg py-2.5 text-sm font-medium"
+              className="w-full bg-accent text-ink-50 hover:bg-accent/90 disabled:opacity-50 transition rounded-lg py-2.5 text-sm font-medium"
             >
               {loading ? '…' : mode === 'signin' ? 'Sign in' : 'Create account'}
             </button>
@@ -123,19 +123,19 @@ export default function LoginPage() {
             setError(null)
             setInfo(null)
           }}
-          className="w-full mt-5 text-sm text-fog-300 hover:text-white transition"
+          className="w-full mt-5 text-sm text-fog-300 hover:text-fog-50 transition"
         >
           {mode === 'signin' ? (
             <>
               Don't have an account?{' '}
-              <span className="text-white underline underline-offset-4">
+              <span className="text-fog-50 underline underline-offset-4">
                 Sign up
               </span>
             </>
           ) : (
             <>
               Already have an account?{' '}
-              <span className="text-white underline underline-offset-4">
+              <span className="text-fog-50 underline underline-offset-4">
                 Sign in
               </span>
             </>
