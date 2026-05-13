@@ -1,8 +1,12 @@
 import json
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List, Optional
+from threading import Lock
+from typing import Any, Dict, List, Optional
+
+import requests
 
 import jwt
 from dotenv import load_dotenv
@@ -10,7 +14,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from jwt import PyJWKClient
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg_pool import ConnectionPool
@@ -47,20 +51,81 @@ def _verify_session(conn, user_id: str, session_id: str):
     ).fetchone():
         raise HTTPException(404, "Session not found")
 
-model = ChatOpenAI(
+DEFAULT_MODEL = os.getenv("CHAT_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+
+
+def _build_model(model_name: str) -> ChatOpenAI:
     # Note: glm-4.5-air:free has a known bug where it wraps multi-arg tool
     # call `args` in a list, breaking AIMessage validation. Llama-3.3 + Qwen-2.5
-    # handle structured tool calls correctly. Override via CHAT_MODEL env var.
-    model=os.getenv("CHAT_MODEL", "meta-llama/llama-3.3-70b-instruct:free"),
-    openai_api_key=os.getenv("OPENROUTER_API_KEY"),
-    openai_api_base="https://openrouter.ai/api/v1",
-    max_tokens=int(os.getenv("CHAT_MAX_TOKENS", "1500")),
-    temperature=float(os.getenv("CHAT_TEMPERATURE", "0.3")),
-    default_headers={
-        "HTTP-Referer": "http://localhost",
-        "X-Title": "FYP Agent Project",
-    },
-)
+    # handle structured tool calls correctly.
+    return ChatOpenAI(
+        model=model_name,
+        openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+        openai_api_base="https://openrouter.ai/api/v1",
+        max_tokens=int(os.getenv("CHAT_MAX_TOKENS", "1500")),
+        temperature=float(os.getenv("CHAT_TEMPERATURE", "0.3")),
+        default_headers={
+            "HTTP-Referer": "http://localhost",
+            "X-Title": "FYP Agent Project",
+        },
+    )
+
+
+_agent_cache: Dict[str, Any] = {}
+_agent_cache_lock = Lock()
+
+
+def _get_agent(model_name: Optional[str]):
+    name = (model_name or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    with _agent_cache_lock:
+        if name in _agent_cache:
+            return _agent_cache[name]
+        agent = create_agent(
+            model=_build_model(name),
+            tools=all_tools,
+            system_prompt=SYSTEM_PROMPT,
+            checkpointer=app.state.saver,
+        )
+        _agent_cache[name] = agent
+        return agent
+
+
+# ── OpenRouter model catalog (cached) ───────────────────────────────────────
+_models_cache: Dict[str, Any] = {"at": 0.0, "items": []}
+_models_lock = Lock()
+_MODELS_TTL_SECONDS = 600  # 10 minutes
+
+
+def _fetch_free_models() -> List[Dict[str, Any]]:
+    """Pull the OpenRouter catalog and keep only `:free` models. Cached."""
+    now = time.time()
+    with _models_lock:
+        if _models_cache["items"] and (now - _models_cache["at"]) < _MODELS_TTL_SECONDS:
+            return _models_cache["items"]
+    try:
+        r = requests.get("https://openrouter.ai/api/v1/models", timeout=10)
+        r.raise_for_status()
+        data = r.json().get("data", [])
+    except Exception as e:
+        print(f"[/models] OpenRouter fetch failed: {e!r}", flush=True)
+        # Fall back to whatever we cached previously (possibly stale, possibly empty).
+        return _models_cache["items"]
+    items = []
+    for m in data:
+        mid = m.get("id") or ""
+        if not mid.endswith(":free"):
+            continue
+        items.append({
+            "id": mid,
+            "name": m.get("name") or mid,
+            "context_length": m.get("context_length") or 0,
+            "description": (m.get("description") or "")[:200],
+        })
+    items.sort(key=lambda m: m["name"].lower())
+    with _models_lock:
+        _models_cache["items"] = items
+        _models_cache["at"] = now
+    return items
 
 
 class CreateSessionRequest(BaseModel):
@@ -77,6 +142,7 @@ class ChatRequest(BaseModel):
     thread_id: str
     message: str
     attached_files: List[str] = []
+    model: Optional[str] = None
 
 
 class TitleRequest(BaseModel):
@@ -136,19 +202,28 @@ async def lifespan(app: FastAPI):
     saver = _saver_cm.__enter__()
     saver.setup()
 
-    agent = create_agent(
-        model=model,
-        tools=all_tools,
-        system_prompt=SYSTEM_PROMPT,
-        checkpointer=saver,
-    )
+    # Idempotent migrations for fields added after db/init.sql first shipped.
+    with pool.connection() as conn:
+        conn.execute(
+            "ALTER TABLE messages "
+            "ADD COLUMN IF NOT EXISTS input_tokens    integer NOT NULL DEFAULT 0, "
+            "ADD COLUMN IF NOT EXISTS output_tokens   integer NOT NULL DEFAULT 0, "
+            "ADD COLUMN IF NOT EXISTS thinking_tokens integer NOT NULL DEFAULT 0, "
+            "ADD COLUMN IF NOT EXISTS langgraph_id    text"
+        )
 
-    app.state.agent = agent
+    app.state.saver = saver
     app.state.pool = pool
+
+    # Pre-build the agent for the default model so the first /chat request
+    # doesn't pay the create_agent cost. Other models are built lazily by
+    # _get_agent on first use.
+    _get_agent(DEFAULT_MODEL)
 
     try:
         yield
     finally:
+        _agent_cache.clear()
         _saver_cm.__exit__(None, None, None)
         pool.close()
 
@@ -203,12 +278,19 @@ def _record_message(
     tool_name: Optional[str] = None,
     tool_calls: Optional[list] = None,
     tokens: int = 0,
-):
-    conn.execute(
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    thinking_tokens: int = 0,
+    langgraph_id: Optional[str] = None,
+) -> int:
+    row = conn.execute(
         """
         INSERT INTO messages
-            (session_id, thread_id, user_id, role, content, tool_name, tool_calls_json, tokens)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            (session_id, thread_id, user_id, role, content, tool_name,
+             tool_calls_json, tokens, input_tokens, output_tokens,
+             thinking_tokens, langgraph_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
         """,
         (
             session_id,
@@ -219,26 +301,70 @@ def _record_message(
             tool_name,
             json.dumps(tool_calls) if tool_calls else None,
             int(tokens or 0),
+            int(input_tokens or 0),
+            int(output_tokens or 0),
+            int(thinking_tokens or 0),
+            langgraph_id,
         ),
-    )
+    ).fetchone()
+    return int(row[0]) if row else 0
 
 
-def _ai_tokens(msg) -> int:
-    """Best-effort token total for an AIMessage."""
+def _ai_token_breakdown(msg) -> Dict[str, int]:
+    """Best-effort token breakdown for an AIMessage. Returns:
+      total    — input + output for this turn
+      input    — prompt tokens sent to the model
+      output   — total completion tokens (visible answer + reasoning)
+      thinking — reasoning portion of output (subset of `output`)
+
+    Invariants the UI relies on: input + output = total, and thinking <= output.
+    Most non-reasoning models report thinking = 0."""
+    total = 0
+    input_ = 0
+    output = 0
+    thinking = 0
+
     um = getattr(msg, "usage_metadata", None)
     if um:
+        def _g(obj, key: str) -> int:
+            try:
+                if hasattr(obj, "__getitem__"):
+                    return int(obj.get(key, 0) or 0)
+                return int(getattr(obj, key, 0) or 0)
+            except Exception:
+                return 0
+        total = _g(um, "total_tokens")
+        input_ = _g(um, "input_tokens")
+        output = _g(um, "output_tokens")
+        details = None
         try:
-            total = um["total_tokens"] if hasattr(um, "__getitem__") else getattr(um, "total_tokens", 0)
-            if total:
-                return int(total)
+            details = um["output_token_details"] if hasattr(um, "__getitem__") else getattr(um, "output_token_details", None)
+        except Exception:
+            details = None
+        if details:
+            thinking = _g(details, "reasoning")
+
+    if not total:
+        rm = getattr(msg, "response_metadata", None) or {}
+        tu = rm.get("token_usage") or rm.get("usage") or {}
+        try:
+            total = int(tu.get("total_tokens", 0) or 0)
+            input_ = input_ or int(tu.get("prompt_tokens", 0) or 0)
+            output = output or int(tu.get("completion_tokens", 0) or 0)
+            details = tu.get("completion_tokens_details") or {}
+            thinking = thinking or int(details.get("reasoning_tokens", 0) or 0)
         except Exception:
             pass
-    rm = getattr(msg, "response_metadata", None) or {}
-    tu = rm.get("token_usage") or rm.get("usage") or {}
-    try:
-        return int(tu.get("total_tokens", 0) or 0)
-    except Exception:
-        return 0
+
+    # Self-heal in case the provider only sent two of the three.
+    if total and not input_ and output:
+        input_ = max(0, total - output)
+    if total and not output and input_:
+        output = max(0, total - input_)
+    if not total and (input_ or output):
+        total = input_ + output
+
+    return {"total": total, "input": input_, "output": output, "thinking": thinking}
 
 
 def _record_error_reply(
@@ -593,7 +719,7 @@ def make_title(req: TitleRequest, _user_id: str = Depends(get_current_user)):
         f"Message:\n{text[:1500]}"
     )
     try:
-        result = model.invoke([HumanMessage(content=prompt)])
+        result = _build_model(DEFAULT_MODEL).invoke([HumanMessage(content=prompt)])
         raw = (getattr(result, "content", "") or "").strip()
         # Take first non-empty line, strip wrapping quotes/punct.
         line = next((l.strip() for l in raw.splitlines() if l.strip()), "")
@@ -695,10 +821,19 @@ _MODEL_CONTEXT_LIMITS = {
 }
 
 
+@app.get("/models")
+def list_models(user_id: str = Depends(get_current_user)):
+    """Return the list of OpenRouter `:free` models the UI can pick from.
+    Cached server-side for 10 minutes."""
+    items = _fetch_free_models()
+    return {"default": DEFAULT_MODEL, "models": items}
+
+
 @app.get("/sessions/{session_id}/threads/{thread_id}/context")
 def get_context(
     session_id: str,
     thread_id: str,
+    model: Optional[str] = None,
     user_id: str = Depends(get_current_user),
 ):
     """Return what the LLM sees on the next turn: system prompt, message
@@ -707,7 +842,9 @@ def get_context(
         _verify_thread(conn, user_id, session_id, thread_id)
         rows = conn.execute(
             """
-            SELECT role, content, tool_name, tool_calls_json, tokens
+            SELECT id, role, content, tool_name, tool_calls_json,
+                   tokens, input_tokens, output_tokens, thinking_tokens,
+                   langgraph_id
             FROM messages
             WHERE session_id = %s AND thread_id = %s AND user_id = %s
             ORDER BY id ASC
@@ -717,18 +854,33 @@ def get_context(
 
     messages = []
     total_tokens = 0
-    for role, content, tool_name, tool_calls_json, recorded_tokens in rows:
-        # Prefer the recorded token count for assistant messages (real usage
-        # from the API). Fall back to a rough char-based estimate otherwise.
+    for row in rows:
+        (
+            row_id,
+            role,
+            content,
+            tool_name,
+            tool_calls_json,
+            recorded_tokens,
+            input_tok,
+            output_tok,
+            thinking_tok,
+            langgraph_id,
+        ) = row
         if recorded_tokens and recorded_tokens > 0:
             tokens = int(recorded_tokens)
         else:
             tokens = _estimate_tokens(content or "")
         total_tokens += tokens
         m = {
+            "id": int(row_id),
             "role": role,
             "content": content,
             "tokens": tokens,
+            "input_tokens": int(input_tok or 0),
+            "output_tokens": int(output_tok or 0),
+            "thinking_tokens": int(thinking_tok or 0),
+            "has_langgraph_id": bool(langgraph_id),
         }
         if tool_name:
             m["tool_name"] = tool_name
@@ -755,8 +907,13 @@ def get_context(
     except Exception as e:
         print(f"[/context] could not list files: {e!r}", flush=True)
 
-    model_name = os.getenv("CHAT_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
-    context_limit = _MODEL_CONTEXT_LIMITS.get(model_name, 128000)
+    model_name = (model or "").strip() or DEFAULT_MODEL
+    if model_name in _MODEL_CONTEXT_LIMITS:
+        context_limit = _MODEL_CONTEXT_LIMITS[model_name]
+    else:
+        # Fall back to the OpenRouter catalog if we haven't hard-coded this one.
+        catalog = {m["id"]: m.get("context_length") or 0 for m in _fetch_free_models()}
+        context_limit = catalog.get(model_name) or 128000
 
     return {
         "model": model_name,
@@ -772,12 +929,71 @@ def get_context(
     }
 
 
+@app.delete("/sessions/{session_id}/threads/{thread_id}/messages/{message_id}")
+def delete_message(
+    session_id: str,
+    thread_id: str,
+    message_id: int,
+    model: Optional[str] = None,
+    user_id: str = Depends(get_current_user),
+):
+    """Remove one message from the chat history.
+
+    Deletes the row from `messages` AND, when the message has a known
+    LangGraph id, surgically removes it from the agent's checkpoint state
+    via RemoveMessage so the LLM won't see it on the next turn.
+
+    Old messages saved before the langgraph_id column existed only get
+    deleted from the display table — the agent's state will still include
+    them. Callers can detect this from the returned `removed_from_state`
+    field.
+    """
+    with app.state.pool.connection() as conn:
+        _verify_thread(conn, user_id, session_id, thread_id)
+        row = conn.execute(
+            "SELECT langgraph_id FROM messages "
+            "WHERE id = %s AND session_id = %s AND thread_id = %s AND user_id = %s",
+            (message_id, session_id, thread_id, user_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Message not found")
+        langgraph_id = row[0]
+        conn.execute("DELETE FROM messages WHERE id = %s", (message_id,))
+
+    removed_from_state = False
+    if langgraph_id:
+        try:
+            agent = _get_agent(model)
+            agent.update_state(
+                {
+                    "configurable": {
+                        "thread_id": f"{user_id}:{session_id}",
+                        "user_id": user_id,
+                        "session_id": session_id,
+                    }
+                },
+                {"messages": [RemoveMessage(id=langgraph_id)]},
+            )
+            removed_from_state = True
+        except Exception as e:
+            # DB row is already gone; log and continue so the UI still sees
+            # the message disappear. The agent's view will catch up if the
+            # state ever gets fully rebuilt.
+            print(
+                f"[delete_message] LangGraph update_state failed for "
+                f"id={langgraph_id}: {e!r}",
+                flush=True,
+            )
+
+    return {"ok": True, "removed_from_state": removed_from_state}
+
+
 @app.post("/chat")
 def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
     import traceback
 
     try:
-        agent = app.state.agent
+        agent = _get_agent(req.model)
         # Scope LangGraph thread by user+session to prevent cross-user collisions.
         # Inject user_id + session_id so file tools (list/read/write) can
         # resolve the current project's uploads dir without the model having
@@ -794,9 +1010,12 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
 
         # Record the user's message in DB *before* invoking the agent. That
         # way it survives in chat history even if the model crashes mid-turn.
+        # We back-fill its langgraph_id after invoke so deletes can target the
+        # message in LangGraph's checkpoint state too.
+        user_row_id = 0
         with app.state.pool.connection() as conn:
             _verify_thread(conn, user_id, req.session_id, req.thread_id)
-            _record_message(
+            user_row_id = _record_message(
                 conn, req.session_id, req.thread_id, user_id, "user", req.message
             )
 
@@ -864,9 +1083,16 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
         try:
             with app.state.pool.connection() as conn:
                 for msg in new_messages:
+                    msg_id = getattr(msg, "id", None)
                     if isinstance(msg, HumanMessage):
-                        # Already recorded before agent.invoke — skip to avoid
-                        # duplicating the user's message in the chat history.
+                        # The user message was recorded pre-invoke. Back-fill
+                        # its langgraph_id now so deletes can also remove it
+                        # from LangGraph's checkpoint state.
+                        if msg_id and user_row_id:
+                            conn.execute(
+                                "UPDATE messages SET langgraph_id = %s WHERE id = %s",
+                                (msg_id, user_row_id),
+                            )
                         continue
                     elif isinstance(msg, AIMessage):
                         tool_calls = []
@@ -875,6 +1101,7 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
                                 tool_calls.append({"name": tc["name"], "args": tc["args"]})
                         content = msg.content or ""
                         if content or tool_calls:
+                            breakdown = _ai_token_breakdown(msg)
                             _record_message(
                                 conn,
                                 req.session_id,
@@ -883,7 +1110,11 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
                                 "assistant",
                                 content,
                                 tool_calls=tool_calls or None,
-                                tokens=_ai_tokens(msg),
+                                tokens=breakdown["total"],
+                                input_tokens=breakdown["input"],
+                                output_tokens=breakdown["output"],
+                                thinking_tokens=breakdown["thinking"],
+                                langgraph_id=msg_id,
                             )
                         if content:
                             reply = content
@@ -896,6 +1127,7 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
                             "tool",
                             str(msg.content),
                             tool_name=getattr(msg, "name", ""),
+                            langgraph_id=msg_id,
                         )
         except Exception as e:
             print(f"[/chat] DB write failed: {e!r}", flush=True)
