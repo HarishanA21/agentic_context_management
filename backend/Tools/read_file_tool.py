@@ -6,7 +6,12 @@ from pathlib import Path
 from langchain.tools import tool
 from langchain_core.runnables import RunnableConfig
 
-from Tools._paths import get_session_ids, safe_name
+from Tools._paths import get_session_ids, get_workspace_ref, safe_name
+from sandbox_client import (
+    SandboxError,
+    SandboxNotFoundError,
+    get_backend,
+)
 from storage import file_key, get_bucket, is_not_found
 
 MAX_READ_BYTES = 200_000  # 200 KB cap to keep tool responses small
@@ -135,12 +140,26 @@ def read_project_file(filename: str, config: RunnableConfig) -> str:
     except ValueError as e:
         return f"Error: {e}"
 
-    try:
-        data: bytes = get_bucket().download(file_key(user_id, session_id, name))
-    except Exception as e:
-        if is_not_found(e):
-            return f"Error: '{name}' not found in project files."
-        return f"Error: failed to download file: {e}"
+    # Workspace first (the agent's live working copy), S3 second
+    # (user-uploaded attachments). Same parsing logic applies either way.
+    data: bytes | None = None
+    workspace_ref = get_workspace_ref(config)
+    if workspace_ref:
+        try:
+            data = get_backend().read_file(workspace_ref, f"/workspace/{name}")
+        except SandboxNotFoundError:
+            data = None  # fall through to S3
+        except SandboxError as e:
+            return f"Error: workspace read failed: {e}"
+
+    if data is None:
+        try:
+            data = get_bucket().download(file_key(user_id, session_id, name))
+        except Exception as e:
+            if is_not_found(e):
+                where = "workspace or attachments" if workspace_ref else "project files"
+                return f"Error: '{name}' not found in {where}."
+            return f"Error: failed to download file: {e}"
 
     ext = Path(name).suffix.lower()
     try:

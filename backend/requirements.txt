@@ -21,6 +21,10 @@ openpyxl
 # Storage (S3-compatible: MinIO locally, AWS S3 / R2 in prod)
 boto3
 
+# Sandboxed workspaces — one backend used at a time via SANDBOX_BACKEND env var
+docker          # backend=docker: talks to local Docker socket
+e2b             # backend=e2b: managed Firecracker microVMs
+
 # GitHub integration
 PyGithub
 
