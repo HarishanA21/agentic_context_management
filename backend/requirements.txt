@@ -11,3 +11,16 @@ psycopg-pool
 pyjwt[crypto]
 fastapi
 uvicorn[standard]
+python-multipart
+
+# File parsing
+pypdf
+python-docx
+openpyxl
+
+# Storage (S3-compatible: MinIO locally, AWS S3 / R2 in prod)
+boto3
+
+# GitHub integration
+PyGithub
+
