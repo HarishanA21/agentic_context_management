@@ -70,6 +70,22 @@ A self-hosted, Codex-like coding platform delivered as a **web application** (Ne
 - [x] **`/chat` workspace wiring** — project sessions lazy-create a workspace and inject `workspace_ref` into the agent's runnable config
 - [x] **Workspace bootstrap** — fresh workspaces auto-clone the linked GitHub repo (PAT embedded then stripped from remote) or `git init` an empty repo + initial commit so HEAD exists for rollback; shell-injection defenses
 
+### MCP inventory
+- [x] **Curated catalog** ([backend/mcp_catalog.json](backend/mcp_catalog.json)) — 23 official, publicly available servers (filesystem, fetch, github, postgres, sqlite, git, memory, sequential-thinking, time, everything, playwright, outline, notion, linear, cloudflare-docs, sentry, stripe, atlassian, huggingface, brave-search, puppeteer, slack, redis). Each entry declares supported transports and per-transport auth.
+- [x] **All four transports supported** — `streamable_http` (preferred for hosted MCPs), `sse`, `http`, `stdio`. Multi-transport entries let the user pick at enable time. Tools bind to a connection spec (no long-lived session) so each invocation opens its own short-lived MCP session — no pool to drain, no leaks across requests.
+- [x] **Per-user enable/disable + custom MCPs** — `mcp_servers` table (`db/init.sql`) keyed on `(user_id, catalog_slug)` for catalog entries plus a custom-MCP path with arbitrary command/URL. Hard cap: `MAX_MCPS_PER_USER=20`.
+- [x] **Endpoints** ([backend/routes_mcp.py](backend/routes_mcp.py)) — `GET /mcp/catalog` (mtime-cached so JSON edits hot-reload), `GET/POST/PATCH/DELETE /mcp/servers`, `POST /mcp/servers/{id}/test` (15s timeout, persists discovered tools + `last_error`).
+- [x] **Secret encryption** — Fernet-encrypted `secret_blob`, key from `MCP_SECRET_KEY` env (stable across restarts; ephemeral fallback warned). API responses redact to `has_secret: bool`.
+- [x] **Security hardening** ([backend/mcp_security.py](backend/mcp_security.py)) — https-only URLs, private-IP / link-local / loopback blocked, DNS-rebind defence (re-resolves hostname right before connect), stdio command allowlist (`npx, uvx, python, python3, node`), shell-metacharacter rejection. Catalog domains get a narrower allowlist.
+- [x] **Agent integration** — `_get_agent_for_request(model, user_id)` discovers the user's enabled MCP tools via `langchain-mcp-adapters` and rebuilds the agent with built-ins + MCP tools. LRU cache keyed on `(model, user, tool-name fingerprint)` so toggling rebuilds without churning unrelated users.
+- [x] **Async invocation path** — `/chat` and `/chat/resume` now run `asyncio.run(agent.ainvoke(...))` because MCP tools are async-only (`StructuredTool` with `coroutine` only). `HybridPostgresSaver` extends `PostgresSaver` with `aget_tuple`/`aput`/`aput_writes`/`alist` delegating to the sync methods via `asyncio.to_thread` so a single saver backs both `invoke` and `ainvoke`. ExceptionGroup unwrapping surfaces the real underlying error from anyio TaskGroups in chat replies + logs.
+- [x] **UI** ([ui/app/app/mcps/page.tsx](ui/app/app/mcps/page.tsx)) — Catalog tab (with a collapsible Power-tools section) and Yours tab. `EnableModal` collects transport choice + secrets; `CustomMCPModal` for hand-rolled servers. Window-focus refresh, toast notifications, SSE `mcp_updated` listener hook.
+- [x] **Official brand icons** — `simple-icons` (CC0) path data baked into [ui/components/mcp-brand-icons.ts](ui/components/mcp-brand-icons.ts) via `scripts/gen-mcp-icons.py`; hand-rolled Lucide-style outlines for generics (filesystem, fetch, memory, sequential, time) and brands not in simple-icons (Playwright, Outline, Slack).
+
+### UI polish
+- [x] **Light / dark theme toggle** — CSS-variable-backed Tailwind palette ([ui/tailwind.config.ts](ui/tailwind.config.ts)), `:root[data-theme=…]` blocks in `globals.css`, inline boot script in `layout.tsx` to avoid flash, `useTheme()` hook in `ui/lib/theme.ts` persists choice in localStorage.
+- [x] **Context window ring button** — header button shows percent-used of the model's context length as a colored arc (`stroke-dasharray`/`stroke-dashoffset`), turning amber → red as it fills.
+
 ### Docs + skills
 - [x] `architecture.md` with Mermaid diagram of the current system
 - [x] `.claude/skills/update-readme/` — keeps README in sync with code
@@ -78,9 +94,8 @@ A self-hosted, Codex-like coding platform delivered as a **web application** (Ne
 ## 🔄 In progress
 
 - **Phase 2A — git workflow** — Steps 2.1–2.3 + 2.5 done. **Step 2.4** (git tools — `git_status`/`git_diff`/`git_branch`/`git_log`) is the remaining 2A item; lower priority now that auto-commit is in.
-- **Phase 2B — rollback + history** — Steps 2.6, 2.7, 2.8, 2.10 all done. Rollback is fully usable end-to-end: edit → auto-commit → see in history → undo → file reverts. **Step 2.9** (push flow) is the only 2B item remaining, deferred per user direction (MCPs will cover it).
+- **Phase 2B — rollback + history** — Steps 2.6, 2.7, 2.8, 2.10 all done. Rollback is fully usable end-to-end: edit → auto-commit → see in history → undo → file reverts. **Step 2.9** (push flow) is the only 2B item remaining; the GitHub MCP now covers push/PR creation for users who enable it, so the bespoke push endpoint is parked unless we need the explicit approval gate.
 - **Phase 1 — Step 1.8** — E2B-side smoke test pending until a real `E2B_API_KEY` is plugged in. Docker side fully validated. E2BBackend code updated to use `Sandbox.create()` classmethod (2026 SDK shape) — untested but should now match the installed signature.
-- **Push to GitHub (Step 2.9)** — deferred (user choice — will add via MCP later).
 - Auto-maintain `architecture.md` + `report.md` on project file changes (system prompt is live; behavior still needs reinforcement on small models).
 
 ---
@@ -380,9 +395,9 @@ A running task shows live output. A `git push` triggers an approval modal. The d
 
 - [ ] **`AGENTS.md` parsing** — on workspace init, read repo-root `AGENTS.md` / `CLAUDE.md` and inject into the system prompt. Per-directory `AGENTS.md` supported via nearest-ancestor lookup.
 - [ ] **Model role split** — `PLANNER_MODEL`, `EXECUTOR_MODEL`, `REVIEWER_MODEL` env vars (with sensible defaults). Planner = smart+slow, executor = fast, reviewer = smart. Each used in the right place.
-- [ ] **Generic MCP loader** — list MCP servers in env (`MCP_SERVERS=shell,github,filesystem,notion,…`), spawn each at backend startup, auto-discover their tools, adapt MCP tool schemas → LangChain tools, register dynamically. Per-user enable/disable in settings.
+- [x] **Generic MCP loader** — delivered as the [MCP inventory](#mcp-inventory) above. Richer than originally scoped: per-user toggleable, catalog of 23 servers, custom MCP support, all four transports (stdio + streamable_http + sse + http), Fernet-encrypted secrets, DNS-rebind defence, command allowlist.
 - [ ] **Token-reduction via summarization** — LangGraph `SummarizationNode` for long conversations; show active summary in the context viewer.
-- [ ] **Context window viewer** — floating button in the web UI → side panel showing system prompt, full message history, files in scope, per-message tokens, % of model limit used.
+- [x] **Context window indicator** — header button shows percent-used as a colored arc. Full side-panel viewer (system prompt, message history, files in scope, per-message tokens) still pending.
 - [ ] **In-browser logs viewer** — searchable per-task log of every shell command, tool call, and LLM exchange. Replaces "open a terminal to see what happened" since we're web-only.
 
 ### Deferred (web-compatible but lower priority)

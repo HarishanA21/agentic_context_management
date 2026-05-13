@@ -20,6 +20,48 @@ from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.postgres import PostgresSaver
+
+
+class HybridPostgresSaver(PostgresSaver):
+    """PostgresSaver + the async surface that ainvoke needs.
+
+    The stock sync saver inherits the BaseCheckpointSaver async methods,
+    which raise NotImplementedError. As soon as we call `agent.ainvoke()`
+    (required for async-only MCP tools), LangGraph hits `aget_tuple` /
+    `aput` / `aput_writes` and blows up.
+
+    The psycopg ConnectionPool we hand it is thread-safe, so the simplest
+    fix is to delegate the async methods to the existing sync ones via
+    `asyncio.to_thread`. This lets a single saver back both `invoke` and
+    `ainvoke` without standing up a parallel AsyncConnectionPool +
+    AsyncPostgresSaver.
+    """
+
+    async def aget_tuple(self, config):  # type: ignore[override]
+        return await asyncio.to_thread(self.get_tuple, config)
+
+    async def aput(self, config, checkpoint, metadata, new_versions):  # type: ignore[override]
+        return await asyncio.to_thread(
+            self.put, config, checkpoint, metadata, new_versions
+        )
+
+    async def aput_writes(self, config, writes, task_id, task_path=""):  # type: ignore[override]
+        return await asyncio.to_thread(
+            self.put_writes, config, writes, task_id, task_path
+        )
+
+    async def alist(self, config, *, filter=None, before=None, limit=None):  # type: ignore[override]
+        # alist is an async generator on the base class. Drain the sync
+        # iterator in a worker thread, then yield from the materialized
+        # list so we don't hold the worker for the duration of consumption.
+        def _drain():
+            return list(
+                self.list(config, filter=filter, before=before, limit=limit)
+            )
+
+        items = await asyncio.to_thread(_drain)
+        for item in items:
+            yield item
 from langgraph.types import Command
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel
@@ -100,20 +142,127 @@ def _build_model(model_name: str) -> ChatOpenAI:
 
 _agent_cache: Dict[str, Any] = {}
 _agent_cache_lock = Lock()
+# Cap so the cache can't grow unbounded as users × MCP fingerprints multiply.
+_AGENT_CACHE_MAX = 64
+
+
+def _unwrap_exc(e: BaseException) -> BaseException:
+    """anyio TaskGroups (used by the MCP transports) wrap real errors in
+    ExceptionGroup. The outer message is generic; the inner one tells you
+    what actually happened. Walk down to the first non-group leaf so the
+    chat reply / error log shows the useful cause.
+    """
+    # ExceptionGroup is stdlib in 3.11+; on older runtimes we just return
+    # the original exception unchanged.
+    EG = getattr(__builtins__, "ExceptionGroup", None) or globals().get(
+        "ExceptionGroup", type(None)
+    )
+    seen = set()
+    current: BaseException = e
+    while isinstance(current, EG) and id(current) not in seen:
+        seen.add(id(current))
+        children = getattr(current, "exceptions", None) or ()
+        if not children:
+            break
+        current = children[0]
+    return current
 
 
 def _get_agent(model_name: Optional[str]):
+    """Backwards-compatible helper that builds an agent with only the
+    built-in tools. Used at startup (warmup) and any path that hasn't yet
+    been threaded through to the MCP-aware variant.
+    """
     name = (model_name or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    key = f"{name}::base"
     with _agent_cache_lock:
-        if name in _agent_cache:
-            return _agent_cache[name]
+        if key in _agent_cache:
+            return _agent_cache[key]
         agent = create_agent(
             model=_build_model(name),
             tools=all_tools,
             system_prompt=SYSTEM_PROMPT,
             checkpointer=app.state.saver,
         )
-        _agent_cache[name] = agent
+        _agent_cache[key] = agent
+        return agent
+
+
+def _fetch_enabled_mcp_rows(user_id: str) -> List[Dict[str, Any]]:
+    """Pull the user's enabled MCP servers as plain dicts the adapter can
+    consume. Returns [] on DB hiccups — agent still runs with built-ins.
+    """
+    try:
+        with app.state.pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id::text, user_id::text, catalog_slug, is_custom, name,
+                       enabled, transport, command, args_json, endpoint_url,
+                       auth_kind, auth_header, secret_blob
+                  FROM mcp_servers
+                 WHERE user_id = %s AND enabled = TRUE
+                """,
+                (user_id,),
+            ).fetchall()
+        cols = [
+            "id", "user_id", "catalog_slug", "is_custom", "name",
+            "enabled", "transport", "command", "args_json", "endpoint_url",
+            "auth_kind", "auth_header", "secret_blob",
+        ]
+        return [dict(zip(cols, r)) for r in rows]
+    except Exception as e:
+        print(f"[mcp] _fetch_enabled_mcp_rows failed: {e!r}", flush=True)
+        return []
+
+
+async def _collect_mcp_tools_async(user_id: str):
+    """Async half of the agent builder — opens MCP sessions briefly to
+    discover tools. Tools are bound to connection specs and re-open
+    sessions on each invocation, so the discovery session can close
+    safely before we return.
+    """
+    from mcp_client import collect_tools_for_user
+
+    enabled = _fetch_enabled_mcp_rows(user_id)
+    if not enabled:
+        return []
+    try:
+        return await collect_tools_for_user(enabled)
+    except Exception as e:
+        print(f"[mcp] collect_tools failed for {user_id}: {e!r}", flush=True)
+        return []
+
+
+def _get_agent_for_request(model_name: Optional[str], user_id: str):
+    """Sync wrapper around the async tool discovery, so /chat (which is
+    a sync FastAPI handler) can call us without flipping to async.
+
+    Returns an agent whose tool list = built-ins + the user's enabled MCP
+    tools. Cache key is `(model, user, tool-name fingerprint)` so
+    toggling an MCP rebuilds on the next request without churning the
+    cache for unrelated users.
+    """
+    name = (model_name or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+
+    mcp_tools = asyncio.run(_collect_mcp_tools_async(user_id))
+
+    if not mcp_tools:
+        return _get_agent(name)
+
+    fingerprint = ",".join(sorted(t.name for t in mcp_tools))
+    key = f"{name}::{user_id}::{fingerprint}"
+    with _agent_cache_lock:
+        if key in _agent_cache:
+            return _agent_cache[key]
+        if len(_agent_cache) >= _AGENT_CACHE_MAX:
+            _agent_cache.pop(next(iter(_agent_cache)), None)
+        agent = create_agent(
+            model=_build_model(name),
+            tools=list(all_tools) + list(mcp_tools),
+            system_prompt=SYSTEM_PROMPT,
+            checkpointer=app.state.saver,
+        )
+        _agent_cache[key] = agent
         return agent
 
 
@@ -252,7 +401,7 @@ async def lifespan(app: FastAPI):
     )
     pool.wait()
 
-    saver = PostgresSaver(pool)
+    saver = HybridPostgresSaver(pool)
     saver.setup()
 
     # Idempotent migrations for fields added after db/init.sql first shipped.
@@ -306,6 +455,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# MCP inventory routes (Slice A — catalog + read-only servers listing).
+# Import here, after `app` is defined and after `get_current_user` exists,
+# to avoid circular imports inside the router.
+from routes_mcp import router as mcp_router  # noqa: E402
+app.include_router(mcp_router)
 
 
 def get_current_user(authorization: Optional[str] = Header(None)) -> str:
@@ -2112,7 +2267,7 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
     clear_cancel(req.thread_id)
 
     try:
-        agent = _get_agent(req.model)
+        agent = _get_agent_for_request(req.model, user_id)
 
         # Project sessions get a sandboxed workspace; chat-only sessions don't.
         # The lazy-create returns an existing workspace if there is one (auto-
@@ -2210,14 +2365,26 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
         )
 
         try:
-            result = agent.invoke(
-                {"messages": [HumanMessage(content=llm_input)]},
-                config=config,
+            # ainvoke + asyncio.run: MCP tools from langchain-mcp-adapters
+            # are async-only (coroutine-backed StructuredTool), so the
+            # sync invoke path raises "StructuredTool does not support
+            # sync invocation" the moment the agent tries to call one.
+            # FastAPI runs this sync handler in a threadpool worker with
+            # no loop attached, so asyncio.run is safe.
+            result = asyncio.run(
+                agent.ainvoke(
+                    {"messages": [HumanMessage(content=llm_input)]},
+                    config=config,
+                )
             )
         except Exception as e:
-            msg = str(e) or e.__class__.__name__
-            cls = e.__class__.__name__
-            print(f"[/chat] model invoke failed ({cls}): {msg}", flush=True)
+            inner = _unwrap_exc(e)
+            msg = str(inner) or inner.__class__.__name__
+            cls = inner.__class__.__name__
+            print(
+                f"[/chat] model invoke failed ({cls} via {e.__class__.__name__}): {msg}",
+                flush=True,
+            )
             traceback.print_exc()
             low = msg.lower()
             low_cls = cls.lower()
@@ -2483,7 +2650,7 @@ def chat_resume(req: ResumeChatRequest, user_id: str = Depends(get_current_user)
     clear_cancel(req.thread_id)
 
     try:
-        agent = _get_agent(req.model)
+        agent = _get_agent_for_request(req.model, user_id)
 
         # Recover session mode + workspace state to rebuild the same config.
         workspace_ref: Optional[str] = None
@@ -2533,13 +2700,21 @@ def chat_resume(req: ResumeChatRequest, user_id: str = Depends(get_current_user)
         )
 
         try:
-            result = agent.invoke(
-                Command(resume={"approved": req.approved, "reason": req.reason}),
-                config=config,
+            # See /chat for why we go through ainvoke + asyncio.run when
+            # async-only MCP tools are in the toolbox.
+            result = asyncio.run(
+                agent.ainvoke(
+                    Command(resume={"approved": req.approved, "reason": req.reason}),
+                    config=config,
+                )
             )
         except Exception as e:
-            msg = str(e) or e.__class__.__name__
-            print(f"[/chat/resume] model invoke failed: {msg}", flush=True)
+            inner = _unwrap_exc(e)
+            msg = str(inner) or inner.__class__.__name__
+            print(
+                f"[/chat/resume] model invoke failed ({inner.__class__.__name__} via {e.__class__.__name__}): {msg}",
+                flush=True,
+            )
             traceback.print_exc()
             raise HTTPException(500, f"Resume failed: {msg[:300]}")
 

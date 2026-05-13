@@ -118,3 +118,49 @@ CREATE TABLE IF NOT EXISTS workspace_commits (
 
 CREATE INDEX IF NOT EXISTS idx_workspace_commits_session
     ON workspace_commits(session_id, id DESC);
+
+-- ── MCP server inventory (Phase 5) ───────────────────────────────────────────
+-- Each row is a user's configuration of one MCP server — either an entry
+-- from the shipped catalog (`is_custom=false`, `catalog_slug` non-null) or
+-- a user-defined custom server (`is_custom=true`).
+--
+-- Disabling a catalog row keeps the row so saved env-vars survive a re-enable.
+-- See MCP_INVENTORY.md for the full design.
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id            uuid NOT NULL,
+    catalog_slug       text,
+    is_custom          boolean NOT NULL DEFAULT false,
+    name               text NOT NULL,
+    enabled            boolean NOT NULL DEFAULT false,
+    transport          text NOT NULL
+                            CHECK (transport IN
+                                ('stdio', 'streamable_http', 'sse', 'http')),
+    -- stdio
+    command            text,
+    args_json          jsonb,
+    -- http-family
+    endpoint_url       text,
+    auth_kind          text
+                            CHECK (auth_kind IS NULL
+                                OR auth_kind IN
+                                    ('none', 'bearer', 'api_key_header',
+                                     'api_key_env', 'oauth')),
+    auth_header        text,
+    -- Fernet-encrypted secret material (bearer token, header value, or
+    -- JSON map of env-var names→values). Never returned by the API.
+    secret_blob        text,
+    -- last-discovered tool list, cached for the UI. Refreshed on
+    -- successful connect; agent never reads this (uses live discovery).
+    tools_json         jsonb,
+    last_connected_at  timestamptz,
+    last_error         text,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    updated_at         timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (user_id, catalog_slug)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_servers_user
+    ON mcp_servers(user_id);
+CREATE INDEX IF NOT EXISTS idx_mcp_servers_user_enabled
+    ON mcp_servers(user_id) WHERE enabled;
