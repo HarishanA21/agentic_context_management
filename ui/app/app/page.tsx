@@ -181,6 +181,11 @@ export default function AppPage() {
   // Composer "+" attach menu
   const [composerMenuOpen, setComposerMenuOpen] = useState(false)
   const [uploading, setUploading] = useState(false)
+  // Model picker
+  const [models, setModels] = useState<
+    { id: string; name: string; context_length: number }[]
+  >([])
+  const [selectedModel, setSelectedModel] = useState<string>('')
   const composerMenuRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const photoInputRef = useRef<HTMLInputElement>(null)
@@ -204,6 +209,7 @@ export default function AppPage() {
       setReady(true)
       loadSessions()
       loadGithubStatus()
+      loadModels()
     })
     const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
       if (!session) router.replace('/login')
@@ -572,6 +578,27 @@ export default function AppPage() {
     if (!r.ok) return
     setSessions(await r.json())
   }
+  async function loadModels() {
+    try {
+      const r = await authFetch('/api/models')
+      if (!r.ok) return
+      const data = await r.json()
+      const list = Array.isArray(data?.models) ? data.models : []
+      setModels(list)
+      const saved =
+        typeof window !== 'undefined'
+          ? localStorage.getItem('selected_model') || ''
+          : ''
+      const initial =
+        (saved && list.some((m: any) => m.id === saved) && saved) ||
+        data?.default ||
+        list[0]?.id ||
+        ''
+      setSelectedModel(initial)
+    } catch {
+      // Network/auth error — picker will just be empty; chat still works on backend default.
+    }
+  }
   async function loadGithubStatus() {
     try {
       const r = await authFetch('/api/github/status')
@@ -611,8 +638,11 @@ export default function AppPage() {
     setContextError(null)
     setContextData(null)
     try {
+      const qs = selectedModel
+        ? `?model=${encodeURIComponent(selectedModel)}`
+        : ''
       const r = await authFetch(
-        `/api/sessions/${activeSession}/threads/${activeThread}/context`,
+        `/api/sessions/${activeSession}/threads/${activeThread}/context${qs}`,
       )
       if (!r.ok) {
         let detail = `${r.status} ${r.statusText}`
@@ -628,6 +658,39 @@ export default function AppPage() {
       setContextError(e?.message ?? 'Network error')
     } finally {
       setContextLoading(false)
+    }
+  }
+  async function deleteContextMessage(messageId: number) {
+    if (!activeSession || !activeThread) return
+    const qs = selectedModel
+      ? `?model=${encodeURIComponent(selectedModel)}`
+      : ''
+    const r = await authFetch(
+      `/api/sessions/${activeSession}/threads/${activeThread}/messages/${messageId}${qs}`,
+      { method: 'DELETE' },
+    )
+    if (!r.ok) {
+      let detail = `${r.status} ${r.statusText}`
+      try {
+        const body = await r.json()
+        if (body?.detail) detail = body.detail
+      } catch {}
+      setToast(`Delete failed: ${detail}`)
+      return
+    }
+    let payload: any = null
+    try {
+      payload = await r.json()
+    } catch {}
+    if (payload && payload.removed_from_state === false) {
+      setToast('Removed from view (older message — model may still recall it).')
+    }
+    // Re-fetch the context window so totals + the message list refresh.
+    await openContextViewer()
+    // Also refresh the main chat history so the deleted message disappears
+    // from the conversation.
+    if (activeSession && activeThread) {
+      loadHistory(activeSession, activeThread)
     }
   }
   async function loadThreads(sid: string) {
@@ -842,6 +905,7 @@ export default function AppPage() {
         thread_id: tid,
         message: msg,
         attached_files: attachedFiles,
+        model: selectedModel || undefined,
       }),
     })
       .then(async (r) => {
@@ -1421,10 +1485,38 @@ export default function AppPage() {
             )}
           </div>
           <div className="flex items-center gap-2">
-            <span className="chip">
-              <span className="dot bg-emerald-400" />
-              glm-4.5-air
-            </span>
+            {models.length > 0 ? (
+              <div className="chip flex items-center gap-2 pr-1">
+                <span className="dot bg-emerald-400" />
+                <select
+                  value={selectedModel}
+                  onChange={(e) => {
+                    const v = e.target.value
+                    setSelectedModel(v)
+                    if (typeof window !== 'undefined') {
+                      localStorage.setItem('selected_model', v)
+                    }
+                  }}
+                  className="bg-transparent text-xs text-white outline-none max-w-[14rem] truncate"
+                  title="Chat model (OpenRouter free tier)"
+                >
+                  {models.map((m) => (
+                    <option
+                      key={m.id}
+                      value={m.id}
+                      className="bg-ink-200 text-white"
+                    >
+                      {m.name.replace(/\s*\(free\)\s*$/i, '')}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : (
+              <span className="chip">
+                <span className="dot bg-emerald-400" />
+                {selectedModel || 'default'}
+              </span>
+            )}
           </div>
         </header>
 
@@ -1727,6 +1819,19 @@ export default function AppPage() {
           error={contextError}
           onClose={() => setContextOpen(false)}
           onRefresh={openContextViewer}
+          onDelete={(id) =>
+            setConfirmDialog({
+              title: 'Remove from context?',
+              message:
+                'This message will be deleted from the conversation and from the model\'s memory of this thread. This cannot be undone.',
+              confirmLabel: 'Remove',
+              danger: true,
+              onConfirm: () => {
+                setConfirmDialog(null)
+                deleteContextMessage(id)
+              },
+            })
+          }
         />
       )}
 
@@ -2526,14 +2631,36 @@ function ContextViewer({
   error,
   onClose,
   onRefresh,
+  onDelete,
 }: {
   data: any
   loading: boolean
   error: string | null
   onClose: () => void
   onRefresh: () => void
+  onDelete: (messageId: number) => void
 }) {
   const [systemOpen, setSystemOpen] = useState(false)
+  const [rawMode, setRawMode] = useState(false)
+
+  const rawText = useMemo(() => {
+    if (!data) return ''
+    const parts: string[] = []
+    if (data.system_prompt) {
+      parts.push(`=== SYSTEM PROMPT ===\n${data.system_prompt}`)
+    }
+    for (const m of (data.messages || []) as any[]) {
+      const label = m.tool_name ? `${m.role}:${m.tool_name}` : m.role
+      const tc =
+        m.tool_calls && m.tool_calls.length > 0
+          ? `\n[tool_calls] ${JSON.stringify(m.tool_calls)}`
+          : ''
+      parts.push(
+        `--- ${String(label).toUpperCase()} (${m.tokens} tokens) ---\n${m.content || ''}${tc}`,
+      )
+    }
+    return parts.join('\n\n')
+  }, [data])
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -2565,6 +2692,14 @@ function ContextViewer({
           <div className="text-sm text-white font-medium">Context window</div>
           <div className="flex items-center gap-1">
             <button
+              onClick={() => setRawMode((v) => !v)}
+              disabled={loading || !data}
+              className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-white/[0.06] disabled:opacity-40"
+              title="See system prompt + every message as one block"
+            >
+              {rawMode ? 'Summary' : 'View raw'}
+            </button>
+            <button
               onClick={onRefresh}
               disabled={loading}
               className="text-xs px-2 py-1 rounded text-fog-300 hover:bg-white/[0.06] disabled:opacity-40"
@@ -2585,7 +2720,30 @@ function ContextViewer({
           {loading && <div className="text-fog-400">Loading…</div>}
           {error && <div className="text-red-400">Error: {error}</div>}
 
-          {!loading && !error && data && (
+          {!loading && !error && data && rawMode && (
+            <section>
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-[11px] uppercase tracking-widest text-fog-500">
+                  Full context · {data.total_tokens.toLocaleString()} tokens
+                </div>
+                <button
+                  onClick={() => {
+                    if (typeof navigator !== 'undefined' && navigator.clipboard) {
+                      navigator.clipboard.writeText(rawText)
+                    }
+                  }}
+                  className="text-[11px] px-2 py-0.5 rounded text-fog-300 hover:bg-white/[0.06]"
+                >
+                  Copy
+                </button>
+              </div>
+              <pre className="text-[12px] leading-relaxed text-fog-100 whitespace-pre-wrap bg-ink-300 border border-line rounded-md p-3 max-h-[75vh] overflow-auto font-mono">
+                {rawText}
+              </pre>
+            </section>
+          )}
+
+          {!loading && !error && data && !rawMode && (
             <>
               {/* Model + token usage */}
               <section>
@@ -2640,7 +2798,11 @@ function ContextViewer({
                 )}
                 <div className="space-y-1.5">
                   {data.messages.map((m: any, i: number) => (
-                    <ContextMessageRow key={i} msg={m} />
+                    <ContextMessageRow
+                      key={m.id ?? i}
+                      msg={m}
+                      onDelete={onDelete}
+                    />
                   ))}
                 </div>
               </section>
@@ -2674,8 +2836,15 @@ function ContextViewer({
   )
 }
 
-function ContextMessageRow({ msg }: { msg: any }) {
+function ContextMessageRow({
+  msg,
+  onDelete,
+}: {
+  msg: any
+  onDelete?: (messageId: number) => void
+}) {
   const [open, setOpen] = useState(false)
+  const [tokensOpen, setTokensOpen] = useState(false)
   const preview = (msg.content || '').slice(0, 100).replace(/\n/g, ' ')
   const roleColor =
     msg.role === 'user'
@@ -2684,27 +2853,104 @@ function ContextMessageRow({ msg }: { msg: any }) {
       ? 'text-emerald-300'
       : 'text-purple-300'
 
+  const totalTok = Number(msg.tokens || 0)
+  const inputTok = Number(msg.input_tokens || 0)
+  const outputTok = Number(msg.output_tokens || 0)
+  const thinkingTok = Number(msg.thinking_tokens || 0)
+  const answerTok = Math.max(0, outputTok - thinkingTok)
+  const hasBreakdown =
+    msg.role === 'assistant' && (inputTok > 0 || outputTok > 0)
+
+  const canDelete = onDelete && typeof msg.id === 'number'
+
   return (
-    <div className="rounded-md border border-line bg-ink-300/40">
-      <button
-        onClick={() => setOpen((v) => !v)}
-        className="w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-white/[0.03]"
-      >
-        <span
-          className={`text-[10px] uppercase tracking-wider font-mono shrink-0 ${roleColor}`}
+    <div className="rounded-md border border-line bg-ink-300/40 group">
+      <div className="w-full flex items-center gap-2 hover:bg-white/[0.03]">
+        <button
+          onClick={() => setOpen((v) => !v)}
+          className="text-left px-3 py-2 flex items-center gap-2 flex-1 min-w-0"
         >
-          {msg.role}
-          {msg.tool_name ? `:${msg.tool_name}` : ''}
-        </span>
-        <span className="text-fog-300 text-[12px] truncate flex-1">
-          {preview || (msg.tool_calls ? '(tool call)' : '(empty)')}
-        </span>
-        <span className="text-fog-500 text-[11px] shrink-0 tabular-nums">
-          {msg.tokens}
-        </span>
-      </button>
+          <span
+            className={`text-[10px] uppercase tracking-wider font-mono shrink-0 ${roleColor}`}
+          >
+            {msg.role}
+            {msg.tool_name ? `:${msg.tool_name}` : ''}
+          </span>
+          <span className="text-fog-300 text-[12px] truncate flex-1">
+            {preview || (msg.tool_calls ? '(tool call)' : '(empty)')}
+          </span>
+          <span className="text-fog-500 text-[11px] shrink-0 tabular-nums">
+            {msg.tokens}
+          </span>
+        </button>
+        {canDelete && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              onDelete!(msg.id)
+            }}
+            className="shrink-0 w-7 h-7 mr-1 rounded text-red-400 hover:text-red-300 hover:bg-red-500/10 flex items-center justify-center text-base"
+            title={
+              msg.has_langgraph_id === false
+                ? 'Remove from view (older message — model may still recall it)'
+                : 'Remove from context'
+            }
+            aria-label="Remove from context"
+          >
+            ✕
+          </button>
+        )}
+      </div>
       {open && (
         <div className="px-3 pb-3 pt-1 text-[12px] text-fog-200">
+          {hasBreakdown && (
+            <div className="mb-2 border border-line rounded bg-ink-300/60">
+              <button
+                onClick={() => setTokensOpen((v) => !v)}
+                className="w-full text-left px-2 py-1.5 flex items-center gap-2 hover:bg-white/[0.03] text-[11px] text-fog-300"
+              >
+                <span className="text-fog-500 w-3 inline-block">
+                  {tokensOpen ? '▾' : '▸'}
+                </span>
+                <span className="flex-1">Tokens</span>
+                <span className="text-fog-500 tabular-nums">
+                  {totalTok.toLocaleString()}
+                </span>
+              </button>
+              {tokensOpen && (
+                <div className="px-2 pb-2 pt-0.5 space-y-0.5 text-[11px]">
+                  <div className="flex items-center justify-between text-fog-400">
+                    <span>Input</span>
+                    <span className="tabular-nums">
+                      {inputTok.toLocaleString()} tokens
+                    </span>
+                  </div>
+                  {thinkingTok > 0 && (
+                    <div className="flex items-center justify-between text-fog-400">
+                      <span className="pl-3">Thinking</span>
+                      <span className="tabular-nums">
+                        {thinkingTok.toLocaleString()} tokens
+                      </span>
+                    </div>
+                  )}
+                  <div className="flex items-center justify-between text-fog-400">
+                    <span className={thinkingTok > 0 ? 'pl-3' : ''}>
+                      {thinkingTok > 0 ? 'Answer' : 'Output'}
+                    </span>
+                    <span className="tabular-nums">
+                      {answerTok.toLocaleString()} tokens
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between text-fog-300 pt-0.5 mt-0.5 border-t border-line">
+                    <span>Total</span>
+                    <span className="tabular-nums">
+                      {totalTok.toLocaleString()} tokens
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
           {msg.tool_calls && msg.tool_calls.length > 0 && (
             <pre className="whitespace-pre-wrap text-[11.5px] text-fog-400 bg-ink-300 border border-line rounded p-2 mb-2 max-h-48 overflow-auto">
               {JSON.stringify(msg.tool_calls, null, 2)}
