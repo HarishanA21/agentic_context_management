@@ -102,6 +102,59 @@ def _verify_session(conn, user_id: str, session_id: str):
 
 DEFAULT_MODEL = os.getenv("CHAT_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
 
+# ── Context-management strategy ────────────────────────────────────────────
+# Selects how the agent's tool surface is presented to the LLM each turn.
+# New strategies plug in as additional branches in `_get_agent_for_request`.
+#   tool_calling   — classic ReAct: every tool is its own LangChain tool,
+#                    agent calls one per round. Current default.
+#   ts_code_mode   — catalog + describe_tools + execute_typescript. The
+#                    agent picks tool names from a compact catalog, fetches
+#                    full TS interfaces on demand, and runs one TS program
+#                    per turn in a Deno isolate. See TS_CODE_MODE_PLAN.md.
+_VALID_CONTEXT_STRATEGIES = {"tool_calling", "ts_code_mode"}
+DEFAULT_CONTEXT_STRATEGY = (
+    os.getenv("DEFAULT_CONTEXT_STRATEGY", "tool_calling").strip() or "tool_calling"
+)
+if DEFAULT_CONTEXT_STRATEGY not in _VALID_CONTEXT_STRATEGIES:
+    print(
+        f"[startup] WARNING: DEFAULT_CONTEXT_STRATEGY={DEFAULT_CONTEXT_STRATEGY!r} "
+        f"not in {sorted(_VALID_CONTEXT_STRATEGIES)}; falling back to tool_calling.",
+        flush=True,
+    )
+    DEFAULT_CONTEXT_STRATEGY = "tool_calling"
+
+
+def _normalise_strategy(value: Optional[str]) -> str:
+    v = (value or "").strip().lower()
+    return v if v in _VALID_CONTEXT_STRATEGIES else DEFAULT_CONTEXT_STRATEGY
+
+
+# Path to the Deno binary used by `ts_code_mode`. Only resolved when the
+# strategy is actually used, so the rest of the backend doesn't care
+# whether Deno is installed.
+DENO_BIN = os.getenv("DENO_BIN", "deno").strip() or "deno"
+
+
+def _deno_health_check() -> Optional[str]:
+    """Return Deno version string if the binary is callable, else None.
+    Run once at startup and logged — does NOT crash the backend, because
+    most paths don't need Deno. Only ts_code_mode will fail loudly if
+    Deno is missing at request time.
+    """
+    import subprocess  # local import: only used at startup
+    try:
+        out = subprocess.run(
+            [DENO_BIN, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode == 0:
+            return (out.stdout or "").splitlines()[0].strip() or "deno (version unknown)"
+        return None
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+
 
 def _build_model(model_name: str) -> ChatOpenAI:
     # Note: glm-4.5-air:free has a known bug where it wraps multi-arg tool
@@ -233,24 +286,50 @@ async def _collect_mcp_tools_async(user_id: str):
         return []
 
 
-def _get_agent_for_request(model_name: Optional[str], user_id: str):
+def _get_agent_for_request(
+    model_name: Optional[str],
+    user_id: str,
+    strategy: Optional[str] = None,
+):
     """Sync wrapper around the async tool discovery, so /chat (which is
     a sync FastAPI handler) can call us without flipping to async.
 
-    Returns an agent whose tool list = built-ins + the user's enabled MCP
-    tools. Cache key is `(model, user, tool-name fingerprint)` so
-    toggling an MCP rebuilds on the next request without churning the
-    cache for unrelated users.
+    Branches on the selected context-management `strategy`:
+      * tool_calling — classic: each built-in + each MCP tool is its
+                       own LangChain tool. Default.
+      * ts_code_mode — exposes describe_tools + execute_typescript and
+                       a compact catalog in the system prompt. The
+                       agent fetches TS interfaces on demand and runs
+                       one TS program per turn inside a Deno isolate.
+
+    Cache key is `(model, user, strategy, tool-name fingerprint)` so
+    toggling an MCP — or flipping strategy mid-session — rebuilds on
+    the next request without churning the cache for unrelated users.
     """
     name = (model_name or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    strat = _normalise_strategy(strategy)
 
     mcp_tools = asyncio.run(_collect_mcp_tools_async(user_id))
+    real_tools = list(all_tools) + list(mcp_tools)
+    real_fingerprint = ",".join(sorted(t.name for t in real_tools))
 
-    if not mcp_tools:
-        return _get_agent(name)
+    if strat == "ts_code_mode":
+        # Local imports to keep the import graph clean: tool_calling
+        # turns don't pay the cost of loading ts_code_mode at all.
+        from Tools.describe_tools_tool import make_describe_tools_tool
+        from Tools.execute_typescript_tool import make_execute_typescript_tool
+        from ts_code_mode import ts_code_mode_system_prompt
 
-    fingerprint = ",".join(sorted(t.name for t in mcp_tools))
-    key = f"{name}::{user_id}::{fingerprint}"
+        agent_tools = [
+            make_describe_tools_tool(real_tools),
+            make_execute_typescript_tool(real_tools),
+        ]
+        system_prompt = ts_code_mode_system_prompt(real_tools)
+    else:
+        agent_tools = real_tools
+        system_prompt = SYSTEM_PROMPT
+
+    key = f"{name}::{user_id}::{strat}::{real_fingerprint}"
     with _agent_cache_lock:
         if key in _agent_cache:
             return _agent_cache[key]
@@ -258,8 +337,8 @@ def _get_agent_for_request(model_name: Optional[str], user_id: str):
             _agent_cache.pop(next(iter(_agent_cache)), None)
         agent = create_agent(
             model=_build_model(name),
-            tools=list(all_tools) + list(mcp_tools),
-            system_prompt=SYSTEM_PROMPT,
+            tools=agent_tools,
+            system_prompt=system_prompt,
             checkpointer=app.state.saver,
         )
         _agent_cache[key] = agent
@@ -329,6 +408,9 @@ class ChatRequest(BaseModel):
     message: str
     attached_files: List[str] = []
     model: Optional[str] = None
+    # Optional per-request override of DEFAULT_CONTEXT_STRATEGY. Unknown
+    # / blank values fall back to the default. See _normalise_strategy.
+    context_strategy: Optional[str] = None
 
 
 class TitleRequest(BaseModel):
@@ -430,6 +512,20 @@ async def lifespan(app: FastAPI):
     # _get_agent on first use.
     _get_agent(DEFAULT_MODEL)
 
+    # Deno availability is informational at startup — only ts_code_mode
+    # turns will actually need it, and they fail loudly with a clear
+    # message if it's missing. Most setups don't use ts_code_mode.
+    deno_ver = _deno_health_check()
+    if deno_ver:
+        print(f"[startup] Deno OK ({deno_ver}) — ts_code_mode available.", flush=True)
+    else:
+        print(
+            f"[startup] Deno not found at {DENO_BIN!r}. "
+            f"ts_code_mode turns will error. Install Deno (`brew install deno`) "
+            f"to enable, or ignore this if you're staying on tool_calling.",
+            flush=True,
+        )
+
     # Workspace garbage collector — destroys expired, pauses idle.
     gc_task = asyncio.create_task(_workspace_gc_loop(app))
 
@@ -461,6 +557,9 @@ app.add_middleware(
 # to avoid circular imports inside the router.
 from routes_mcp import router as mcp_router  # noqa: E402
 app.include_router(mcp_router)
+
+from routes_demo import router as demo_router  # noqa: E402
+app.include_router(demo_router)
 
 
 def get_current_user(authorization: Optional[str] = Header(None)) -> str:
@@ -2098,6 +2197,35 @@ def list_models(user_id: str = Depends(get_current_user)):
     return {"default": DEFAULT_MODEL, "models": items}
 
 
+@app.get("/context/strategies")
+def list_context_strategies(user_id: str = Depends(get_current_user)):
+    """Available context-management strategies + the current default.
+    Wire-compatible with a future UI selector; for now the strategy can
+    be overridden per request via ChatRequest.context_strategy.
+    """
+    strategies = [
+        {
+            "id": "tool_calling",
+            "label": "Tool Calling",
+            "summary": (
+                "Classic ReAct loop — every tool is a separate "
+                "LangChain tool, the model picks one per round."
+            ),
+        },
+        {
+            "id": "ts_code_mode",
+            "label": "TypeScript Code Mode",
+            "summary": (
+                "Compact catalog in the prompt; describe_tools fetches "
+                "TS interfaces on demand; execute_typescript runs one "
+                "program per turn in a Deno isolate. Saves tokens and "
+                "round-trips on multi-step tasks; needs Deno installed."
+            ),
+        },
+    ]
+    return {"default": DEFAULT_CONTEXT_STRATEGY, "strategies": strategies}
+
+
 @app.get("/sessions/{session_id}/threads/{thread_id}/context")
 def get_context(
     session_id: str,
@@ -2267,7 +2395,7 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
     clear_cancel(req.thread_id)
 
     try:
-        agent = _get_agent_for_request(req.model, user_id)
+        agent = _get_agent_for_request(req.model, user_id, req.context_strategy)
 
         # Project sessions get a sandboxed workspace; chat-only sessions don't.
         # The lazy-create returns an existing workspace if there is one (auto-
@@ -2571,6 +2699,7 @@ class ResumeChatRequest(BaseModel):
     approved: bool
     reason: Optional[str] = None
     model: Optional[str] = None
+    context_strategy: Optional[str] = None
 
 
 class CancelChatRequest(BaseModel):
@@ -2650,7 +2779,7 @@ def chat_resume(req: ResumeChatRequest, user_id: str = Depends(get_current_user)
     clear_cancel(req.thread_id)
 
     try:
-        agent = _get_agent_for_request(req.model, user_id)
+        agent = _get_agent_for_request(req.model, user_id, req.context_strategy)
 
         # Recover session mode + workspace state to rebuild the same config.
         workspace_ref: Optional[str] = None
