@@ -605,6 +605,49 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE sessions "
             "ADD COLUMN IF NOT EXISTS mode text NOT NULL DEFAULT 'auto'"
         )
+        # Phase F — per-user multi-provider configs and per-session
+        # override. Matches db/init.sql; gated by IF NOT EXISTS so it's
+        # a no-op when the DB was bootstrapped fresh from the SQL file.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_providers (
+                id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id            uuid NOT NULL,
+                slug               text NOT NULL,
+                label              text NOT NULL,
+                model_id           text NOT NULL,
+                credentials_blob   text NOT NULL,
+                is_default         boolean NOT NULL DEFAULT false,
+                last_error         text,
+                last_tested_at     timestamptz,
+                created_at         timestamptz NOT NULL DEFAULT now(),
+                updated_at         timestamptz NOT NULL DEFAULT now(),
+                UNIQUE (user_id, label)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_providers_user "
+            "ON llm_providers(user_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_providers_user_default "
+            "ON llm_providers(user_id) WHERE is_default"
+        )
+        # Phase G — provider-level temperature + max_tokens overrides.
+        conn.execute(
+            "ALTER TABLE llm_providers "
+            "ADD COLUMN IF NOT EXISTS temperature double precision, "
+            "ADD COLUMN IF NOT EXISTS max_tokens integer"
+        )
+        # Per-session preferred provider; FK with ON DELETE SET NULL so
+        # deleting a provider silently reverts affected sessions to the
+        # user-level default.
+        conn.execute(
+            "ALTER TABLE sessions "
+            "ADD COLUMN IF NOT EXISTS preferred_provider_id uuid "
+            "REFERENCES llm_providers(id) ON DELETE SET NULL"
+        )
 
     app.state.saver = saver
     app.state.pool = pool
