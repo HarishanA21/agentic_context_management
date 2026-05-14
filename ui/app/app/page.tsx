@@ -8,6 +8,7 @@ import remarkGfm from 'remark-gfm'
 import { supabase, authFetch, authToken } from '@/lib/supabase'
 import { useTheme } from '@/lib/theme'
 import { MCPInventoryPanel } from '@/components/mcp-inventory'
+import { StrategyDemoPanel } from '@/components/strategy-demo'
 
 /* ─────────────────────────── types ─────────────────────────── */
 
@@ -231,6 +232,10 @@ export default function AppPage() {
   // MCP inventory takes over the main pane when open — exclusive with the
   // chat view; clicking any session/project/chat row closes it.
   const [mcpsOpen, setMcpsOpen] = useState(false)
+  // Strategy comparison demo — runs both context-management strategies
+  // in parallel and shows tokens / latency / tool-call counts side by
+  // side. Same exclusivity model as MCPs.
+  const [demoOpen, setDemoOpen] = useState(false)
   const [projectModalOpen, setProjectModalOpen] = useState(false)
 
   // Per-row "⋯" menu — keyed by `${kind}:${id}` so chats and threads don't collide
@@ -312,6 +317,15 @@ export default function AppPage() {
     { id: string; name: string; context_length: number }[]
   >([])
   const [selectedModel, setSelectedModel] = useState<string>('')
+  // Context-management strategy picker. Loaded from /context/strategies
+  // on mount; choice persists in localStorage. Sent on every /chat and
+  // /chat/resume so the backend can rebuild the agent if it differs
+  // from the default — see _get_agent_for_request.
+  const [strategies, setStrategies] = useState<
+    { id: string; label: string; summary: string }[]
+  >([])
+  const [defaultStrategy, setDefaultStrategy] = useState<string>('tool_calling')
+  const [selectedStrategy, setSelectedStrategy] = useState<string>('')
   const composerMenuRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const photoInputRef = useRef<HTMLInputElement>(null)
@@ -336,6 +350,7 @@ export default function AppPage() {
       loadSessions()
       loadGithubStatus()
       loadModels()
+      loadStrategies()
     })
     const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
       if (!session) router.replace('/login')
@@ -849,6 +864,26 @@ export default function AppPage() {
       // Network/auth error — picker will just be empty; chat still works on backend default.
     }
   }
+  async function loadStrategies() {
+    try {
+      const r = await authFetch('/api/context/strategies')
+      if (!r.ok) return
+      const data = await r.json()
+      const list = Array.isArray(data?.strategies) ? data.strategies : []
+      setStrategies(list)
+      const fallback = data?.default || list[0]?.id || 'tool_calling'
+      setDefaultStrategy(fallback)
+      const saved =
+        typeof window !== 'undefined'
+          ? localStorage.getItem('selected_strategy') || ''
+          : ''
+      const initial =
+        (saved && list.some((s: any) => s.id === saved) && saved) || fallback
+      setSelectedStrategy(initial)
+    } catch {
+      // Non-critical — backend's DEFAULT_CONTEXT_STRATEGY wins if we can't reach this.
+    }
+  }
   async function loadGithubStatus() {
     try {
       const r = await authFetch('/api/github/status')
@@ -1024,6 +1059,7 @@ export default function AppPage() {
           approved,
           reason,
           model: selectedModel || undefined,
+          context_strategy: selectedStrategy || undefined,
         }),
       })
       if (!r.ok) {
@@ -1268,6 +1304,7 @@ export default function AppPage() {
 
   async function selectThread(sid: string, tid: string) {
     setMcpsOpen(false)
+    setDemoOpen(false)
     setActiveSession(sid)
     setActiveThread(tid)
     setMessages([])
@@ -1292,6 +1329,7 @@ export default function AppPage() {
   // see the project's files, threads, and metadata before diving in.
   async function selectProject(sid: string) {
     setMcpsOpen(false)
+    setDemoOpen(false)
     setActiveSession(sid)
     setActiveThread(null)
     setMessages([])
@@ -1394,6 +1432,7 @@ export default function AppPage() {
         message: msg,
         attached_files: attachedFiles,
         model: selectedModel || undefined,
+        context_strategy: selectedStrategy || undefined,
       }),
     })
       .then(async (r) => {
@@ -1944,12 +1983,47 @@ export default function AppPage() {
           </div>
         </div>
 
+        {/* Strategy demo entry — runs both context-management strategies
+            in parallel for the same prompt and shows token / latency /
+            tool-call comparison. Sits above MCP Inventory. */}
+        <div className="px-3 pt-2">
+          <button
+            onClick={() =>
+              setDemoOpen((v) => {
+                const next = !v
+                if (next) setMcpsOpen(false)
+                return next
+              })
+            }
+            aria-pressed={demoOpen}
+            className={`w-full flex items-center gap-3 px-2 py-2 rounded-md transition ${
+              demoOpen
+                ? 'bg-soft/[0.08] text-fog-50'
+                : 'hover:bg-soft/[0.04] text-fog-200'
+            }`}
+          >
+            <span className="w-7 h-7 rounded-md bg-soft/10 text-accent flex items-center justify-center">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M9 3v18M15 3v18M3 9h18M3 15h18" opacity="0.55" />
+                <path d="M3 3h18v18H3z" />
+              </svg>
+            </span>
+            <span className="text-sm flex-1 text-left">Strategy Demo</span>
+          </button>
+        </div>
+
         {/* MCP inventory entry — sits above the user profile so it's
             findable without diving into the user menu. Toggles the MCP
             panel in the main pane (in place of chat). */}
-        <div className="px-3 pt-2">
+        <div className="px-3 pt-1">
           <button
-            onClick={() => setMcpsOpen((v) => !v)}
+            onClick={() =>
+              setMcpsOpen((v) => {
+                const next = !v
+                if (next) setDemoOpen(false)
+                return next
+              })
+            }
             aria-pressed={mcpsOpen}
             className={`w-full flex items-center gap-3 px-2 py-2 rounded-md transition ${
               mcpsOpen
@@ -2012,7 +2086,9 @@ export default function AppPage() {
 
       {/* ────── Main ────── */}
       <main className="flex-1 flex flex-col min-w-0">
-        {mcpsOpen ? (
+        {demoOpen ? (
+          <StrategyDemoPanel />
+        ) : mcpsOpen ? (
           <MCPInventoryPanel embedded />
         ) : (
         <>
@@ -2075,6 +2151,16 @@ export default function AppPage() {
                 onChange={(m) => updateSessionMode(activeSessionObj.id, m)}
               />
             )}
+            <StrategyToggle
+              value={selectedStrategy || defaultStrategy}
+              strategies={strategies}
+              onChange={(id) => {
+                setSelectedStrategy(id)
+                if (typeof window !== 'undefined') {
+                  localStorage.setItem('selected_strategy', id)
+                }
+              }}
+            />
             {models.length > 0 ? (
               <div className="chip flex items-center gap-2 pr-1">
                 <span className="dot bg-emerald-400" />
@@ -3088,6 +3174,45 @@ function ViewToggle({
 }
 
 /* ─────────────────────────── mode toggle (Auto / Confirm) ────────────────── */
+
+function StrategyToggle({
+  value,
+  onChange,
+  strategies,
+}: {
+  value: string
+  onChange: (id: string) => void
+  strategies: { id: string; label: string; summary: string }[]
+}) {
+  // Hide entirely when the backend reports fewer than two options —
+  // there's nothing to toggle.
+  if (strategies.length < 2) return null
+  const current = strategies.find((s) => s.id === value)
+  return (
+    <div
+      className="flex items-center rounded-full border border-line bg-ink-200 p-0.5 text-[11px]"
+      title={
+        current
+          ? `${current.label}: ${current.summary}`
+          : 'Context-management strategy'
+      }
+    >
+      {strategies.map((s) => (
+        <button
+          key={s.id}
+          onClick={() => value !== s.id && onChange(s.id)}
+          className={`px-2.5 py-1 rounded-full transition ${
+            value === s.id
+              ? 'bg-soft/[0.10] text-fog-50'
+              : 'text-fog-400 hover:text-fog-50'
+          }`}
+        >
+          {s.label}
+        </button>
+      ))}
+    </div>
+  )
+}
 
 function ModeToggle({
   mode,
