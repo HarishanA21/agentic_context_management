@@ -25,3 +25,7 @@ uv.lock
 # Uploaded user files (per-session storage)
 uploads/
 .claude
+
+
+current.md
+note.txt

@@ -95,6 +95,15 @@ A self-hosted, Codex-like coding platform delivered as a **web application** (Ne
 - [x] `.claude/skills/update-readme/` — keeps README in sync with code
 - [x] `.claude/skills/update-architecture/` — keeps `architecture.md` + diagram in sync
 
+### Multi-provider LLM settings
+- [x] **DB + crypto + adapter ABC** — `llm_providers` table (`db/init.sql`); `LLMProvider` ABC + `CredentialField`; Fernet-encrypted credentials (reuses `MCP_SECRET_KEY`)
+- [x] **Six adapters** — OpenRouter, OpenAI, Anthropic, AWS Bedrock, Azure OpenAI, Google AI Studio; each implements `build_chat_model`, `test_credentials`, `list_models`
+- [x] **Wired into `/chat`** — `_resolve_chat_model` resolves session → user-default → env-fallback in that order; cache keys never collide between branches
+- [x] **REST endpoints** ([backend/routes_providers.py](backend/routes_providers.py)) — `/providers/catalog`, CRUD, `/test`, `/default`, `/{id}/models`, `/discover-models`; 20/min/user rate limit; max 10 providers/user
+- [x] **Settings UI** ([ui/app/app/providers/page.tsx](ui/app/app/providers/page.tsx)) — dynamic form per provider type using the catalog schema, secret fields masked, region/option fields render as `<select>`, "Fetch available" button for live model lists
+- [x] **Per-session model picker** — `sessions.preferred_provider_id`; chat-header dropdown switches to user's providers when any are configured; selection PATCHes the session so each session can use a different provider in parallel
+- [x] **Sidebar entry** — "LLM Providers" sits below "MCP Inventory" in the chat sidebar; navigates to the standalone `/app/providers` route
+
 ## 🔄 In progress
 
 - **Phase 2A — git workflow** — Steps 2.1–2.3 + 2.5 done. **Step 2.4** (git tools — `git_status`/`git_diff`/`git_branch`/`git_log`) is the remaining 2A item; lower priority now that auto-commit is in.

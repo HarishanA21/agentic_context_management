@@ -193,9 +193,38 @@ Then open http://localhost:3000.
 
 ## Choosing a model
 
-The chat header has a model picker populated from `GET /api/models`, which proxies OpenRouter's catalog filtered to `:free` models (cached server-side for 10 minutes). Selection persists in `localStorage` and is sent on every `/chat` and `/context` request. The backend builds one LangGraph agent per model on first use and caches it; the same `PostgresSaver` checkpointer is shared across models so conversation history is preserved when you switch.
+There are **two model-selection paths** depending on whether you've configured an LLM provider:
 
-If `OPENROUTER_API_KEY` isn't set or the catalog fetch fails, the picker stays empty and chat falls back to the backend's `CHAT_MODEL` env default.
+### A. With configured providers (recommended)
+
+Open the sidebar → **LLM Providers** → add one or more of: OpenAI, Anthropic, AWS Bedrock, Azure OpenAI, Google AI Studio, OpenRouter.
+
+For each provider you supply credentials and a model ID. The "Fetch available" button in the Add/Edit modal pulls a live model list when the provider exposes one (OpenAI, OpenRouter, Bedrock, Azure deployments, Google). Marking one as ★ default sets it as the fallback for new sessions. Credentials are stored Fernet-encrypted in Postgres using the `MCP_SECRET_KEY` env var.
+
+The chat header's top-right picker then lists **your configured providers** (instead of OpenRouter's free-model catalog). Selecting one writes `preferred_provider_id` on the current session — different sessions can use different providers in parallel.
+
+Resolution order on every `/chat` turn:
+
+1. The session's `preferred_provider_id` (Phase F picker)
+2. The user's default provider (`is_default = true`)
+3. The env-var path (`OPENROUTER_API_KEY` + `CHAT_MODEL`) — legacy / zero-config fallback
+
+### B. Zero-config (legacy)
+
+If you have **no** providers configured, the chat header reverts to the old OpenRouter free-model dropdown populated from `GET /api/models`. The backend uses `OPENROUTER_API_KEY` + `CHAT_MODEL` directly. This is what runs out-of-the-box on a fresh checkout.
+
+### Provider credential reference
+
+| Provider | Required fields | Where to get them |
+|---|---|---|
+| OpenRouter | `api_key` | https://openrouter.ai/keys |
+| OpenAI | `api_key` (optional `organization`) | https://platform.openai.com/api-keys |
+| Anthropic | `api_key` | https://console.anthropic.com/settings/keys |
+| AWS Bedrock | `aws_access_key_id`, `aws_secret_access_key`, `aws_region` | IAM user with `AmazonBedrockFullAccess` and Bedrock model access enabled in the chosen region |
+| Azure OpenAI | `api_key`, `azure_endpoint` (e.g. `https://my-rg.openai.azure.com`), `api_version` (optional, defaults to `2024-10-21`) | Azure portal → Cognitive Services → Keys and Endpoint. Model ID is the **deployment name**, not the underlying model. |
+| Google AI Studio | `api_key` | https://aistudio.google.com/apikey |
+
+Adapter implementations live in [backend/providers/](backend/providers/) — one file per provider following the `LLMProvider` ABC in `base.py`.
 
 ## Adding a tool
 

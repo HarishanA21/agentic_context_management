@@ -199,6 +199,91 @@ _agent_cache_lock = Lock()
 _AGENT_CACHE_MAX = 64
 
 
+def _resolve_chat_model(
+    model_name_hint: Optional[str],
+    user_id: str,
+    session_id: Optional[str] = None,
+):
+    """Pick the LangChain chat model for this user's next /chat turn.
+
+    Order:
+      1. The session's `preferred_provider_id` if set (Phase F per-session
+         picker).
+      2. The user's default provider (`is_default = true`).
+      3. Env-var path: `_build_model(model_name_hint)` — legacy OpenRouter
+         setup, used when the user has no providers configured.
+
+    Returns `(chat_model, cache_key_str)`. The cache key prefix differs
+    between the three branches so they never collide.
+    """
+    try:
+        with app.state.pool.connection() as conn:
+            # 1) session-specific override
+            if session_id:
+                row = conn.execute(
+                    """
+                    SELECT lp.id, lp.slug, lp.model_id, lp.credentials_blob,
+                           lp.updated_at
+                      FROM sessions s
+                      JOIN llm_providers lp ON lp.id = s.preferred_provider_id
+                     WHERE s.id = %s AND s.user_id = %s
+                     LIMIT 1
+                    """,
+                    (session_id, user_id),
+                ).fetchone()
+                if row:
+                    pid, slug, model_id, blob, updated_at = row
+                    from providers.base import decrypt_credentials
+                    from providers.registry import (
+                        _build_for_user,
+                        _env_fallback_model,
+                    )
+
+                    creds = decrypt_credentials(blob or "")
+                    if creds:
+                        chat_model = _build_for_user(
+                            slug, model_id, creds, updated_at
+                        )
+                        return (
+                            chat_model,
+                            f"prov::{slug}::{model_id}::{updated_at}::sess",
+                        )
+                    # creds missing — fall through to user default
+                    print(
+                        f"[providers] session {session_id} preferred provider "
+                        f"{pid} has empty credentials; using user default",
+                        flush=True,
+                    )
+
+            # 2) user default
+            row = conn.execute(
+                """
+                SELECT slug, model_id, updated_at
+                  FROM llm_providers
+                 WHERE user_id = %s AND is_default = true
+                 LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            if row:
+                from providers.registry import resolve_active_model
+
+                slug, model_id, updated_at = row
+                chat_model = resolve_active_model(conn, user_id)
+                key = f"prov::{slug}::{model_id}::{updated_at}"
+                return chat_model, key
+    except Exception as e:
+        print(
+            f"[providers] resolve_active_model failed for {user_id}; "
+            f"falling back to env path: {e!r}",
+            flush=True,
+        )
+
+    # 3) env fallback
+    name = (model_name_hint or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    return _build_model(name), f"env::{name}"
+
+
 def _unwrap_exc(e: BaseException) -> BaseException:
     """anyio TaskGroups (used by the MCP transports) wrap real errors in
     ExceptionGroup. The outer message is generic; the inner one tells you
@@ -290,6 +375,7 @@ def _get_agent_for_request(
     model_name: Optional[str],
     user_id: str,
     strategy: Optional[str] = None,
+    session_id: Optional[str] = None,
 ):
     """Sync wrapper around the async tool discovery, so /chat (which is
     a sync FastAPI handler) can call us without flipping to async.
@@ -306,8 +392,11 @@ def _get_agent_for_request(
     toggling an MCP — or flipping strategy mid-session — rebuilds on
     the next request without churning the cache for unrelated users.
     """
-    name = (model_name or DEFAULT_MODEL).strip() or DEFAULT_MODEL
     strat = _normalise_strategy(strategy)
+
+    # Choose the LLM. Order: session.preferred_provider_id (Phase F),
+    # then user default, then env fallback.
+    chat_model, model_key = _resolve_chat_model(model_name, user_id, session_id)
 
     mcp_tools = asyncio.run(_collect_mcp_tools_async(user_id))
     real_tools = list(all_tools) + list(mcp_tools)
@@ -329,14 +418,14 @@ def _get_agent_for_request(
         agent_tools = real_tools
         system_prompt = SYSTEM_PROMPT
 
-    key = f"{name}::{user_id}::{strat}::{real_fingerprint}"
+    key = f"{model_key}::{user_id}::{strat}::{real_fingerprint}"
     with _agent_cache_lock:
         if key in _agent_cache:
             return _agent_cache[key]
         if len(_agent_cache) >= _AGENT_CACHE_MAX:
             _agent_cache.pop(next(iter(_agent_cache)), None)
         agent = create_agent(
-            model=_build_model(name),
+            model=chat_model,
             tools=agent_tools,
             system_prompt=system_prompt,
             checkpointer=app.state.saver,
@@ -561,6 +650,9 @@ app.include_router(mcp_router)
 from routes_demo import router as demo_router  # noqa: E402
 app.include_router(demo_router)
 
+from routes_providers import router as providers_router  # noqa: E402
+app.include_router(providers_router)
+
 
 def get_current_user(authorization: Optional[str] = Header(None)) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -757,12 +849,14 @@ def list_sessions(user_id: str = Depends(get_current_user)):
             """
             SELECT s.id, s.name, s.kind, s.mode, s.created_at,
                    s.github_owner, s.github_repo, s.github_branch,
+                   s.preferred_provider_id,
                    COALESCE(SUM(m.tokens), 0)::int AS tokens
             FROM sessions s
             LEFT JOIN messages m ON m.session_id = s.id
             WHERE s.user_id = %s
             GROUP BY s.id, s.name, s.kind, s.mode, s.created_at,
-                     s.github_owner, s.github_repo, s.github_branch
+                     s.github_owner, s.github_repo, s.github_branch,
+                     s.preferred_provider_id
             ORDER BY s.created_at DESC
             """,
             (user_id,),
@@ -777,14 +871,20 @@ def list_sessions(user_id: str = Depends(get_current_user)):
             "github_owner": r[5],
             "github_repo": r[6],
             "github_branch": r[7],
-            "tokens": int(r[8] or 0),
+            "preferred_provider_id": str(r[8]) if r[8] else None,
+            "tokens": int(r[9] or 0),
         }
         for r in rows
     ]
 
 
 class UpdateSessionRequest(BaseModel):
-    mode: Optional[str] = None  # 'auto' | 'confirm'
+    mode: Optional[str] = None                     # 'auto' | 'confirm'
+    # Phase F: per-session provider override.
+    #   "<uuid>" — use this specific provider for chats in this session
+    #   ""       — clear the override (falls back to user default)
+    #   None     — leave unchanged
+    preferred_provider_id: Optional[str] = None
 
 
 @app.patch("/sessions/{session_id}")
@@ -793,7 +893,7 @@ def update_session(
     req: UpdateSessionRequest,
     user_id: str = Depends(get_current_user),
 ):
-    """Partial-update a session. Currently supports `mode` only."""
+    """Partial-update a session. Supports `mode` and `preferred_provider_id`."""
     if req.mode is not None and req.mode not in {"auto", "confirm"}:
         raise HTTPException(400, "mode must be 'auto' or 'confirm'")
 
@@ -804,7 +904,30 @@ def update_session(
                 "UPDATE sessions SET mode = %s WHERE id = %s AND user_id = %s",
                 (req.mode, session_id, user_id),
             )
-    return {"ok": True, "mode": req.mode}
+        if req.preferred_provider_id is not None:
+            new_pid: Optional[str]
+            if req.preferred_provider_id == "":
+                new_pid = None  # clear override
+            else:
+                # Verify the provider belongs to this user before assigning.
+                owned = conn.execute(
+                    "SELECT 1 FROM llm_providers "
+                    "WHERE id = %s AND user_id = %s",
+                    (req.preferred_provider_id, user_id),
+                ).fetchone()
+                if not owned:
+                    raise HTTPException(404, "Provider not found.")
+                new_pid = req.preferred_provider_id
+            conn.execute(
+                "UPDATE sessions SET preferred_provider_id = %s "
+                "WHERE id = %s AND user_id = %s",
+                (new_pid, session_id, user_id),
+            )
+    return {
+        "ok": True,
+        "mode": req.mode,
+        "preferred_provider_id": req.preferred_provider_id,
+    }
 
 
 def _resolve_github_link(
@@ -2395,7 +2518,9 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
     clear_cancel(req.thread_id)
 
     try:
-        agent = _get_agent_for_request(req.model, user_id, req.context_strategy)
+        agent = _get_agent_for_request(
+            req.model, user_id, req.context_strategy, session_id=req.session_id
+        )
 
         # Project sessions get a sandboxed workspace; chat-only sessions don't.
         # The lazy-create returns an existing workspace if there is one (auto-
@@ -2779,7 +2904,9 @@ def chat_resume(req: ResumeChatRequest, user_id: str = Depends(get_current_user)
     clear_cancel(req.thread_id)
 
     try:
-        agent = _get_agent_for_request(req.model, user_id, req.context_strategy)
+        agent = _get_agent_for_request(
+            req.model, user_id, req.context_strategy, session_id=req.session_id
+        )
 
         # Recover session mode + workspace state to rebuild the same config.
         workspace_ref: Optional[str] = None

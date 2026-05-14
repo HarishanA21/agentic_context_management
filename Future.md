@@ -1,7 +1,7 @@
 
 
 Create API Keys - Wrap the openrouter models with the same names, but our platfrom api keys exposing those models
-Need to implement compact, summarization and my research emthods, so user can chnage it according to their needs
+Need to implement compact, summarization and my research emthods, so user can change it according to their needs
 
 Demo UI
 Raw text method + IMage for tools + Image for entire window

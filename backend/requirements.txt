@@ -28,6 +28,14 @@ e2b             # backend=e2b: managed Firecracker microVMs
 # GitHub integration
 PyGithub
 
+# Multi-provider LLM adapters (Bedrock + Google; OpenAI/Anthropic/Azure
+# already covered by langchain-openai and langchain-anthropic above)
+langchain-aws
+langchain-google-genai
+
+# Tests
+pytest
+
 # MCP inventory — adapter for stdio + SSE servers, plus the raw Python
 # SDK for streamable_http connections.
 langchain-mcp-adapters>=0.1

@@ -317,6 +317,17 @@ export default function AppPage() {
     { id: string; name: string; context_length: number }[]
   >([])
   const [selectedModel, setSelectedModel] = useState<string>('')
+  // Phase F: user's configured LLM providers + per-session preference.
+  // When `providers.length > 0`, the chat-header picker switches from
+  // OpenRouter free-model list to a provider list and sets the session's
+  // preferred_provider_id on change.
+  const [providers, setProviders] = useState<
+    { id: string; slug: string; label: string; model_id: string; is_default: boolean }[]
+  >([])
+  // Map of session_id → preferred_provider_id (null = "use user default").
+  const [sessionProviders, setSessionProviders] = useState<
+    Record<string, string | null>
+  >({})
   // Context-management strategy picker. Loaded from /context/strategies
   // on mount; choice persists in localStorage. Sent on every /chat and
   // /chat/resume so the backend can rebuild the agent if it differs
@@ -351,6 +362,7 @@ export default function AppPage() {
       loadGithubStatus()
       loadModels()
       loadStrategies()
+      loadProviders()
     })
     const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
       if (!session) router.replace('/login')
@@ -841,7 +853,58 @@ export default function AppPage() {
   async function loadSessions() {
     const r = await authFetch('/api/sessions')
     if (!r.ok) return
-    setSessions(await r.json())
+    const list: any[] = await r.json()
+    setSessions(list)
+    // Cache each session's preferred_provider_id so the chat-header picker
+    // can highlight the right entry without an extra fetch.
+    setSessionProviders((prev) => {
+      const next: Record<string, string | null> = { ...prev }
+      for (const s of list) {
+        next[s.id] = s.preferred_provider_id ?? null
+      }
+      return next
+    })
+  }
+  async function loadProviders() {
+    try {
+      const r = await authFetch('/api/providers')
+      if (!r.ok) return
+      const list = await r.json()
+      setProviders(Array.isArray(list) ? list : [])
+    } catch {
+      // ignore — chat falls back to env path
+    }
+  }
+  async function setSessionProvider(sid: string, providerId: string | null) {
+    // Optimistic update so the picker reacts instantly.
+    setSessionProviders((prev) => ({ ...prev, [sid]: providerId }))
+    try {
+      const body = JSON.stringify({
+        // Backend treats "" as "clear override"; UUID as "set".
+        preferred_provider_id: providerId ?? '',
+      })
+      const r = await authFetch(`/api/sessions/${sid}`, {
+        method: 'PATCH',
+        body,
+      })
+      if (!r.ok) {
+        // Roll back on failure.
+        const reloaded = await authFetch('/api/sessions')
+        if (reloaded.ok) {
+          const list: any[] = await reloaded.json()
+          setSessions(list)
+          setSessionProviders((prev) => {
+            const next = { ...prev }
+            for (const s of list) {
+              next[s.id] = s.preferred_provider_id ?? null
+            }
+            return next
+          })
+        }
+      }
+    } catch {
+      // Best effort — if the PATCH failed transiently, next loadSessions fixes it.
+    }
   }
   async function loadModels() {
     try {
@@ -2041,6 +2104,24 @@ export default function AppPage() {
           </button>
         </div>
 
+        {/* LLM Providers entry — sits below MCP Inventory. Navigates to the
+            standalone /app/providers route rather than swapping a panel
+            in place. */}
+        <div className="px-3 pt-1">
+          <Link
+            href="/app/providers"
+            className="w-full flex items-center gap-3 px-2 py-2 rounded-md transition hover:bg-soft/[0.04] text-fog-200"
+          >
+            <span className="w-7 h-7 rounded-md bg-soft/10 text-accent flex items-center justify-center">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 12c0 4.97-4.03 9-9 9s-9-4.03-9-9 4.03-9 9-9 9 4.03 9 9z" />
+                <path d="M3 12h18M12 3a14.7 14.7 0 0 1 0 18M12 3a14.7 14.7 0 0 0 0 18" opacity="0.55" />
+              </svg>
+            </span>
+            <span className="text-sm flex-1 text-left">LLM Providers</span>
+          </Link>
+        </div>
+
         {/* User menu */}
         <div className="border-t border-line p-3 relative">
           <button
@@ -2161,7 +2242,41 @@ export default function AppPage() {
                 }
               }}
             />
-            {models.length > 0 ? (
+            {providers.length > 0 ? (
+              <div className="chip flex items-center gap-2 pr-1" title="LLM provider for this session">
+                <span className="dot bg-emerald-400" />
+                <select
+                  value={
+                    (activeSession && sessionProviders[activeSession]) || ''
+                  }
+                  onChange={(e) => {
+                    const v = e.target.value
+                    if (!activeSession) return
+                    setSessionProvider(activeSession, v || null)
+                  }}
+                  disabled={!activeSession}
+                  className="bg-transparent text-xs text-fog-50 outline-none max-w-[18rem] truncate disabled:opacity-50"
+                >
+                  <option value="" className="bg-ink-200 text-fog-50">
+                    {(() => {
+                      const def = providers.find((p) => p.is_default)
+                      return def
+                        ? `Default · ${def.label} · ${def.model_id}`
+                        : 'Default (env fallback)'
+                    })()}
+                  </option>
+                  {providers.map((p) => (
+                    <option
+                      key={p.id}
+                      value={p.id}
+                      className="bg-ink-200 text-fog-50"
+                    >
+                      {p.label} · {p.model_id}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : models.length > 0 ? (
               <div className="chip flex items-center gap-2 pr-1">
                 <span className="dot bg-emerald-400" />
                 <select
