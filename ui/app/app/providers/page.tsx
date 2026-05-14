@@ -38,6 +38,8 @@ type Provider = {
   last_tested_at: string | null
   created_at: string | null
   updated_at: string | null
+  temperature: number | null
+  max_tokens: number | null
 }
 
 type ModalMode =
@@ -160,6 +162,10 @@ export default function ProvidersPage() {
     credentials: Record<string, string> | null
     is_default: boolean
     id?: string
+    temperature: number | null
+    max_tokens: number | null
+    clear_temperature: boolean
+    clear_max_tokens: boolean
   }): Promise<{ ok: boolean; error?: string }> {
     const body: any = {
       label: payload.label,
@@ -170,14 +176,23 @@ export default function ProvidersPage() {
 
     let r: Response
     if (payload.id) {
+      // PATCH: only send fields that need to change. `clear_*` flags tell
+      // the backend to NULL the column.
+      if (payload.temperature !== null) body.temperature = payload.temperature
+      if (payload.max_tokens !== null) body.max_tokens = payload.max_tokens
+      if (payload.clear_temperature) body.clear_temperature = true
+      if (payload.clear_max_tokens) body.clear_max_tokens = true
       r = await authFetch(`/api/providers/${payload.id}`, {
         method: 'PATCH',
         body: JSON.stringify(body),
       })
     } else {
+      // POST: send numeric overrides directly; null fields are simply omitted.
       body.slug = payload.slug
       body.is_default = payload.is_default
       body.credentials = payload.credentials ?? {}
+      if (payload.temperature !== null) body.temperature = payload.temperature
+      if (payload.max_tokens !== null) body.max_tokens = payload.max_tokens
       r = await authFetch('/api/providers', {
         method: 'POST',
         body: JSON.stringify(body),
@@ -453,6 +468,10 @@ function ProviderModal({
     credentials: Record<string, string> | null
     is_default: boolean
     id?: string
+    temperature: number | null
+    max_tokens: number | null
+    clear_temperature: boolean
+    clear_max_tokens: boolean
   }) => Promise<{ ok: boolean; error?: string }>
 }) {
   const isEdit = mode.kind === 'edit'
@@ -464,6 +483,13 @@ function ProviderModal({
   const [creds, setCreds] = useState<Record<string, string>>({})
   const [replaceCreds, setReplaceCreds] = useState(!isEdit)
   const [isDefault, setIsDefault] = useState(existing?.is_default ?? false)
+  // Runtime overrides — empty string means "use the adapter default".
+  const [temperatureRaw, setTemperatureRaw] = useState<string>(
+    existing?.temperature != null ? String(existing.temperature) : '',
+  )
+  const [maxTokensRaw, setMaxTokensRaw] = useState<string>(
+    existing?.max_tokens != null ? String(existing.max_tokens) : '',
+  )
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   // Seed with the catalog's curated shortlist so the dropdown is useful
@@ -535,6 +561,27 @@ function ProviderModal({
 
   async function handleSubmit() {
     setErr(null)
+
+    // Parse the override inputs. Empty = "no override / use default".
+    let temperatureValue: number | null = null
+    if (temperatureRaw.trim()) {
+      const t = Number(temperatureRaw)
+      if (Number.isNaN(t) || t < 0 || t > 2) {
+        setErr('Temperature must be a number between 0 and 2.')
+        return
+      }
+      temperatureValue = t
+    }
+    let maxTokensValue: number | null = null
+    if (maxTokensRaw.trim()) {
+      const m = Number(maxTokensRaw)
+      if (!Number.isInteger(m) || m < 1 || m > 200_000) {
+        setErr('Max tokens must be a whole number between 1 and 200000.')
+        return
+      }
+      maxTokensValue = m
+    }
+
     setBusy(true)
     const result = await save({
       slug: entry.slug,
@@ -543,6 +590,12 @@ function ProviderModal({
       credentials: replaceCreds ? creds : null,
       is_default: isDefault,
       id: existing?.id,
+      temperature: temperatureValue,
+      max_tokens: maxTokensValue,
+      clear_temperature:
+        isEdit && existing?.temperature != null && temperatureValue === null,
+      clear_max_tokens:
+        isEdit && existing?.max_tokens != null && maxTokensValue === null,
     })
     setBusy(false)
     if (!result.ok) {
@@ -666,6 +719,48 @@ function ProviderModal({
               ))}
             </div>
           )}
+        </div>
+
+        {/* Runtime overrides (optional) */}
+        <div className="mb-4">
+          <div className="text-fog-200 text-sm mb-2">Runtime (optional)</div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-[12.5px] text-fog-300 mb-1">
+                Temperature
+              </label>
+              <input
+                type="number"
+                step="0.1"
+                min="0"
+                max="2"
+                value={temperatureRaw}
+                onChange={(e) => setTemperatureRaw(e.target.value)}
+                placeholder="default 0.3"
+                className="w-full bg-ink-300 border border-lineStrong rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-white/40"
+              />
+              <p className="text-[11.5px] text-fog-500 mt-1">
+                0.0 – 2.0. Empty = adapter default.
+              </p>
+            </div>
+            <div>
+              <label className="block text-[12.5px] text-fog-300 mb-1">
+                Max tokens
+              </label>
+              <input
+                type="number"
+                step="1"
+                min="1"
+                value={maxTokensRaw}
+                onChange={(e) => setMaxTokensRaw(e.target.value)}
+                placeholder="provider default"
+                className="w-full bg-ink-300 border border-lineStrong rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-white/40"
+              />
+              <p className="text-[11.5px] text-fog-500 mt-1">
+                Cap on the reply length. Empty = adapter default.
+              </p>
+            </div>
+          </div>
         </div>
 
         {/* Default */}

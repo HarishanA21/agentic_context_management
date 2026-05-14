@@ -223,7 +223,7 @@ def _resolve_chat_model(
                 row = conn.execute(
                     """
                     SELECT lp.id, lp.slug, lp.model_id, lp.credentials_blob,
-                           lp.updated_at
+                           lp.updated_at, lp.temperature, lp.max_tokens
                       FROM sessions s
                       JOIN llm_providers lp ON lp.id = s.preferred_provider_id
                      WHERE s.id = %s AND s.user_id = %s
@@ -232,7 +232,15 @@ def _resolve_chat_model(
                     (session_id, user_id),
                 ).fetchone()
                 if row:
-                    pid, slug, model_id, blob, updated_at = row
+                    (
+                        pid,
+                        slug,
+                        model_id,
+                        blob,
+                        updated_at,
+                        temperature,
+                        max_tokens,
+                    ) = row
                     from providers.base import decrypt_credentials
                     from providers.registry import (
                         _build_for_user,
@@ -242,7 +250,12 @@ def _resolve_chat_model(
                     creds = decrypt_credentials(blob or "")
                     if creds:
                         chat_model = _build_for_user(
-                            slug, model_id, creds, updated_at
+                            slug,
+                            model_id,
+                            creds,
+                            updated_at,
+                            temperature,
+                            max_tokens,
                         )
                         return (
                             chat_model,

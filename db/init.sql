@@ -202,3 +202,11 @@ CREATE INDEX IF NOT EXISTS idx_llm_providers_user_default
 ALTER TABLE sessions
     ADD COLUMN IF NOT EXISTS preferred_provider_id uuid
         REFERENCES llm_providers(id) ON DELETE SET NULL;
+
+
+-- Phase G follow-up: per-provider temperature and max_tokens overrides.
+-- NULL means "use the adapter's built-in default" (currently env-driven).
+ALTER TABLE llm_providers
+    ADD COLUMN IF NOT EXISTS temperature double precision;
+ALTER TABLE llm_providers
+    ADD COLUMN IF NOT EXISTS max_tokens integer;

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
-from typing import Any
+from typing import Any, Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
@@ -55,11 +55,18 @@ def _build_cached(
     model_id: str,
     credentials_repr: tuple[tuple[str, str], ...],
     _updated_at: str,  # part of the cache key; not used inside the body
+    temperature: Optional[float],
+    max_tokens: Optional[int],
 ) -> BaseChatModel:
     provider = PROVIDERS.get(provider_slug)
     if provider is None:
         raise ValueError(f"Unknown provider slug: {provider_slug}")
-    return provider.build_chat_model(model_id, dict(credentials_repr))
+    runtime: dict[str, Any] = {}
+    if temperature is not None:
+        runtime["temperature"] = temperature
+    if max_tokens is not None:
+        runtime["max_tokens"] = max_tokens
+    return provider.build_chat_model(model_id, dict(credentials_repr), **runtime)
 
 
 def _build_for_user(
@@ -67,11 +74,18 @@ def _build_for_user(
     model_id: str,
     credentials: dict[str, str],
     updated_at: Any,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
 ) -> BaseChatModel:
     # dicts aren't hashable; flatten to a sorted tuple-of-tuples for the cache.
     cred_repr = tuple(sorted(credentials.items()))
     return _build_cached(
-        provider_slug, model_id, cred_repr, str(updated_at) if updated_at else ""
+        provider_slug,
+        model_id,
+        cred_repr,
+        str(updated_at) if updated_at else "",
+        temperature,
+        max_tokens,
     )
 
 
@@ -105,7 +119,8 @@ def resolve_active_model(conn, user_id: str) -> BaseChatModel:
     """
     row = conn.execute(
         """
-        SELECT slug, model_id, credentials_blob, updated_at
+        SELECT slug, model_id, credentials_blob, updated_at,
+               temperature, max_tokens
         FROM llm_providers
         WHERE user_id = %s AND is_default = true
         LIMIT 1
@@ -114,12 +129,14 @@ def resolve_active_model(conn, user_id: str) -> BaseChatModel:
     ).fetchone()
     if not row:
         return _env_fallback_model()
-    slug, model_id, blob, updated_at = row
+    slug, model_id, blob, updated_at, temperature, max_tokens = row
     credentials = decrypt_credentials(blob or "")
     if not credentials:
         # Encrypted blob unreadable — fall back rather than crash.
         return _env_fallback_model()
-    return _build_for_user(slug, model_id, credentials, updated_at)
+    return _build_for_user(
+        slug, model_id, credentials, updated_at, temperature, max_tokens
+    )
 
 
 def resolve_session_model(

@@ -80,6 +80,8 @@ def _row_to_dict(row: tuple) -> Dict[str, Any]:
         last_tested_at,
         created_at,
         updated_at,
+        temperature,
+        max_tokens,
     ) = row
     return {
         "id": str(id_),
@@ -92,12 +94,15 @@ def _row_to_dict(row: tuple) -> Dict[str, Any]:
         "last_tested_at": last_tested_at.isoformat() if last_tested_at else None,
         "created_at": created_at.isoformat() if created_at else None,
         "updated_at": updated_at.isoformat() if updated_at else None,
+        "temperature": float(temperature) if temperature is not None else None,
+        "max_tokens": int(max_tokens) if max_tokens is not None else None,
     }
 
 
 _SELECT_FIELDS = (
     "id, slug, label, model_id, credentials_blob, is_default, "
-    "last_error, last_tested_at, created_at, updated_at"
+    "last_error, last_tested_at, created_at, updated_at, "
+    "temperature, max_tokens"
 )
 
 
@@ -112,6 +117,9 @@ class CreateProviderRequest(BaseModel):
     is_default: bool = False
     # If true, do a test_credentials() before saving and reject on failure.
     verify: bool = True
+    # Optional runtime overrides — NULL means "use the adapter's default".
+    temperature: Optional[float] = Field(None, ge=0.0, le=2.0)
+    max_tokens: Optional[int] = Field(None, ge=1, le=200_000)
 
 
 class UpdateProviderRequest(BaseModel):
@@ -119,6 +127,16 @@ class UpdateProviderRequest(BaseModel):
     model_id: Optional[str] = Field(None, min_length=1, max_length=200)
     credentials: Optional[Dict[str, str]] = None
     verify: bool = False
+    # Tri-state knobs:
+    #   None        — leave unchanged
+    #   number      — set to this value
+    #   -1 / "null" — explicit "clear back to adapter default"
+    # Pydantic can't model that distinction natively, so PATCH callers send
+    # `null` (JSON) to clear and a number to set; `None` here = leave alone.
+    temperature: Optional[float] = Field(None, ge=0.0, le=2.0)
+    max_tokens: Optional[int] = Field(None, ge=1, le=200_000)
+    clear_temperature: bool = False
+    clear_max_tokens: bool = False
 
 
 # ── Catalog ────────────────────────────────────────────────────────────────
@@ -221,8 +239,8 @@ def create_provider(req: CreateProviderRequest, request: Request) -> Dict[str, A
             f"""
             INSERT INTO llm_providers
                 (user_id, slug, label, model_id, credentials_blob, is_default,
-                 last_error, last_tested_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                 last_error, last_tested_at, temperature, max_tokens)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s)
             RETURNING {_SELECT_FIELDS}
             """,
             (
@@ -233,6 +251,8 @@ def create_provider(req: CreateProviderRequest, request: Request) -> Dict[str, A
                 blob,
                 req.is_default,
                 last_error,
+                req.temperature,
+                req.max_tokens,
             ),
         ).fetchone()
     return _row_to_dict(row)
@@ -283,48 +303,44 @@ def update_provider(
         except Exception as e:
             raise HTTPException(400, f"Verification failed: {e}")
 
+    # Build the UPDATE dynamically — every field below is independent.
+    set_clauses: list[str] = ["label = %s", "model_id = %s"]
+    params: list[Any] = [new_label, new_model_id]
+
+    if new_blob is not None:
+        set_clauses.append("credentials_blob = %s")
+        params.append(new_blob)
+        set_clauses.append("last_error = NULL")  # fresh creds → drop the old error
+
+    if req.temperature is not None:
+        set_clauses.append("temperature = %s")
+        params.append(req.temperature)
+    elif req.clear_temperature:
+        set_clauses.append("temperature = NULL")
+
+    if req.max_tokens is not None:
+        set_clauses.append("max_tokens = %s")
+        params.append(req.max_tokens)
+    elif req.clear_max_tokens:
+        set_clauses.append("max_tokens = NULL")
+
+    set_clauses.append(
+        "last_tested_at = CASE WHEN %s THEN NOW() ELSE last_tested_at END"
+    )
+    params.append(req.verify)
+    set_clauses.append("updated_at = NOW()")
+
+    params.extend([provider_id, user_id])
+
+    sql = (
+        "UPDATE llm_providers SET "
+        + ", ".join(set_clauses)
+        + " WHERE id = %s AND user_id = %s RETURNING "
+        + _SELECT_FIELDS
+    )
+
     with _pool().connection() as conn:
-        if new_blob is not None:
-            row = conn.execute(
-                f"""
-                UPDATE llm_providers
-                   SET label = %s,
-                       model_id = %s,
-                       credentials_blob = %s,
-                       last_error = NULL,
-                       last_tested_at = CASE WHEN %s THEN NOW() ELSE last_tested_at END,
-                       updated_at = NOW()
-                 WHERE id = %s AND user_id = %s
-                 RETURNING {_SELECT_FIELDS}
-                """,
-                (
-                    new_label,
-                    new_model_id,
-                    new_blob,
-                    req.verify,
-                    provider_id,
-                    user_id,
-                ),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                f"""
-                UPDATE llm_providers
-                   SET label = %s,
-                       model_id = %s,
-                       last_tested_at = CASE WHEN %s THEN NOW() ELSE last_tested_at END,
-                       updated_at = NOW()
-                 WHERE id = %s AND user_id = %s
-                 RETURNING {_SELECT_FIELDS}
-                """,
-                (
-                    new_label,
-                    new_model_id,
-                    req.verify,
-                    provider_id,
-                    user_id,
-                ),
-            ).fetchone()
+        row = conn.execute(sql, tuple(params)).fetchone()
     if not row:
         raise HTTPException(404, "Provider not found.")
     return _row_to_dict(row)

@@ -39,6 +39,7 @@ class OpenRouterProvider(LLMProvider):
                 "openai/gpt-4o-mini",
                 "anthropic/claude-haiku-4-5",
                 "anthropic/claude-sonnet-4-6",
+                "inclusionai/ring-2.6-1t:free",
             ],
             credential_fields=[
                 CredentialField(
