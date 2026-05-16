@@ -4,6 +4,7 @@ The agent will automatically get access to everything in `all_tools`.
 """
 
 from Tools.calculator_tool import calculator
+from Tools.jit_tools import find_files, grep_files, head_file, tail_file
 from Tools.list_files_tool import list_project_files
 from Tools.read_file_tool import read_project_file
 from Tools.shell_tool import run_shell
@@ -18,4 +19,11 @@ all_tools = [
     read_project_file,
     write_project_file,
     run_shell,
+    # PR #2 — just-in-time retrieval primitives. Always available; cheap
+    # to expose because they only cost context when the agent actually
+    # calls them. See CONTEXT_STRATEGIES_PLAN.md technique B5.
+    find_files,
+    head_file,
+    tail_file,
+    grep_files,
 ]
