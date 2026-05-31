@@ -44,3 +44,9 @@ mcp>=1.0
 # Secret-blob encryption for stored MCP API tokens / env-var values.
 cryptography
 
+# Hybrid Visual-Textual Tool Ingestion — rasterise large tool outputs
+# into 2-column 1024 px PNGs (research paper 21_ENG_009) so vision-
+# capable LLMs can read them with far fewer tokens. Used by the
+# Strategy Demo's "Visual Compression Bench" tab.
+Pillow
+

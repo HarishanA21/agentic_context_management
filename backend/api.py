@@ -389,23 +389,35 @@ def _get_agent_for_request(
     user_id: str,
     strategy: Optional[str] = None,
     session_id: Optional[str] = None,
+    profile: Optional["Profile"] = None,  # type: ignore[name-defined]
 ):
     """Sync wrapper around the async tool discovery, so /chat (which is
     a sync FastAPI handler) can call us without flipping to async.
 
-    Branches on the selected context-management `strategy`:
-      * tool_calling — classic: each built-in + each MCP tool is its
-                       own LangChain tool. Default.
-      * ts_code_mode — exposes describe_tools + execute_typescript and
-                       a compact catalog in the system prompt. The
-                       agent fetches TS interfaces on demand and runs
-                       one TS program per turn inside a Deno isolate.
+    Profile-driven branching (PR #1 onwards):
+      * ``profile.tool_surface`` decides the tool list + system prompt
+        (``tool_calling`` vs ``ts_code_mode``).
+      * Later PRs read ``profile.context_management.{trimming,
+        summarisation, memory, subagent, jit_tools, sliding_window}``
+        to wire in those techniques. PR #1 leaves them as no-ops.
 
-    Cache key is `(model, user, strategy, tool-name fingerprint)` so
-    toggling an MCP — or flipping strategy mid-session — rebuilds on
-    the next request without churning the cache for unrelated users.
+    Back-compat: callers that haven't migrated still pass a string
+    ``strategy``; we wrap it into a synthetic profile. New callers
+    pass a fully-resolved Profile via ``profile=``.
+
+    Cache key includes the profile's fingerprint so changing any
+    technique toggle rebuilds the agent on the next request.
     """
-    strat = _normalise_strategy(strategy)
+    # Resolve to a Profile object regardless of how the caller invoked us.
+    if profile is None:
+        from context_profiles import Profile as _Profile  # lazy import
+
+        # Legacy string path: build a synthetic profile from the strategy
+        # name. ``minimal``/``code_mode`` are the only two outcomes here.
+        surface = _normalise_strategy(strategy)
+        profile = _Profile(tool_surface=surface)
+    surface = profile.tool_surface
+    profile_fp = profile.fingerprint()
 
     # Choose the LLM. Order: session.preferred_provider_id (Phase F),
     # then user default, then env fallback.
@@ -415,7 +427,7 @@ def _get_agent_for_request(
     real_tools = list(all_tools) + list(mcp_tools)
     real_fingerprint = ",".join(sorted(t.name for t in real_tools))
 
-    if strat == "ts_code_mode":
+    if surface == "ts_code_mode":
         # Local imports to keep the import graph clean: tool_calling
         # turns don't pay the cost of loading ts_code_mode at all.
         from Tools.describe_tools_tool import make_describe_tools_tool
@@ -431,7 +443,45 @@ def _get_agent_for_request(
         agent_tools = real_tools
         system_prompt = SYSTEM_PROMPT
 
-    key = f"{model_key}::{user_id}::{strat}::{real_fingerprint}"
+    # PR #4: memory tool. Added to the agent's toolbox when the profile
+    # enables it. The tool reads its scope (thread vs user) from this
+    # config block at call time — so the agent cache key only depends on
+    # `scope`, not on the live thread_id. system_prompt rider nudges the
+    # model to view memory at turn start.
+    mem_cfg = getattr(getattr(profile, "context_management", None), "memory", None)
+    if mem_cfg is not None and getattr(mem_cfg, "enabled", False):
+        from Tools.memory_tool import MEMORY_PROMPT_RIDER, make_memory_tool
+
+        agent_tools = list(agent_tools) + [make_memory_tool(scope=mem_cfg.scope)]
+        if getattr(mem_cfg, "auto_view_at_start", True):
+            system_prompt = system_prompt + MEMORY_PROMPT_RIDER
+
+    # PR #7: sub-agent delegation tool. Bound to the parent's chat_model
+    # and tool surface so the subagent stays apples-to-apples. The tool
+    # itself stays lightweight; the heavy lifting is in subagent.py.
+    sub_cfg = getattr(getattr(profile, "context_management", None), "subagent", None)
+    if sub_cfg is not None and getattr(sub_cfg, "enabled", False):
+        from Tools.delegate_tool import make_delegate_tool
+
+        agent_tools = list(agent_tools) + [
+            make_delegate_tool(
+                real_tools=real_tools,
+                tool_surface=surface,
+                chat_model=chat_model,
+                base_system_prompt=SYSTEM_PROMPT,
+                token_budget=sub_cfg.token_budget,
+                max_depth=sub_cfg.max_depth,
+            )
+        ]
+
+    # Cache key includes the profile fingerprint (covers tool_surface +
+    # every technique toggle). Two profiles with identical bodies share
+    # an agent; flipping any toggle invalidates without disturbing
+    # unrelated users' cached agents.
+    import hashlib
+
+    profile_hash = hashlib.sha1(profile_fp.encode()).hexdigest()[:12]
+    key = f"{model_key}::{user_id}::{profile_hash}::{real_fingerprint}"
     with _agent_cache_lock:
         if key in _agent_cache:
             return _agent_cache[key]
@@ -510,9 +560,15 @@ class ChatRequest(BaseModel):
     message: str
     attached_files: List[str] = []
     model: Optional[str] = None
-    # Optional per-request override of DEFAULT_CONTEXT_STRATEGY. Unknown
-    # / blank values fall back to the default. See _normalise_strategy.
+    # Legacy: "tool_calling" / "ts_code_mode" — maps to a built-in
+    # preset of the matching tool_surface. Superseded by context_profile_id
+    # / context_profile but kept so old clients keep working.
     context_strategy: Optional[str] = None
+    # Preferred (PR #1+): a saved profile id, or a one-off profile body.
+    # Resolution order: body > id > legacy strategy > session profile
+    # > user default > built-in `minimal`. See context_profiles.resolve_profile.
+    context_profile_id: Optional[str] = None
+    context_profile: Optional[Dict[str, Any]] = None
 
 
 class TitleRequest(BaseModel):
@@ -605,6 +661,118 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE sessions "
             "ADD COLUMN IF NOT EXISTS mode text NOT NULL DEFAULT 'auto'"
         )
+        # Phase F — per-user multi-provider configs and per-session
+        # override. Matches db/init.sql; gated by IF NOT EXISTS so it's
+        # a no-op when the DB was bootstrapped fresh from the SQL file.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_providers (
+                id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id            uuid NOT NULL,
+                slug               text NOT NULL,
+                label              text NOT NULL,
+                model_id           text NOT NULL,
+                credentials_blob   text NOT NULL,
+                is_default         boolean NOT NULL DEFAULT false,
+                last_error         text,
+                last_tested_at     timestamptz,
+                created_at         timestamptz NOT NULL DEFAULT now(),
+                updated_at         timestamptz NOT NULL DEFAULT now(),
+                UNIQUE (user_id, label)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_providers_user "
+            "ON llm_providers(user_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_providers_user_default "
+            "ON llm_providers(user_id) WHERE is_default"
+        )
+        # Phase G — provider-level temperature + max_tokens overrides.
+        conn.execute(
+            "ALTER TABLE llm_providers "
+            "ADD COLUMN IF NOT EXISTS temperature double precision, "
+            "ADD COLUMN IF NOT EXISTS max_tokens integer"
+        )
+        # Per-session preferred provider; FK with ON DELETE SET NULL so
+        # deleting a provider silently reverts affected sessions to the
+        # user-level default.
+        conn.execute(
+            "ALTER TABLE sessions "
+            "ADD COLUMN IF NOT EXISTS preferred_provider_id uuid "
+            "REFERENCES llm_providers(id) ON DELETE SET NULL"
+        )
+        # Context-management observability: append-only log of every
+        # context edit a strategy applies (trimming, summarisation,
+        # sliding-window, sub-agent dispatch, …). Plain bigserial id
+        # so the API can ORDER BY id ASC and the UI gets stable order
+        # even when several edits land in the same millisecond.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS context_events (
+                id            bigserial PRIMARY KEY,
+                user_id       uuid NOT NULL,
+                session_id    uuid NOT NULL,
+                thread_id     uuid NOT NULL,
+                turn_index    integer NOT NULL,
+                edit_type     text NOT NULL,
+                freed_tokens  integer NOT NULL DEFAULT 0,
+                details_json  jsonb,
+                created_at    timestamptz NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_context_events_thread "
+            "ON context_events(session_id, thread_id, id)"
+        )
+        # Context-management profiles — bundles tool_surface + per-
+        # technique toggles. Built-in presets have user_id IS NULL;
+        # user-saved profiles carry the owner's id. See
+        # backend/context_profiles.py for the schema + seed routine.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS context_profiles (
+                id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id      uuid,
+                name         text NOT NULL,
+                body         jsonb NOT NULL,
+                is_default   boolean NOT NULL DEFAULT false,
+                created_at   timestamptz NOT NULL DEFAULT now(),
+                updated_at   timestamptz NOT NULL DEFAULT now()
+            )
+            """
+        )
+        # Partial unique indexes — separate namespaces for built-ins
+        # (user_id NULL) and user-owned. Postgres treats each NULL
+        # as distinct so a plain UNIQUE (user_id, name) won't enforce
+        # built-in name uniqueness.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uniq_context_profiles_global_name "
+            "ON context_profiles(name) WHERE user_id IS NULL"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uniq_context_profiles_user_name "
+            "ON context_profiles(user_id, name) WHERE user_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_context_profiles_user "
+            "ON context_profiles(user_id)"
+        )
+        conn.execute(
+            "ALTER TABLE sessions "
+            "ADD COLUMN IF NOT EXISTS context_profile_id uuid "
+            "REFERENCES context_profiles(id) ON DELETE SET NULL"
+        )
+
+        # Seed the built-in context-management presets (minimal,
+        # code_mode, long_chat, power_research, cheap_long). Idempotent:
+        # the seeder updates existing built-in rows so adding a field
+        # to a preset auto-deploys.
+        from context_profiles import seed_builtin_presets  # lazy import
+        seed_builtin_presets(conn)
 
     app.state.saver = saver
     app.state.pool = pool
@@ -665,6 +833,9 @@ app.include_router(demo_router)
 
 from routes_providers import router as providers_router  # noqa: E402
 app.include_router(providers_router)
+
+from routes_context_profiles import router as context_profiles_router  # noqa: E402
+app.include_router(context_profiles_router)
 
 
 def get_current_user(authorization: Optional[str] = Header(None)) -> str:
@@ -898,6 +1069,9 @@ class UpdateSessionRequest(BaseModel):
     #   ""       — clear the override (falls back to user default)
     #   None     — leave unchanged
     preferred_provider_id: Optional[str] = None
+    # PR #1: per-session context-management profile override. Same
+    # tri-state semantics as preferred_provider_id.
+    context_profile_id: Optional[str] = None
 
 
 @app.patch("/sessions/{session_id}")
@@ -906,7 +1080,8 @@ def update_session(
     req: UpdateSessionRequest,
     user_id: str = Depends(get_current_user),
 ):
-    """Partial-update a session. Supports `mode` and `preferred_provider_id`."""
+    """Partial-update a session. Supports `mode`, `preferred_provider_id`,
+    and `context_profile_id`."""
     if req.mode is not None and req.mode not in {"auto", "confirm"}:
         raise HTTPException(400, "mode must be 'auto' or 'confirm'")
 
@@ -936,10 +1111,30 @@ def update_session(
                 "WHERE id = %s AND user_id = %s",
                 (new_pid, session_id, user_id),
             )
+        if req.context_profile_id is not None:
+            new_cpid: Optional[str]
+            if req.context_profile_id == "":
+                new_cpid = None  # clear override
+            else:
+                # Profile must be a built-in (user_id NULL) or owned.
+                owned = conn.execute(
+                    "SELECT 1 FROM context_profiles "
+                    "WHERE id = %s AND (user_id = %s OR user_id IS NULL)",
+                    (req.context_profile_id, user_id),
+                ).fetchone()
+                if not owned:
+                    raise HTTPException(404, "Context profile not found.")
+                new_cpid = req.context_profile_id
+            conn.execute(
+                "UPDATE sessions SET context_profile_id = %s "
+                "WHERE id = %s AND user_id = %s",
+                (new_cpid, session_id, user_id),
+            )
     return {
         "ok": True,
         "mode": req.mode,
         "preferred_provider_id": req.preferred_provider_id,
+        "context_profile_id": req.context_profile_id,
     }
 
 
@@ -2314,6 +2509,154 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+# ── Context-management observability ──────────────────────────────────────
+#
+# Two helpers used by the /context endpoint and by future strategies
+# (tool-result trimming, summarisation, sliding window, sub-agent).
+#
+# `_compute_trajectory(message_rows)` turns the raw messages-table rows
+# into a per-turn token series the UI can plot as a sparkline. A "turn"
+# starts on a user message and includes every assistant / tool message
+# that follows until the next user message.
+#
+# `_record_context_event(...)` appends one row to context_events.
+# Strategies call this whenever they edit the in-flight message list
+# so the UI can show the user *which* technique fired and how much it
+# saved.
+
+
+def _compute_trajectory(message_rows: List[tuple]) -> List[Dict[str, Any]]:
+    """Group the SELECT rows of `messages` into per-turn token totals.
+
+    Expected row shape (matches the SELECT in get_context):
+      (id, role, content, tool_name, tool_calls_json,
+       tokens, input_tokens, output_tokens, thinking_tokens, langgraph_id)
+    """
+    turns: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+    for row in message_rows:
+        role = row[1]
+        content = row[2] or ""
+        recorded = int(row[5] or 0)
+        in_tok = int(row[6] or 0)
+        out_tok = int(row[7] or 0)
+        # Prefer the canonical `tokens` column when it's populated; fall
+        # back to the rough estimator when the message predates the
+        # token-recording columns or is a tool message that never had
+        # them written.
+        msg_tok = recorded if recorded > 0 else _estimate_tokens(content)
+        if role == "user":
+            # Push the previous turn, if any, before opening a new one.
+            if current is not None:
+                turns.append(current)
+            current = {
+                "turn": len(turns) + 1,
+                "input_tokens": msg_tok + in_tok,
+                "output_tokens": out_tok,
+                "messages": 1,
+            }
+        elif current is not None:
+            # Assistant or tool message — counts as output for the turn.
+            current["output_tokens"] += msg_tok + out_tok
+            current["messages"] += 1
+        else:
+            # Edge case: leading non-user messages with no preceding
+            # user. Lump them into a turn-0 bucket so the UI still
+            # plots them rather than silently dropping.
+            current = {
+                "turn": 0,
+                "input_tokens": 0,
+                "output_tokens": msg_tok + out_tok,
+                "messages": 1,
+            }
+    if current is not None:
+        turns.append(current)
+    cumulative = 0
+    for t in turns:
+        t["turn_tokens"] = t["input_tokens"] + t["output_tokens"]
+        cumulative += t["turn_tokens"]
+        t["cumulative_tokens"] = cumulative
+    return turns
+
+
+def _record_context_event(
+    conn,
+    user_id: str,
+    session_id: str,
+    thread_id: str,
+    turn_index: int,
+    edit_type: str,
+    freed_tokens: int = 0,
+    details: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Append one row to `context_events`. Returns the new id.
+
+    `edit_type` is a free-form string. Conventional values shipped by
+    the strategies in CONTEXT_STRATEGIES_PLAN.md:
+      - "tool_result_trimming"
+      - "summarization"
+      - "sliding_window"
+      - "subagent_call"
+      - "memory_write" / "memory_read"
+
+    `details` is JSON-serialised and exposed to the UI verbatim — keep
+    it small and explanatory ("cleared 12 tool results", a summary
+    preview, the subagent's token totals, etc.).
+    """
+    row = conn.execute(
+        """
+        INSERT INTO context_events
+            (user_id, session_id, thread_id, turn_index, edit_type,
+             freed_tokens, details_json)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (
+            user_id,
+            session_id,
+            thread_id,
+            int(turn_index),
+            edit_type,
+            int(freed_tokens or 0),
+            json.dumps(details) if details else None,
+        ),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _list_context_events(
+    conn, user_id: str, session_id: str, thread_id: str
+) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT id, turn_index, edit_type, freed_tokens, details_json, created_at
+          FROM context_events
+         WHERE user_id = %s AND session_id = %s AND thread_id = %s
+         ORDER BY id ASC
+        """,
+        (user_id, session_id, thread_id),
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        details = r[4]
+        if isinstance(details, str):
+            try:
+                details = json.loads(details)
+            except Exception:
+                pass
+        out.append(
+            {
+                "id": int(r[0]),
+                "turn": int(r[1] or 0),
+                "type": r[2],
+                "freed_tokens": int(r[3] or 0),
+                "details": details,
+                "at": r[5].isoformat() if r[5] else None,
+            }
+        )
+    return out
+
+
 # Context window sizes for common models (in tokens). Used to compute %used.
 _MODEL_CONTEXT_LIMITS = {
     "meta-llama/llama-3.3-70b-instruct:free": 131072,
@@ -2384,6 +2727,8 @@ def get_context(
             """,
             (session_id, thread_id, user_id),
         ).fetchall()
+        applied_edits = _list_context_events(conn, user_id, session_id, thread_id)
+    trajectory = _compute_trajectory(rows)
 
     messages = []
     total_tokens = 0
@@ -2459,6 +2804,11 @@ def get_context(
         "system_tokens": sys_tokens,
         "messages": messages,
         "files": files,
+        # PR #0 additions — empty until a strategy actually writes
+        # context_events rows, but the keys are stable so the UI can
+        # render the panels with "no edits yet" right away.
+        "trajectory": trajectory,
+        "applied_edits": applied_edits,
     }
 
 
@@ -2531,8 +2881,25 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
     clear_cancel(req.thread_id)
 
     try:
+        # Resolve which context-management profile applies to this turn.
+        # Order: one-off body > saved id > legacy strategy > session
+        # override > user default > built-in `minimal`.
+        from context_profiles import resolve_profile  # lazy
+
+        with app.state.pool.connection() as _conn:
+            _profile, _profile_name = resolve_profile(
+                _conn,
+                user_id=user_id,
+                session_id=req.session_id,
+                request_profile_id=req.context_profile_id,
+                request_profile_body=req.context_profile,
+                legacy_strategy=req.context_strategy,
+            )
         agent = _get_agent_for_request(
-            req.model, user_id, req.context_strategy, session_id=req.session_id
+            req.model,
+            user_id,
+            session_id=req.session_id,
+            profile=_profile,
         )
 
         # Project sessions get a sandboxed workspace; chat-only sessions don't.
@@ -2585,6 +2952,45 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
             ],
             "configurable": configurable,
         }
+
+        # PR #3: context-editing pass. Runs every enabled technique on
+        # the in-flight message list before agent.ainvoke. PR #3 ships
+        # tool_result_trimming; PRs #5/#6 will add summarisation +
+        # sliding window inside the same orchestrator.
+        try:
+            from context_editing import apply_context_edits  # lazy
+
+            def _log_edit(edit_type, turn_index, freed_tokens, details):
+                with app.state.pool.connection() as _ec:
+                    _record_context_event(
+                        _ec,
+                        user_id=user_id,
+                        session_id=req.session_id,
+                        thread_id=req.thread_id,
+                        turn_index=turn_index,
+                        edit_type=edit_type,
+                        freed_tokens=freed_tokens,
+                        details=details,
+                    )
+
+            # Re-resolve the active chat model so the summariser step
+            # (PR #5) has something to call. _resolve_chat_model is LRU-
+            # cached, so the second call this turn is free.
+            try:
+                _chat_model, _ = _resolve_chat_model(
+                    req.model, user_id, req.session_id
+                )
+            except Exception:
+                _chat_model = None
+            apply_context_edits(
+                agent, config, _profile,
+                chat_model=_chat_model,
+                record_event=_log_edit,
+                estimator=_estimate_tokens,
+            )
+        except Exception as _e:
+            # Edits are best-effort — never block the user's turn.
+            print(f"[/chat] context_editing failed: {_e!r}", flush=True)
 
         # Record the user's message in DB *before* invoking the agent. That
         # way it survives in chat history even if the model crashes mid-turn.
@@ -2838,6 +3244,8 @@ class ResumeChatRequest(BaseModel):
     reason: Optional[str] = None
     model: Optional[str] = None
     context_strategy: Optional[str] = None
+    context_profile_id: Optional[str] = None
+    context_profile: Optional[Dict[str, Any]] = None
 
 
 class CancelChatRequest(BaseModel):
@@ -2917,8 +3325,25 @@ def chat_resume(req: ResumeChatRequest, user_id: str = Depends(get_current_user)
     clear_cancel(req.thread_id)
 
     try:
+        # Resolve which context-management profile applies to this turn.
+        # Order: one-off body > saved id > legacy strategy > session
+        # override > user default > built-in `minimal`.
+        from context_profiles import resolve_profile  # lazy
+
+        with app.state.pool.connection() as _conn:
+            _profile, _profile_name = resolve_profile(
+                _conn,
+                user_id=user_id,
+                session_id=req.session_id,
+                request_profile_id=req.context_profile_id,
+                request_profile_body=req.context_profile,
+                legacy_strategy=req.context_strategy,
+            )
         agent = _get_agent_for_request(
-            req.model, user_id, req.context_strategy, session_id=req.session_id
+            req.model,
+            user_id,
+            session_id=req.session_id,
+            profile=_profile,
         )
 
         # Recover session mode + workspace state to rebuild the same config.
@@ -2962,6 +3387,43 @@ def chat_resume(req: ResumeChatRequest, user_id: str = Depends(get_current_user)
             ],
             "configurable": configurable,
         }
+
+        # PR #3: same context-editing pass as /chat. The user might have
+        # spent several turns under this conversation since the last
+        # resume, so a long-running approval flow still benefits.
+        try:
+            from context_editing import apply_context_edits  # lazy
+
+            def _log_edit(edit_type, turn_index, freed_tokens, details):
+                with app.state.pool.connection() as _ec:
+                    _record_context_event(
+                        _ec,
+                        user_id=user_id,
+                        session_id=req.session_id,
+                        thread_id=req.thread_id,
+                        turn_index=turn_index,
+                        edit_type=edit_type,
+                        freed_tokens=freed_tokens,
+                        details=details,
+                    )
+
+            # Re-resolve the active chat model so the summariser step
+            # (PR #5) has something to call. _resolve_chat_model is LRU-
+            # cached, so the second call this turn is free.
+            try:
+                _chat_model, _ = _resolve_chat_model(
+                    req.model, user_id, req.session_id
+                )
+            except Exception:
+                _chat_model = None
+            apply_context_edits(
+                agent, config, _profile,
+                chat_model=_chat_model,
+                record_event=_log_edit,
+                estimator=_estimate_tokens,
+            )
+        except Exception as _e:
+            print(f"[/chat/resume] context_editing failed: {_e!r}", flush=True)
 
         pre_state = agent.get_state(config)
         pre_count = len(

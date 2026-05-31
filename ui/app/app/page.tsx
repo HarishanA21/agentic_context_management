@@ -9,6 +9,7 @@ import { supabase, authFetch, authToken } from '@/lib/supabase'
 import { useTheme } from '@/lib/theme'
 import { MCPInventoryPanel } from '@/components/mcp-inventory'
 import { StrategyDemoPanel } from '@/components/strategy-demo'
+import { ContextProfilesPanel } from '@/components/context-profiles'
 
 /* ─────────────────────────── types ─────────────────────────── */
 
@@ -236,6 +237,8 @@ export default function AppPage() {
   // in parallel and shows tokens / latency / tool-call counts side by
   // side. Same exclusivity model as MCPs.
   const [demoOpen, setDemoOpen] = useState(false)
+  // PR #8: context-profile manager panel. Opens in-place like MCPs/Demo.
+  const [contextProfilesOpen, setContextProfilesOpen] = useState(false)
   const [projectModalOpen, setProjectModalOpen] = useState(false)
 
   // Per-row "⋯" menu — keyed by `${kind}:${id}` so chats and threads don't collide
@@ -337,6 +340,21 @@ export default function AppPage() {
   >([])
   const [defaultStrategy, setDefaultStrategy] = useState<string>('tool_calling')
   const [selectedStrategy, setSelectedStrategy] = useState<string>('')
+  // PR #8: context-management profile picker (richer than the strategy
+  // string — bundles tool surface + per-technique toggles). When a
+  // profile id is set we send it as context_profile_id on /chat; the
+  // backend's resolve_profile then prefers it over context_strategy.
+  const [profiles, setProfiles] = useState<
+    {
+      id: string
+      name: string
+      built_in: boolean
+      summary: string | null
+      is_default: boolean
+      body: any
+    }[]
+  >([])
+  const [selectedProfileId, setSelectedProfileId] = useState<string>('')
   const composerMenuRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const photoInputRef = useRef<HTMLInputElement>(null)
@@ -362,6 +380,7 @@ export default function AppPage() {
       loadGithubStatus()
       loadModels()
       loadStrategies()
+      loadProfiles()
       loadProviders()
     })
     const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
@@ -947,6 +966,31 @@ export default function AppPage() {
       // Non-critical — backend's DEFAULT_CONTEXT_STRATEGY wins if we can't reach this.
     }
   }
+  async function loadProfiles() {
+    try {
+      const r = await authFetch('/api/context/profiles')
+      if (!r.ok) return
+      const data = await r.json()
+      const list = Array.isArray(data?.profiles) ? data.profiles : []
+      setProfiles(list)
+      // Pick initial: user default → saved localStorage choice → built-in `minimal`.
+      const saved =
+        typeof window !== 'undefined'
+          ? localStorage.getItem('selected_profile_id') || ''
+          : ''
+      const userDefault = list.find((p: any) => p.user_id && p.is_default)
+      const minimal = list.find((p: any) => p.built_in && p.name === 'minimal')
+      const initial =
+        (saved && list.some((p: any) => p.id === saved) && saved) ||
+        userDefault?.id ||
+        minimal?.id ||
+        list[0]?.id ||
+        ''
+      setSelectedProfileId(initial)
+    } catch {
+      // Non-critical — backend will fall back to the built-in `minimal`.
+    }
+  }
   async function loadGithubStatus() {
     try {
       const r = await authFetch('/api/github/status')
@@ -1123,6 +1167,7 @@ export default function AppPage() {
           reason,
           model: selectedModel || undefined,
           context_strategy: selectedStrategy || undefined,
+          context_profile_id: selectedProfileId || undefined,
         }),
       })
       if (!r.ok) {
@@ -1368,6 +1413,7 @@ export default function AppPage() {
   async function selectThread(sid: string, tid: string) {
     setMcpsOpen(false)
     setDemoOpen(false)
+    setContextProfilesOpen(false)
     setActiveSession(sid)
     setActiveThread(tid)
     setMessages([])
@@ -1393,6 +1439,7 @@ export default function AppPage() {
   async function selectProject(sid: string) {
     setMcpsOpen(false)
     setDemoOpen(false)
+    setContextProfilesOpen(false)
     setActiveSession(sid)
     setActiveThread(null)
     setMessages([])
@@ -1496,6 +1543,7 @@ export default function AppPage() {
         attached_files: attachedFiles,
         model: selectedModel || undefined,
         context_strategy: selectedStrategy || undefined,
+        context_profile_id: selectedProfileId || undefined,
       }),
     })
       .then(async (r) => {
@@ -2046,15 +2094,49 @@ export default function AppPage() {
           </div>
         </div>
 
+        {/* PR #8: context profiles entry — bundles tool surface +
+            context-management toggles. Sits above Strategy Demo so
+            users land on it before running comparisons. */}
+        <div className="px-3 pt-2">
+          <button
+            onClick={() =>
+              setContextProfilesOpen((v) => {
+                const next = !v
+                if (next) {
+                  setDemoOpen(false)
+                  setMcpsOpen(false)
+                }
+                return next
+              })
+            }
+            aria-pressed={contextProfilesOpen}
+            className={`w-full flex items-center gap-3 px-2 py-2 rounded-md transition ${
+              contextProfilesOpen
+                ? 'bg-soft/[0.08] text-fog-50'
+                : 'hover:bg-soft/[0.04] text-fog-200'
+            }`}
+          >
+            <span className="w-7 h-7 rounded-md bg-soft/10 text-accent flex items-center justify-center">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M4 6h12M4 10h16M4 14h10M4 18h14" />
+              </svg>
+            </span>
+            <span className="text-sm flex-1 text-left">Context Profiles</span>
+          </button>
+        </div>
+
         {/* Strategy demo entry — runs both context-management strategies
             in parallel for the same prompt and shows token / latency /
             tool-call comparison. Sits above MCP Inventory. */}
-        <div className="px-3 pt-2">
+        <div className="px-3 pt-1">
           <button
             onClick={() =>
               setDemoOpen((v) => {
                 const next = !v
-                if (next) setMcpsOpen(false)
+                if (next) {
+                  setMcpsOpen(false)
+                  setContextProfilesOpen(false)
+                }
                 return next
               })
             }
@@ -2083,7 +2165,10 @@ export default function AppPage() {
             onClick={() =>
               setMcpsOpen((v) => {
                 const next = !v
-                if (next) setDemoOpen(false)
+                if (next) {
+                  setDemoOpen(false)
+                  setContextProfilesOpen(false)
+                }
                 return next
               })
             }
@@ -2167,7 +2252,18 @@ export default function AppPage() {
 
       {/* ────── Main ────── */}
       <main className="flex-1 flex flex-col min-w-0">
-        {demoOpen ? (
+        {contextProfilesOpen ? (
+          <ContextProfilesPanel
+            onPickProfile={(id) => {
+              setSelectedProfileId(id)
+              if (typeof window !== 'undefined') {
+                localStorage.setItem('selected_profile_id', id)
+              }
+              setContextProfilesOpen(false)
+            }}
+            onListChanged={() => loadProfiles()}
+          />
+        ) : demoOpen ? (
           <StrategyDemoPanel />
         ) : mcpsOpen ? (
           <MCPInventoryPanel embedded />
@@ -2232,16 +2328,34 @@ export default function AppPage() {
                 onChange={(m) => updateSessionMode(activeSessionObj.id, m)}
               />
             )}
-            <StrategyToggle
-              value={selectedStrategy || defaultStrategy}
-              strategies={strategies}
-              onChange={(id) => {
-                setSelectedStrategy(id)
-                if (typeof window !== 'undefined') {
-                  localStorage.setItem('selected_strategy', id)
-                }
-              }}
-            />
+            {profiles.length > 0 ? (
+              <ProfilePicker
+                value={selectedProfileId}
+                profiles={profiles}
+                onChange={(id) => {
+                  setSelectedProfileId(id)
+                  if (typeof window !== 'undefined') {
+                    localStorage.setItem('selected_profile_id', id)
+                  }
+                }}
+                onOpenManager={() => {
+                  setMcpsOpen(false)
+                  setDemoOpen(false)
+                  setContextProfilesOpen(true)
+                }}
+              />
+            ) : (
+              <StrategyToggle
+                value={selectedStrategy || defaultStrategy}
+                strategies={strategies}
+                onChange={(id) => {
+                  setSelectedStrategy(id)
+                  if (typeof window !== 'undefined') {
+                    localStorage.setItem('selected_strategy', id)
+                  }
+                }}
+              />
+            )}
             {providers.length > 0 ? (
               <div className="chip flex items-center gap-2 pr-1" title="LLM provider for this session">
                 <span className="dot bg-emerald-400" />
@@ -3289,6 +3403,75 @@ function ViewToggle({
 }
 
 /* ─────────────────────────── mode toggle (Auto / Confirm) ────────────────── */
+
+/* PR #8: profile picker — dropdown over the user's saved + built-in
+ * context-management profiles. Replaces StrategyToggle in the header.
+ * Each entry is one bundle of (tool surface + technique toggles); the
+ * tooltip shows which techniques are on so the user can scan at a
+ * glance. */
+function ProfilePicker({
+  value,
+  profiles,
+  onChange,
+  onOpenManager,
+}: {
+  value: string
+  profiles: {
+    id: string
+    name: string
+    built_in: boolean
+    summary: string | null
+    is_default: boolean
+    body: any
+  }[]
+  onChange: (id: string) => void
+  onOpenManager: () => void
+}) {
+  const current = profiles.find((p) => p.id === value)
+  function describe(p: any): string {
+    const cm = p.body?.context_management ?? {}
+    const on: string[] = []
+    if (cm.tool_result_trimming?.enabled) on.push('trim')
+    if (cm.summarization?.enabled) on.push('summarise')
+    if (cm.memory?.enabled) on.push('memory')
+    if (cm.subagent?.enabled) on.push('subagent')
+    if (cm.sliding_window?.enabled) on.push('sliding')
+    return on.length ? `${p.body?.tool_surface} · ${on.join(' · ')}` : p.body?.tool_surface
+  }
+  return (
+    <div
+      className="chip flex items-center gap-2 pr-1"
+      title={
+        current
+          ? `${current.name}: ${current.summary ?? describe(current)}`
+          : 'Context-management profile (bundle of tool surface + edit toggles)'
+      }
+    >
+      <span className="dot bg-emerald-400" />
+      <select
+        value={value}
+        onChange={(e) => {
+          if (e.target.value === '__manage__') {
+            onOpenManager()
+            return
+          }
+          onChange(e.target.value)
+        }}
+        className="bg-transparent text-xs text-fog-50 outline-none max-w-[16rem] truncate"
+      >
+        {profiles.map((p) => (
+          <option key={p.id} value={p.id} className="bg-ink-200 text-fog-50">
+            {p.name}{p.is_default ? ' ★' : ''}
+          </option>
+        ))}
+        <option disabled className="bg-ink-200 text-fog-500">──────────</option>
+        <option value="__manage__" className="bg-ink-200 text-fog-50">
+          Manage profiles…
+        </option>
+      </select>
+    </div>
+  )
+}
 
 function StrategyToggle({
   value,
@@ -5332,6 +5515,19 @@ function ContextViewer({
                 </div>
               </section>
 
+              {/* Per-turn token trajectory (PR #0) */}
+              <TrajectorySection
+                trajectory={data.trajectory || []}
+                fmtTokenCount={fmtTokenCount}
+              />
+
+              {/* Applied context edits (PR #0) — empty until a
+                  context-management strategy actually fires. */}
+              <AppliedEditsSection
+                edits={data.applied_edits || []}
+                fmtTokenCount={fmtTokenCount}
+              />
+
               {/* System prompt */}
               <section>
                 <button
@@ -5395,6 +5591,201 @@ function ContextViewer({
         </div>
       </aside>
     </div>
+  )
+}
+
+/* ────────── PR #0: trajectory sparkline + applied-edits list ──────────
+ *
+ * Both panels read straight off the `/context` payload — no extra
+ * round trip. They stay visible (with an empty-state hint) when no
+ * data is present yet, so a user opening the panel before any
+ * context-management strategy has fired still sees where these views
+ * live. Future strategy PRs (B1/B2/B6/B4) populate them by calling
+ * `_record_context_event(...)` on the backend.
+ */
+
+type TrajectoryPoint = {
+  turn: number
+  input_tokens: number
+  output_tokens: number
+  turn_tokens: number
+  cumulative_tokens: number
+  messages: number
+}
+
+type AppliedEdit = {
+  id: number
+  turn: number
+  type: string
+  freed_tokens: number
+  details: any
+  at: string | null
+}
+
+const EDIT_TYPE_LABEL: Record<string, { label: string; icon: string }> = {
+  tool_result_trimming: { label: 'Tool-result trimming', icon: '↺' },
+  summarization: { label: 'Summarisation', icon: '📝' },
+  sliding_window: { label: 'Sliding window', icon: '✂️' },
+  subagent_call: { label: 'Sub-agent dispatch', icon: '🧠' },
+  memory_write: { label: 'Memory write', icon: '💾' },
+  memory_read: { label: 'Memory read', icon: '🗂️' },
+}
+
+function TrajectorySection({
+  trajectory,
+  fmtTokenCount,
+}: {
+  trajectory: TrajectoryPoint[]
+  fmtTokenCount: (n: number) => string
+}) {
+  // Geometry. Width grows linearly with the turn count so very long
+  // conversations still get a useful sparkline; height stays fixed.
+  const W = Math.max(220, trajectory.length * 24)
+  const H = 60
+  const PAD = 4
+
+  const max = Math.max(1, ...trajectory.map((t) => t.cumulative_tokens))
+  const points = trajectory.map((t, i) => {
+    const x =
+      trajectory.length === 1
+        ? W / 2
+        : PAD + (i * (W - PAD * 2)) / (trajectory.length - 1)
+    const y = H - PAD - ((H - PAD * 2) * t.cumulative_tokens) / max
+    return { x, y, t }
+  })
+  const path = points
+    .map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`)
+    .join(' ')
+  const areaPath =
+    points.length > 0
+      ? `${path} L ${points[points.length - 1].x.toFixed(1)} ${H - PAD} L ${
+          points[0].x.toFixed(1)
+        } ${H - PAD} Z`
+      : ''
+
+  const lastTurn = trajectory[trajectory.length - 1]
+  const firstTurn = trajectory[0]
+
+  return (
+    <section>
+      <div className="flex items-baseline justify-between mb-2">
+        <span className="text-[11px] uppercase tracking-widest text-fog-500">
+          Per-turn trajectory · {trajectory.length} turn
+          {trajectory.length === 1 ? '' : 's'}
+        </span>
+        {lastTurn && (
+          <span className="text-[11px] text-fog-400">
+            peak {fmtTokenCount(lastTurn.cumulative_tokens)}
+          </span>
+        )}
+      </div>
+      {trajectory.length === 0 ? (
+        <div className="text-[12px] text-fog-500 bg-ink-300 border border-line rounded-md p-3">
+          No turns yet — send a message to start the trajectory.
+        </div>
+      ) : (
+        <div className="bg-ink-300 border border-line rounded-md p-2 overflow-x-auto">
+          <svg
+            width={W}
+            height={H}
+            viewBox={`0 0 ${W} ${H}`}
+            className="block"
+            preserveAspectRatio="none"
+          >
+            {areaPath && (
+              <path d={areaPath} fill="currentColor" className="text-emerald-500/15" />
+            )}
+            <path
+              d={path}
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              className="text-emerald-400"
+            />
+            {points.map((p, i) => (
+              <g key={i}>
+                <circle
+                  cx={p.x}
+                  cy={p.y}
+                  r={2.5}
+                  className="fill-emerald-400"
+                />
+                <title>
+                  {`Turn ${p.t.turn} · +${p.t.turn_tokens} tok (cum ${p.t.cumulative_tokens})`}
+                </title>
+              </g>
+            ))}
+          </svg>
+          <div className="flex justify-between text-[10px] text-fog-500 px-1 mt-1">
+            <span>
+              turn {firstTurn?.turn} · {fmtTokenCount(firstTurn?.turn_tokens ?? 0)}
+            </span>
+            <span>
+              turn {lastTurn?.turn} · +{fmtTokenCount(lastTurn?.turn_tokens ?? 0)} this turn
+            </span>
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
+
+function AppliedEditsSection({
+  edits,
+  fmtTokenCount,
+}: {
+  edits: AppliedEdit[]
+  fmtTokenCount: (n: number) => string
+}) {
+  return (
+    <section>
+      <div className="text-[11px] uppercase tracking-widest text-fog-500 mb-2">
+        Applied context edits · {edits.length}
+      </div>
+      {edits.length === 0 ? (
+        <div className="text-[12px] text-fog-500 bg-ink-300 border border-line rounded-md p-3">
+          Nothing has been trimmed, summarised, or delegated yet. When a
+          context-management strategy fires (e.g. tool-result trimming
+          or summarisation), the action shows up here.
+        </div>
+      ) : (
+        <div className="space-y-1.5">
+          {edits.map((e) => {
+            const meta = EDIT_TYPE_LABEL[e.type] || { label: e.type, icon: '•' }
+            const detail =
+              typeof e.details === 'string'
+                ? e.details
+                : e.details && typeof e.details === 'object'
+                  ? (e.details.note ||
+                      e.details.summary ||
+                      Object.keys(e.details).join(', '))
+                  : null
+            return (
+              <div
+                key={e.id}
+                className="text-[12px] bg-ink-300 border border-line rounded-md px-3 py-2"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-fog-100">
+                    <span className="mr-1.5">{meta.icon}</span>
+                    {meta.label}
+                  </span>
+                  <span className="text-fog-500 text-[10px] uppercase tracking-widest">
+                    turn {e.turn}
+                  </span>
+                </div>
+                <div className="text-fog-400 text-[11px] mt-0.5">
+                  {e.freed_tokens > 0
+                    ? `freed ${fmtTokenCount(e.freed_tokens)} tokens`
+                    : 'no tokens freed'}
+                  {detail ? ` · ${String(detail).slice(0, 80)}` : ''}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </section>
   )
 }
 
