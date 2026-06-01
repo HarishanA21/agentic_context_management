@@ -1,0 +1,39 @@
+{
+  "_comment": "Copy to acm.config.json (or point ACM_CONFIG at this file). Shape == backend/context_profiles.py Profile. Flip 'enabled' to turn a technique on. This example mirrors the 'long_chat' preset.",
+  "tool_surface": "tool_calling",
+  "context_management": {
+    "tool_result_trimming": {
+      "enabled": true,
+      "trigger_tokens": 20000,
+      "keep_recent": 4,
+      "exclude_tools": []
+    },
+    "summarization": {
+      "enabled": false,
+      "trigger_tokens": 50000,
+      "keep_recent": 6,
+      "summariser_model": null,
+      "instructions": null
+    },
+    "sliding_window": {
+      "enabled": false,
+      "keep_recent": 12
+    },
+    "image_recall": {
+      "mode": "off",
+      "keep_recent_images": 3,
+      "cache_ttl": "5m",
+      "evict_batch_turns": 1
+    },
+    "memory": { "enabled": false, "scope": "thread", "auto_view_at_start": true },
+    "subagent": { "enabled": false },
+    "jit_tools": { "enabled": false }
+  },
+  "visual_method": {
+    "_comment": "Gateway-only: rasterise large tool outputs into a PNG the model reads as an image, keeping URLs/citations as text. Independent of the Profile keys above.",
+    "enabled": false,
+    "trigger_tokens": 500,
+    "only_tools": [],
+    "exclude_tools": []
+  }
+}

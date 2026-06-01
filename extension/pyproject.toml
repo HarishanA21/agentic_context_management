@@ -1,0 +1,67 @@
+[project]
+name = "acm-context-management"
+version = "0.1.0"
+description = "Context-management gateway + MCP server that brings the ACM techniques (trimming, summarisation, image-recall, memory) into any IDE"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "ACM" }]
+keywords = ["llm", "context-management", "mcp", "gateway", "vscode", "cursor", "claude-code", "ides"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    # Web surface for the gateway
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "httpx>=0.27",
+    "pydantic>=2",
+    # The vendored engine (acm_engine/_vendor) imports these. cache_layout pulls
+    # the full `langchain` for AgentMiddleware; the rest need only langchain-core.
+    "langchain>=0.3",
+    "langchain-core>=0.3",
+    # Visual method — rasterising tool output to a PNG (vendored visual_tool).
+    "pillow>=10",
+    # MCP server (acm_mcp)
+    "mcp>=1.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/HarishanA21/agentic_context_management"
+Repository = "https://github.com/HarishanA21/agentic_context_management"
+
+[project.scripts]
+acm-gateway = "acm_gateway.__main__:main"
+acm-mcp = "acm_mcp.server:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "build", "twine"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# acm_engine ships its vendored engine (acm_engine/_vendor/*.py); those are not
+# importable submodules (no __init__) but are placed on sys.path at runtime by
+# acm_engine/__init__.py, so they must be force-included as data.
+packages = ["acm_engine", "acm_gateway", "acm_mcp"]
+artifacts = ["acm_engine/_vendor/*.py"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "acm_engine",
+    "acm_gateway",
+    "acm_mcp",
+    "config",
+    "scripts",
+    "README.md",
+    "PACKAGING.md",
+]

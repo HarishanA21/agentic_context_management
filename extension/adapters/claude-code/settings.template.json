@@ -1,0 +1,30 @@
+{
+  "_comment": "Copy the relevant blocks into ~/.claude/settings.json (or .claude/settings.json in a project). Replace <EXT> with the absolute path to the extension/ folder. The hooks shrink big tool outputs and auto-load memory; the mcpServers block registers the ACM tool buttons; env points Claude Code at the gateway for full-parity context editing.",
+
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8807"
+  },
+
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 <EXT>/adapters/claude-code/hooks/post_tool_use.py" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 <EXT>/adapters/claude-code/hooks/user_prompt_submit.py" }
+        ]
+      }
+    ]
+  },
+
+  "mcpServers": {
+    "acm": {
+      "command": "acm-mcp"
+    }
+  }
+}

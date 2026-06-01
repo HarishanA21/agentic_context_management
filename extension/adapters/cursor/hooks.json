@@ -1,0 +1,18 @@
+{
+  "_comment": "Copy to .cursor/hooks.json (project) or ~/.cursor/hooks.json (global). Replace <EXT> with the absolute path to the extension/ folder. These hooks capture the conversation + tool/file activity into local ACM memory; they never block the agent.",
+  "version": 1,
+  "hooks": {
+    "beforeSubmitPrompt": [
+      { "command": "python3 <EXT>/adapters/cursor/hooks/before_submit_prompt.py" }
+    ],
+    "beforeShellExecution": [
+      { "command": "python3 <EXT>/adapters/cursor/hooks/before_shell_execution.py" }
+    ],
+    "afterFileEdit": [
+      { "command": "python3 <EXT>/adapters/cursor/hooks/after_file_edit.py" }
+    ],
+    "stop": [
+      { "command": "python3 <EXT>/adapters/cursor/hooks/stop.py" }
+    ]
+  }
+}
