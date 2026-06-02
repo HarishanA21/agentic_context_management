@@ -29,3 +29,15 @@ uploads/
 
 current.md
 note.txt
+
+# Generated extension docs/plans — kept locally, not pushed
+/EXTENSION_PLAN.md
+/extension/PACKAGING.md
+/extension/PRIVATE_DEPLOY.md
+/extension/README.md
+/extension/TESTING.md
+/extension/adapters/claude-code/README.md
+/extension/adapters/cursor/README.md
+/extension/adapters/vscode/README.md
+/extension/adapters/vscode/CHANGELOG.md
+/extension/adapters/vscode/UI_PLAN.md
