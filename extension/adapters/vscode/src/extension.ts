@@ -1,13 +1,14 @@
-// ACM VSCode extension entry point. Wires three things into VSCode:
-//   1. Language Model Tools (registerTools) — callable by Copilot agent mode.
-//   2. Commands — open the settings panel, show status, recall memory.
-//   3. A simple @acm chat participant — status / recall / compact from chat.
+// ACM VSCode extension entry point. Wires in:
+//   1. The settings UI (React webview) in BOTH placements — a sidebar view and
+//      an editor-panel tab — sharing one bundle (see webview.ts).
+//   2. Language Model Tools (registerTools) — callable by Copilot agent mode.
+//   3. Commands + a simple @acm chat participant.
 // Everything talks to the local acm-gateway over HTTP (see acmClient.ts).
 
 import * as vscode from 'vscode';
 import { AcmClient } from './acmClient';
 import { registerTools } from './tools';
-import { SettingsPanel } from './settingsPanel';
+import { AcmViewProvider, openSettingsPanel } from './webview';
 
 function gatewayUrl(): string {
   return vscode.workspace.getConfiguration('acm').get<string>('gatewayUrl', 'http://127.0.0.1:8807');
@@ -20,8 +21,18 @@ function client(): AcmClient {
 export function activate(context: vscode.ExtensionContext): void {
   registerTools(context, client);
 
+  // Sidebar placement (Activity Bar -> "ACM" -> Context Management view).
   context.subscriptions.push(
-    vscode.commands.registerCommand('acm.openSettings', () => SettingsPanel.show(client())),
+    vscode.window.registerWebviewViewProvider(
+      'acm.sidebar',
+      new AcmViewProvider(context.extensionUri, client),
+    ),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('acm.openSettings', () =>
+      openSettingsPanel(context.extensionUri, client),
+    ),
     vscode.commands.registerCommand('acm.showStatus', async () => {
       try {
         const s = await client().status();
@@ -69,8 +80,8 @@ function registerChatParticipant(context: vscode.ExtensionContext): void {
         return;
       }
       stream.markdown(
-        'ACM helper. Try `@acm status`, `@acm recall <query>`, or reference the tools ' +
-          '`#acmRecall` / `#acmCompact` in agent mode.',
+        'ACM helper. Try `@acm status`, `@acm recall <query>`, or open the ' +
+          'sidebar / `ACM: Open Context-Management Settings` for the full UI.',
       );
     } catch (e) {
       stream.markdown(`⚠️ Can't reach the gateway: ${(e as Error).message}`);

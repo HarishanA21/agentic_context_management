@@ -41,6 +41,24 @@
         "title": "ACM: Recall Memory"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "acm",
+          "title": "ACM",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "acm": [
+        {
+          "id": "acm.sidebar",
+          "name": "Context Management",
+          "type": "webview"
+        }
+      ]
+    },
     "configuration": {
       "title": "ACM Context Management",
       "properties": {
@@ -132,12 +150,19 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
+    "build:host": "tsc -p ./",
+    "build:ui": "node esbuild.mjs",
+    "compile": "npm run build:host && npm run build:ui",
     "watch": "tsc -watch -p ./"
   },
   "devDependencies": {
     "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
     "@types/vscode": "^1.95.0",
+    "esbuild": "^0.23.0",
+    "react": "^18",
+    "react-dom": "^18",
     "typescript": "^5.5.0"
   }
 }

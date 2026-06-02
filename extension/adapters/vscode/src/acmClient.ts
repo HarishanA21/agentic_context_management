@@ -73,6 +73,10 @@ export class AcmClient {
     return this.request('POST', '/profile', { name });
   }
 
+  setProfileBody(body: Record<string, unknown>, visual_method?: unknown): Promise<{ ok: boolean }> {
+    return this.request('POST', '/profile', { body, visual_method });
+  }
+
   remember(text: string, scope = 'user'): Promise<{ ok: boolean; count: number }> {
     return this.request('POST', '/memory/remember', { text, scope });
   }
@@ -80,6 +84,10 @@ export class AcmClient {
   recall(query = '', scope = 'user', limit = 10): Promise<{ items: string[] }> {
     const q = `?query=${encodeURIComponent(query)}&scope=${encodeURIComponent(scope)}&limit=${limit}`;
     return this.request('GET', '/memory/recall' + q);
+  }
+
+  memoryClear(scope = 'user'): Promise<{ ok: boolean }> {
+    return this.request('POST', '/memory/clear', { scope });
   }
 
   compact(text: string): Promise<{ summary: string }> {
@@ -110,6 +118,14 @@ export class AcmClient {
 
   setDefaultProvider(slug: string): Promise<{ ok: boolean }> {
     return this.request('POST', `/providers/${encodeURIComponent(slug)}/default`);
+  }
+
+  upsertProvider(cfg: Record<string, unknown>): Promise<{ ok: boolean }> {
+    return this.request('POST', '/providers', cfg);
+  }
+
+  deleteProvider(slug: string): Promise<{ ok: boolean }> {
+    return this.request('DELETE', `/providers/${encodeURIComponent(slug)}`);
   }
 }
 

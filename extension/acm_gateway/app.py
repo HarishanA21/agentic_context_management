@@ -250,10 +250,12 @@ async def subagent(request: Request) -> Any:
 
 @app.get("/profile")
 def get_profile() -> Dict[str, Any]:
-    """Active profile + the built-in presets, for the settings panel."""
+    """Active profile + the gateway-only visual_method block + built-in presets,
+    for the settings UI."""
     profile = load_profile(active_config_path())
     return {
         "active": profile.model_dump(),
+        "visual_method": load_visual_cfg(active_config_path()),
         "config_path": str(active_config_path()),
         "presets": [
             {
@@ -268,8 +270,10 @@ def get_profile() -> Dict[str, Any]:
 
 @app.post("/profile")
 async def set_profile(request: Request) -> Any:
-    """Set the active profile. Body is either ``{"name": "<preset>"}`` or
-    ``{"body": {<full Profile dict>}}``. Always writes the user config copy."""
+    """Set the active profile. Body is ``{"name": "<preset>"}`` or
+    ``{"body": {<full Profile dict>}}``, plus an optional ``"visual_method"``
+    block (the gateway-only axis). Always writes the user config copy and
+    preserves any existing ``visual_method`` unless a new one is supplied."""
     body: Dict[str, Any] = await request.json()
     name = body.get("name")
     if name:
@@ -278,7 +282,7 @@ async def set_profile(request: Request) -> Any:
             return JSONResponse(
                 {"error": f"unknown preset '{name}'"}, status_code=400
             )
-        new_body = preset["body"]
+        new_body = dict(preset["body"])
     elif body.get("body"):
         try:
             new_body = parse_profile(body["body"]).model_dump()
@@ -288,10 +292,18 @@ async def set_profile(request: Request) -> Any:
         return JSONResponse(
             {"error": "provide 'name' or 'body'"}, status_code=400
         )
+    # Preserve / update the visual_method block (it isn't part of the Profile).
+    visual = body.get("visual_method")
+    if visual is None:
+        visual = load_visual_cfg(active_config_path())
+    new_body["visual_method"] = visual
+
     path = user_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(new_body, indent=2))
-    return JSONResponse({"ok": True, "active": new_body, "config_path": str(path)})
+    return JSONResponse(
+        {"ok": True, "active": new_body, "visual_method": visual, "config_path": str(path)}
+    )
 
 
 @app.post("/memory/remember")
@@ -307,6 +319,13 @@ async def memory_remember(request: Request) -> Any:
 @app.get("/memory/recall")
 def memory_recall(query: str = "", scope: str = "user", limit: int = 10) -> Dict[str, Any]:
     return {"items": _MEMORY.recall(query, scope=scope, limit=limit)}
+
+
+@app.post("/memory/clear")
+async def memory_clear(request: Request) -> Any:
+    body: Dict[str, Any] = await request.json()
+    _MEMORY.clear(scope=body.get("scope", "user"))
+    return JSONResponse({"ok": True})
 
 
 # ─── manual message removal (drop-list) ──────────────────────────────────

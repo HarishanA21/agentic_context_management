@@ -2,6 +2,9 @@
 src/**
 node_modules/**
 tsconfig.json
+tsconfig.ui.json
+esbuild.mjs
+UI_PLAN.md
 .gitignore
 **/*.map
 **/*.ts
