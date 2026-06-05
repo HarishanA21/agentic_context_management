@@ -366,6 +366,48 @@ def _fetch_enabled_mcp_rows(user_id: str) -> List[Dict[str, Any]]:
         return []
 
 
+def _fetch_enabled_skill_rows(user_id: str) -> List[Dict[str, Any]]:
+    """Pull the user's enabled skills (catalog + custom) as plain dicts.
+
+    Catalog rows carry only ``catalog_slug`` + ``enabled``; their content is
+    resolved from ``skills_catalog.CATALOG`` at prompt-build time. Custom rows
+    carry their own name/description/instructions. Returns [] on DB hiccups —
+    the agent still runs with no skills folded in.
+    """
+    try:
+        with app.state.pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT catalog_slug, is_custom, name, description, instructions
+                  FROM skills
+                 WHERE user_id = %s AND enabled = TRUE
+                 ORDER BY is_custom, created_at
+                """,
+                (user_id,),
+            ).fetchall()
+        cols = ["catalog_slug", "is_custom", "name", "description", "instructions"]
+        return [dict(zip(cols, r)) for r in rows]
+    except Exception as e:
+        print(f"[skills] _fetch_enabled_skill_rows failed: {e!r}", flush=True)
+        return []
+
+
+def _fetch_enabled_plugin_slugs(user_id: str) -> List[str]:
+    """Return the slugs of plugins the user has enabled. Each maps to one or
+    more real tools added to the agent's toolbox. [] on DB hiccups."""
+    try:
+        with app.state.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT catalog_slug FROM plugins "
+                "WHERE user_id = %s AND enabled = TRUE",
+                (user_id,),
+            ).fetchall()
+        return [r[0] for r in rows]
+    except Exception as e:
+        print(f"[plugins] _fetch_enabled_plugin_slugs failed: {e!r}", flush=True)
+        return []
+
+
 async def _collect_mcp_tools_async(user_id: str):
     """Async half of the agent builder — opens MCP sessions briefly to
     discover tools. Tools are bound to connection specs and re-open
@@ -424,7 +466,14 @@ def _get_agent_for_request(
     chat_model, model_key = _resolve_chat_model(model_name, user_id, session_id)
 
     mcp_tools = asyncio.run(_collect_mcp_tools_async(user_id))
-    real_tools = list(all_tools) + list(mcp_tools)
+    # Plugins (user-added capabilities): each enabled plugin contributes one or
+    # more real tools to the agent's toolbox. They join MCP + built-in tools and
+    # feed the fingerprint below, so enabling/disabling a plugin rebuilds the
+    # cached agent automatically.
+    from plugins_catalog import build_plugin_tools  # lazy import
+
+    plugin_tools = build_plugin_tools(_fetch_enabled_plugin_slugs(user_id))
+    real_tools = list(all_tools) + list(mcp_tools) + list(plugin_tools)
     real_fingerprint = ",".join(sorted(t.name for t in real_tools))
 
     if surface == "ts_code_mode":
@@ -474,14 +523,25 @@ def _get_agent_for_request(
             )
         ]
 
+    # Skills (claude.ai-style): fold each enabled skill's instructions into
+    # the system prompt. The rider is hashed into the cache key below, so
+    # toggling or editing a skill yields a fresh agent without touching
+    # unrelated users' cached ones — same mechanism MCP changes ride on.
+    import hashlib
+
+    from skills_catalog import build_skills_prompt  # lazy import
+
+    skills_rider = build_skills_prompt(_fetch_enabled_skill_rows(user_id))
+    if skills_rider:
+        system_prompt = system_prompt + skills_rider
+    skills_fp = hashlib.sha1(skills_rider.encode()).hexdigest()[:12]
+
     # Cache key includes the profile fingerprint (covers tool_surface +
     # every technique toggle). Two profiles with identical bodies share
     # an agent; flipping any toggle invalidates without disturbing
     # unrelated users' cached agents.
-    import hashlib
-
     profile_hash = hashlib.sha1(profile_fp.encode()).hexdigest()[:12]
-    key = f"{model_key}::{user_id}::{profile_hash}::{real_fingerprint}"
+    key = f"{model_key}::{user_id}::{profile_hash}::{skills_fp}::{real_fingerprint}"
     with _agent_cache_lock:
         if key in _agent_cache:
             return _agent_cache[key]
@@ -767,6 +827,55 @@ async def lifespan(app: FastAPI):
             "REFERENCES context_profiles(id) ON DELETE SET NULL"
         )
 
+        # Skills — toggleable instruction bundles folded into the agent's
+        # system prompt (claude.ai-style). Catalog skills carry only a slug +
+        # enabled flag (content lives in skills_catalog.py); custom skills
+        # carry their own name/description/instructions. Matches db/init.sql.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS skills (
+                id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id       uuid NOT NULL,
+                catalog_slug  text,
+                is_custom     boolean NOT NULL DEFAULT false,
+                name          text NOT NULL,
+                description   text NOT NULL DEFAULT '',
+                instructions  text NOT NULL DEFAULT '',
+                enabled       boolean NOT NULL DEFAULT false,
+                created_at    timestamptz NOT NULL DEFAULT now(),
+                updated_at    timestamptz NOT NULL DEFAULT now(),
+                UNIQUE (user_id, catalog_slug)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_skills_user ON skills(user_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_skills_user_enabled "
+            "ON skills(user_id) WHERE enabled"
+        )
+
+        # Plugins — per-user enabled state for code-defined plugins. Each
+        # enabled plugin adds real tools to the agent (see plugins_catalog.py).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS plugins (
+                id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id       uuid NOT NULL,
+                catalog_slug  text NOT NULL,
+                enabled       boolean NOT NULL DEFAULT false,
+                created_at    timestamptz NOT NULL DEFAULT now(),
+                updated_at    timestamptz NOT NULL DEFAULT now(),
+                UNIQUE (user_id, catalog_slug)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_plugins_user_enabled "
+            "ON plugins(user_id) WHERE enabled"
+        )
+
         # Seed the built-in context-management presets (minimal,
         # code_mode, long_chat, power_research, cheap_long). Idempotent:
         # the seeder updates existing built-in rows so adding a field
@@ -836,6 +945,12 @@ app.include_router(providers_router)
 
 from routes_context_profiles import router as context_profiles_router  # noqa: E402
 app.include_router(context_profiles_router)
+
+from routes_skills import router as skills_router  # noqa: E402
+app.include_router(skills_router)
+
+from routes_plugins import router as plugins_router  # noqa: E402
+app.include_router(plugins_router)
 
 
 def get_current_user(authorization: Optional[str] = Header(None)) -> str:

@@ -8,6 +8,11 @@ import remarkGfm from 'remark-gfm'
 import { supabase, authFetch, authToken } from '@/lib/supabase'
 import { useTheme } from '@/lib/theme'
 import { MCPInventoryPanel } from '@/components/mcp-inventory'
+import {
+  SkillsInventoryPanel,
+  SkillsComposerFlyout,
+} from '@/components/skills-inventory'
+import { PluginsInventoryPanel } from '@/components/plugins-inventory'
 import { StrategyDemoPanel } from '@/components/strategy-demo'
 import { ContextProfilesPanel } from '@/components/context-profiles'
 
@@ -239,6 +244,8 @@ export default function AppPage() {
   const [demoOpen, setDemoOpen] = useState(false)
   // PR #8: context-profile manager panel. Opens in-place like MCPs/Demo.
   const [contextProfilesOpen, setContextProfilesOpen] = useState(false)
+  // Skills manage panel — swaps into the main pane like MCPs/Demo.
+  const [skillsOpen, setSkillsOpen] = useState(false)
   const [projectModalOpen, setProjectModalOpen] = useState(false)
 
   // Per-row "⋯" menu — keyed by `${kind}:${id}` so chats and threads don't collide
@@ -314,6 +321,10 @@ export default function AppPage() {
   const [liveTokens, setLiveTokens] = useState('')
   // Composer "+" attach menu
   const [composerMenuOpen, setComposerMenuOpen] = useState(false)
+  // Skills quick-toggle flyout that opens to the side of the composer "+" menu.
+  const [skillsFlyoutOpen, setSkillsFlyoutOpen] = useState(false)
+  // Plugins manage page — swaps into the main pane like Skills/MCPs.
+  const [pluginsOpen, setPluginsOpen] = useState(false)
   const [uploading, setUploading] = useState(false)
   // Model picker
   const [models, setModels] = useState<
@@ -436,10 +447,14 @@ export default function AppPage() {
     function onClick(e: MouseEvent) {
       if (!composerMenuRef.current?.contains(e.target as Node)) {
         setComposerMenuOpen(false)
+        setSkillsFlyoutOpen(false)
       }
     }
     function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') setComposerMenuOpen(false)
+      if (e.key === 'Escape') {
+        setComposerMenuOpen(false)
+        setSkillsFlyoutOpen(false)
+      }
     }
     window.addEventListener('mousedown', onClick)
     window.addEventListener('keydown', onKey)
@@ -1414,6 +1429,8 @@ export default function AppPage() {
     setMcpsOpen(false)
     setDemoOpen(false)
     setContextProfilesOpen(false)
+    setSkillsOpen(false)
+    setPluginsOpen(false)
     setActiveSession(sid)
     setActiveThread(tid)
     setMessages([])
@@ -1440,6 +1457,8 @@ export default function AppPage() {
     setMcpsOpen(false)
     setDemoOpen(false)
     setContextProfilesOpen(false)
+    setSkillsOpen(false)
+    setPluginsOpen(false)
     setActiveSession(sid)
     setActiveThread(null)
     setMessages([])
@@ -2105,6 +2124,8 @@ export default function AppPage() {
                 if (next) {
                   setDemoOpen(false)
                   setMcpsOpen(false)
+                  setSkillsOpen(false)
+                  setPluginsOpen(false)
                 }
                 return next
               })
@@ -2136,6 +2157,8 @@ export default function AppPage() {
                 if (next) {
                   setMcpsOpen(false)
                   setContextProfilesOpen(false)
+                  setSkillsOpen(false)
+                  setPluginsOpen(false)
                 }
                 return next
               })
@@ -2168,6 +2191,8 @@ export default function AppPage() {
                 if (next) {
                   setDemoOpen(false)
                   setContextProfilesOpen(false)
+                  setSkillsOpen(false)
+                  setPluginsOpen(false)
                 }
                 return next
               })
@@ -2186,6 +2211,70 @@ export default function AppPage() {
               </svg>
             </span>
             <span className="text-sm flex-1 text-left">MCP Inventory</span>
+          </button>
+        </div>
+
+        {/* Skills entry — toggleable instruction bundles. Swaps the manage
+            panel into the main pane, same exclusivity model as MCPs/Demo. */}
+        <div className="px-3 pt-1">
+          <button
+            onClick={() =>
+              setSkillsOpen((v) => {
+                const next = !v
+                if (next) {
+                  setMcpsOpen(false)
+                  setDemoOpen(false)
+                  setContextProfilesOpen(false)
+                  setPluginsOpen(false)
+                }
+                return next
+              })
+            }
+            aria-pressed={skillsOpen}
+            className={`w-full flex items-center gap-3 px-2 py-2 rounded-md transition ${
+              skillsOpen
+                ? 'bg-soft/[0.08] text-fog-50'
+                : 'hover:bg-soft/[0.04] text-fog-200'
+            }`}
+          >
+            <span className="w-7 h-7 rounded-md bg-soft/10 text-accent flex items-center justify-center">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 3l2.4 5.6L20 10l-4.5 3.9L17 20l-5-3-5 3 1.5-6.1L4 10l5.6-1.4z" />
+              </svg>
+            </span>
+            <span className="text-sm flex-1 text-left">Skills</span>
+          </button>
+        </div>
+
+        {/* Plugins entry — code-defined tools the agent can call. Swaps the
+            manage page into the main pane, same exclusivity model as Skills. */}
+        <div className="px-3 pt-1">
+          <button
+            onClick={() =>
+              setPluginsOpen((v) => {
+                const next = !v
+                if (next) {
+                  setMcpsOpen(false)
+                  setDemoOpen(false)
+                  setContextProfilesOpen(false)
+                  setSkillsOpen(false)
+                }
+                return next
+              })
+            }
+            aria-pressed={pluginsOpen}
+            className={`w-full flex items-center gap-3 px-2 py-2 rounded-md transition ${
+              pluginsOpen
+                ? 'bg-soft/[0.08] text-fog-50'
+                : 'hover:bg-soft/[0.04] text-fog-200'
+            }`}
+          >
+            <span className="w-7 h-7 rounded-md bg-soft/10 text-accent flex items-center justify-center">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 2a3 3 0 0 1 3 3v2h2a2 2 0 0 1 2 2v3a3 3 0 0 1 0 6 2 2 0 0 1-2 2h-3v-2a3 3 0 0 0-6 0v2H5a2 2 0 0 1-2-2v-3a3 3 0 0 0 0-6V9a2 2 0 0 1 2-2h2V5a3 3 0 0 1 3-3z" />
+              </svg>
+            </span>
+            <span className="text-sm flex-1 text-left">Plugins</span>
           </button>
         </div>
 
@@ -2267,6 +2356,10 @@ export default function AppPage() {
           <StrategyDemoPanel />
         ) : mcpsOpen ? (
           <MCPInventoryPanel embedded />
+        ) : skillsOpen ? (
+          <SkillsInventoryPanel embedded />
+        ) : pluginsOpen ? (
+          <PluginsInventoryPanel embedded />
         ) : (
         <>
         {/* Top bar */}
@@ -2684,6 +2777,68 @@ export default function AppPage() {
                           <div className="text-fog-100">Upload photos</div>
                           <div className="text-[11px] text-fog-400">
                             Stored as project files
+                          </div>
+                        </div>
+                      </button>
+
+                      <div className="my-1 border-t border-line" />
+
+                      <button
+                        type="button"
+                        onClick={() => setSkillsFlyoutOpen((v) => !v)}
+                        aria-expanded={skillsFlyoutOpen}
+                        className={`w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5 ${
+                          skillsFlyoutOpen ? 'bg-soft/[0.06]' : ''
+                        }`}
+                      >
+                        <IconSkill />
+                        <div className="flex-1">
+                          <div className="text-fog-100">Skills</div>
+                          <div className="text-[11px] text-fog-400">
+                            Turn specialist instructions on
+                          </div>
+                        </div>
+                        <span className="text-fog-400 text-xs">›</span>
+                      </button>
+
+                      {/* Quick-toggle flyout to the side, claude.ai-style.
+                          Nested in the menu's DOM so the outside-click guard
+                          still treats interactions here as "inside". */}
+                      {skillsFlyoutOpen && (
+                        <div className="absolute left-full bottom-0 ml-2">
+                          <SkillsComposerFlyout
+                            onManage={() => {
+                              setDemoOpen(false)
+                              setContextProfilesOpen(false)
+                              setMcpsOpen(false)
+                              setSkillsOpen(true)
+                            }}
+                            onClose={() => {
+                              setSkillsFlyoutOpen(false)
+                              setComposerMenuOpen(false)
+                            }}
+                          />
+                        </div>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setComposerMenuOpen(false)
+                          setSkillsFlyoutOpen(false)
+                          setDemoOpen(false)
+                          setContextProfilesOpen(false)
+                          setMcpsOpen(false)
+                          setSkillsOpen(false)
+                          setPluginsOpen(true)
+                        }}
+                        className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5"
+                      >
+                        <IconPlugin />
+                        <div className="flex-1">
+                          <div className="text-fog-100">Add plugins…</div>
+                          <div className="text-[11px] text-fog-400">
+                            Give the agent new tools
                           </div>
                         </div>
                       </button>
@@ -4828,6 +4983,26 @@ function IconChat({
         strokeWidth="1.7"
         strokeLinejoin="round"
       />
+    </svg>
+  )
+}
+function IconSkill() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+      <path
+        d="M12 3l2.4 5.6L20 10l-4.5 3.9L17 20l-5-3-5 3 1.5-6.1L4 10l5.6-1.4z"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+    </svg>
+  )
+}
+function IconPlugin() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 2a3 3 0 0 1 3 3v2h2a2 2 0 0 1 2 2v3a3 3 0 0 1 0 6 2 2 0 0 1-2 2h-3v-2a3 3 0 0 0-6 0v2H5a2 2 0 0 1-2-2v-3a3 3 0 0 0 0-6V9a2 2 0 0 1 2-2h2V5a3 3 0 0 1 3-3z" />
     </svg>
   )
 }

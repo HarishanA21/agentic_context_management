@@ -166,6 +166,53 @@ CREATE INDEX IF NOT EXISTS idx_mcp_servers_user_enabled
     ON mcp_servers(user_id) WHERE enabled;
 
 
+-- ── Skills ──────────────────────────────────────────────────────────────
+-- Toggleable instruction bundles folded into the agent's system prompt
+-- (claude.ai-style "+" → Skills). Two kinds:
+--   * catalog skill  — is_custom=false, catalog_slug set. The row only tracks
+--                       `enabled`; name/description/instructions live in code
+--                       (backend/skills_catalog.py) so edits auto-deploy.
+--   * custom skill    — is_custom=true, catalog_slug NULL. Carries its own
+--                       name/description/instructions authored by the user.
+-- Disabling a catalog skill keeps the row so the toggle state survives.
+CREATE TABLE IF NOT EXISTS skills (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id       uuid NOT NULL,
+    catalog_slug  text,
+    is_custom     boolean NOT NULL DEFAULT false,
+    name          text NOT NULL,
+    description   text NOT NULL DEFAULT '',
+    instructions  text NOT NULL DEFAULT '',
+    enabled       boolean NOT NULL DEFAULT false,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (user_id, catalog_slug)
+);
+
+CREATE INDEX IF NOT EXISTS idx_skills_user ON skills(user_id);
+CREATE INDEX IF NOT EXISTS idx_skills_user_enabled
+    ON skills(user_id) WHERE enabled;
+
+
+-- ── Plugins ─────────────────────────────────────────────────────────────
+-- Per-user enabled state for code-defined plugins. Each enabled plugin adds
+-- one or more real tools to the agent's toolbox (see backend/plugins_catalog.py
+-- and backend/plugin_tools.py). Plugins are not user-authored, so a row just
+-- tracks `enabled` for a catalog slug.
+CREATE TABLE IF NOT EXISTS plugins (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id       uuid NOT NULL,
+    catalog_slug  text NOT NULL,
+    enabled       boolean NOT NULL DEFAULT false,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (user_id, catalog_slug)
+);
+
+CREATE INDEX IF NOT EXISTS idx_plugins_user_enabled
+    ON plugins(user_id) WHERE enabled;
+
+
 -- ── LLM providers ───────────────────────────────────────────────────────
 -- Per-user multi-provider configs (OpenAI, Anthropic, Bedrock, etc.).
 -- Credentials are Fernet-encrypted JSON in `credentials_blob`. At most one
