@@ -106,7 +106,9 @@ function PluginGlyph({ icon }: { icon: string }) {
           ? 'M12 7v5l3 2M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z'
           : icon === 'hash'
             ? 'M4 9h16M4 15h16M10 3L8 21M16 3l-2 18'
-            : 'M16 18l6-6-6-6M8 6l-6 6 6 6'
+            : icon === 'terminal'
+              ? 'M4 4h16v16H4zM7 9l3 3-3 3M13 15h4'
+              : 'M16 18l6-6-6-6M8 6l-6 6 6 6'
   return (
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
       <path d={path} />

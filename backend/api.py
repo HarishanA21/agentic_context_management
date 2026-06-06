@@ -392,6 +392,70 @@ def _fetch_enabled_skill_rows(user_id: str) -> List[Dict[str, Any]]:
         return []
 
 
+def _apply_triggered_skills(
+    user_id: str, session_id: str, thread_id: str, names: List[str]
+) -> str:
+    """Apply skills for this turn — both "/"-forced and auto-matched. For each
+    resolved skill we (a) build a prompt block with its full instructions and
+    (b) record a `skill_used` display message so the timeline shows
+    "Skill: <name>" — persistent, just like a plugin/tool call.
+
+    Returns a directive string (or "" if none resolved) prepended to the turn's
+    message. Resolves any skill the user owns (built-in or custom), so a forced
+    skill works even when it isn't globally enabled.
+    """
+    # Custom-skill lookup by name for this user.
+    custom: Dict[str, str] = {}
+    try:
+        with app.state.pool.connection() as conn:
+            for nm, instr in conn.execute(
+                "SELECT name, instructions FROM skills "
+                "WHERE user_id = %s AND is_custom = TRUE",
+                (user_id,),
+            ).fetchall():
+                custom[nm] = instr or ""
+    except Exception as e:
+        print(f"[skills] custom lookup failed: {e!r}", flush=True)
+
+    from skills_catalog import resolve_skill_instructions_by_name  # lazy
+
+    blocks: List[str] = []
+    applied: List[str] = []
+    for name in names:
+        instructions = resolve_skill_instructions_by_name(name, custom)
+        if not instructions:
+            continue
+        blocks.append(f"## Skill: {name}\n{instructions.strip()}")
+        applied.append(name)
+
+    # Record a display message per applied skill so the UI shows it (live via
+    # the SSE the recorder emits, and in history on reload).
+    if applied:
+        try:
+            with app.state.pool.connection() as conn:
+                for name in applied:
+                    _record_message(
+                        conn,
+                        session_id,
+                        thread_id,
+                        user_id,
+                        "tool",
+                        name,
+                        tool_name="skill_used",
+                    )
+        except Exception as e:
+            print(f"[skills] record skill_used failed: {e!r}", flush=True)
+
+    if not blocks:
+        return ""
+    joined = "\n\n".join(blocks)
+    return (
+        "[The following skill(s) apply to this message and are already loaded — "
+        "follow their instructions exactly. Do NOT call read_skill for these; "
+        "you already have them.]\n\n" + joined
+    )
+
+
 def _fetch_enabled_plugin_slugs(user_id: str) -> List[str]:
     """Return the slugs of plugins the user has enabled. Each maps to one or
     more real tools added to the agent's toolbox. [] on DB hiccups."""
@@ -523,18 +587,33 @@ def _get_agent_for_request(
             )
         ]
 
-    # Skills (claude.ai-style): fold each enabled skill's instructions into
-    # the system prompt. The rider is hashed into the cache key below, so
-    # toggling or editing a skill yields a fresh agent without touching
-    # unrelated users' cached ones — same mechanism MCP changes ride on.
+    # Skills (progressive disclosure): the system prompt lists enabled skills as
+    # JSON (name + description only — no instructions). The model inspects that
+    # list and, when a skill matches the task, calls the `read_skill` tool to
+    # load its full instructions on demand — which also surfaces in the UI as a
+    # visible "Skill: <name>" step. The fingerprint hashes the manifest + the
+    # instructions so toggling/editing a skill rebuilds the cached agent.
+    # (The "/" menu remains an explicit override — see _apply_triggered_skills.)
     import hashlib
+    import json as _json
 
-    from skills_catalog import build_skills_prompt  # lazy import
+    from skills_catalog import (  # lazy import
+        build_skills_system_prompt,
+        skill_instructions_index,
+    )
 
-    skills_rider = build_skills_prompt(_fetch_enabled_skill_rows(user_id))
+    _skill_rows = _fetch_enabled_skill_rows(user_id)
+    skills_rider = build_skills_system_prompt(_skill_rows)
+    skill_index = skill_instructions_index(_skill_rows)
     if skills_rider:
         system_prompt = system_prompt + skills_rider
-    skills_fp = hashlib.sha1(skills_rider.encode()).hexdigest()[:12]
+    if skill_index:
+        from Tools.use_skill_tool import make_read_skill_tool  # lazy
+
+        agent_tools = list(agent_tools) + [make_read_skill_tool(skill_index)]
+    skills_fp = hashlib.sha1(
+        (skills_rider + _json.dumps(skill_index, sort_keys=True)).encode()
+    ).hexdigest()[:12]
 
     # Cache key includes the profile fingerprint (covers tool_surface +
     # every technique toggle). Two profiles with identical bodies share
@@ -629,6 +708,9 @@ class ChatRequest(BaseModel):
     # > user default > built-in `minimal`. See context_profiles.resolve_profile.
     context_profile_id: Optional[str] = None
     context_profile: Optional[Dict[str, Any]] = None
+    # Skills the user force-activated for THIS message via the "/" menu. These
+    # are applied for the turn regardless of whether they're globally enabled.
+    triggered_skills: List[str] = []
 
 
 class TitleRequest(BaseModel):
@@ -3147,6 +3229,31 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
                 f"{file_list}. Use read_project_file to read them before "
                 f"answering.]"
             )
+
+        # Apply skills for this turn: ones the user explicitly invoked via the
+        # "/" menu, PLUS any enabled skills whose description keywords match the
+        # message. The keyword match is a deterministic, server-side backstop:
+        # smaller models (e.g. gemini-2.0-flash) don't reliably call the
+        # read_skill tool, so we detect the relevant skill ourselves, inject its
+        # real instructions, and record a "Skill: <name>" row so the timeline
+        # always shows which skill was used — like a tool/sandbox step.
+        _auto_skills: list[str] = []
+        try:
+            from skills_catalog import match_skills  # lazy
+
+            _auto_skills = match_skills(
+                req.message, _fetch_enabled_skill_rows(user_id)
+            )
+        except Exception as e:
+            print(f"[skills] match failed: {e!r}", flush=True)
+        _all_skills = list(dict.fromkeys(list(req.triggered_skills) + _auto_skills))
+        if _all_skills:
+            _applied = _apply_triggered_skills(
+                user_id, req.session_id, req.thread_id, _all_skills
+            )
+            if _applied:
+                prefixes.append(_applied)
+
         llm_input = (
             "\n\n".join(prefixes + [req.message]) if prefixes else req.message
         )

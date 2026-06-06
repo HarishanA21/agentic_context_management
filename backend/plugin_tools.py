@@ -12,9 +12,12 @@ plugins_catalog.py.
 
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import json
+import os
+import platform
 import re
 import urllib.parse
 import uuid
@@ -310,4 +313,107 @@ def regex_test(pattern: str, text: str, ignore_case: bool = False) -> str:
         out.append(f"  {i}. '{m.group(0)}' at {m.start()}-{m.end()}{groups}")
     if len(matches) > 50:
         out.append(f"  … and {len(matches) - 50} more")
+    return "\n".join(out)
+
+
+# ── desktop-commander (read-only host system + file ops) ─────────────────────
+@tool
+def system_info() -> str:
+    """Report basic information about the machine the agent runs on:
+    operating system, Python version, CPU count, current directory, and free
+    disk space. Read-only."""
+    lines = [
+        f"OS: {platform.platform()}",
+        f"Python: {platform.python_version()}",
+        f"CPU cores: {os.cpu_count()}",
+        f"CWD: {os.getcwd()}",
+    ]
+    try:
+        import shutil
+
+        total, _used, free = shutil.disk_usage(os.getcwd())
+        gb = 1024 ** 3
+        lines.append(f"Disk (cwd): {free // gb} GB free of {total // gb} GB")
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
+@tool
+def list_directory(path: str = ".") -> str:
+    """List the files and folders in a directory on the host machine (read-only).
+
+    Args:
+        path: Directory path to list (default: the current directory). ``~`` is
+            expanded to the home directory.
+    """
+    try:
+        p = os.path.abspath(os.path.expanduser(path or "."))
+        if not os.path.isdir(p):
+            return f"Not a directory: {p}"
+        entries = sorted(os.listdir(p))
+        out = [f"{p}  ({len(entries)} entries)"]
+        for name in entries[:200]:
+            full = os.path.join(p, name)
+            is_dir = os.path.isdir(full)
+            try:
+                size = os.path.getsize(full) if not is_dir else 0
+            except OSError:
+                size = 0
+            label = "dir " if is_dir else "file"
+            suffix = f"  ({size} B)" if not is_dir else ""
+            out.append(f"  [{label}] {name}{suffix}")
+        if len(entries) > 200:
+            out.append(f"  … and {len(entries) - 200} more")
+        return "\n".join(out)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ── qodo-code-review (static Python review) ──────────────────────────────────
+@tool
+def review_python(code: str) -> str:
+    """Quick static review of a Python snippet.
+
+    Reports syntax validity, function/class counts, functions missing
+    docstrings, and overly long functions — a fast "shift-left" code review.
+
+    Args:
+        code: The Python source code to review.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return f"Syntax error on line {e.lineno}: {e.msg}"
+
+    funcs = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    classes = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+
+    issues = []
+    for fn in funcs:
+        if not ast.get_docstring(fn):
+            issues.append(
+                f"  - function '{fn.name}' (line {fn.lineno}) has no docstring"
+            )
+        last = max(
+            (getattr(n, "lineno", fn.lineno) for n in ast.walk(fn)),
+            default=fn.lineno,
+        )
+        span = last - fn.lineno
+        if span > 50:
+            issues.append(
+                f"  - function '{fn.name}' is long (~{span} lines); "
+                f"consider splitting it"
+            )
+
+    out = [f"Parsed OK — {len(funcs)} function(s), {len(classes)} class(es)."]
+    if issues:
+        out.append("Suggestions:")
+        out.extend(issues)
+    else:
+        out.append("No obvious issues found.")
     return "\n".join(out)

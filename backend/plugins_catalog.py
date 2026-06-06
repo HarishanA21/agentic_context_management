@@ -20,7 +20,10 @@ from plugin_tools import (
     fetch_url,
     generate_uuid,
     json_tool,
+    list_directory,
     regex_test,
+    review_python,
+    system_info,
     text_transform,
 )
 
@@ -112,6 +115,29 @@ CATALOG: List[Dict[str, Any]] = [
         "icon": "code",
         "tools": ["regex_test"],
     },
+    {
+        "slug": "desktop-commander",
+        "name": "Desktop Commander",
+        "publisher": "Desktop Commander",
+        "description": (
+            "Inspect the machine the agent runs on — system info and read-only "
+            "file/folder listing. Adds system_info and list_directory tools."
+        ),
+        "icon": "terminal",
+        "tools": ["system_info", "list_directory"],
+    },
+    {
+        "slug": "qodo-code-review",
+        "name": "Code Review",
+        "publisher": "Qodo.ai",
+        "description": (
+            "Shift-left code review — static analysis of a Python snippet for "
+            "syntax, missing docstrings, and overly long functions. Adds a "
+            "review_python tool."
+        ),
+        "icon": "code",
+        "tools": ["review_python"],
+    },
 ]
 
 # slug -> the actual tool objects the plugin contributes.
@@ -123,6 +149,8 @@ _TOOLS_BY_SLUG: Dict[str, list] = {
     "uuid-generator": [generate_uuid],
     "datetime": [datetime_tool],
     "regex-tester": [regex_test],
+    "desktop-commander": [system_info, list_directory],
+    "qodo-code-review": [review_python],
 }
 
 _CATALOG_BY_SLUG: Dict[str, Dict[str, Any]] = {e["slug"]: e for e in CATALOG}

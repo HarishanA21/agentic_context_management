@@ -23,6 +23,8 @@ The DB schema lives in ``db/init.sql`` and the idempotent lifespan migration in
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Any, Dict, List, Optional
 
 
@@ -530,10 +532,10 @@ def resolve_enabled_skill(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
 
 
 def build_skills_prompt(rows: List[Dict[str, Any]]) -> str:
-    """Render the system-prompt rider for a list of enabled skill rows.
-
-    Returns "" when nothing is enabled, so callers can unconditionally append
-    the result without growing the prompt for users who use no skills.
+    """(Legacy, eager) Fold every enabled skill's FULL instructions into the
+    system prompt. Superseded by the progressive-disclosure pair below
+    (``build_skills_manifest_prompt`` + ``use_skill`` tool), but kept for
+    reference / fallback.
     """
     resolved = [r for r in (resolve_enabled_skill(row) for row in rows) if r]
     if not resolved:
@@ -550,3 +552,161 @@ def build_skills_prompt(rows: List[Dict[str, Any]]) -> str:
         parts.append(skill["instructions"].rstrip())
         parts.append("\n")
     return "".join(parts)
+
+
+# ── Progressive disclosure ───────────────────────────────────────────────────
+# Instead of dumping every enabled skill's full instructions into the system
+# prompt, we list only their names + descriptions (cheap) and expose a
+# ``use_skill`` tool. The model calls that tool to load a skill's full
+# instructions on demand — which also surfaces in the UI as a visible step.
+
+
+def skill_manifest_entries(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """``[{name, description}]`` for a list of enabled skill rows (resolved)."""
+    out: List[Dict[str, str]] = []
+    for row in rows:
+        r = resolve_enabled_skill(row)
+        if r:
+            out.append({"name": r["name"], "description": r["description"]})
+    return out
+
+
+def build_skills_system_prompt(rows: List[Dict[str, Any]]) -> str:
+    """System-prompt rider listing the available skills as JSON (name +
+    description only, NO instructions) and instructing the model to call the
+    ``read_skill`` tool to load a skill's full instructions on demand.
+
+    Returns "" when nothing is enabled.
+    """
+    entries = skill_manifest_entries(rows)
+    if not entries:
+        return ""
+    manifest = json.dumps(
+        [{"name": e["name"], "description": e["description"]} for e in entries],
+        indent=2,
+        ensure_ascii=False,
+    )
+    return (
+        "\n\n"
+        "── AVAILABLE SKILLS ──\n"
+        "The following skills are available to you, given as JSON. Each entry "
+        "has a `name` and a `description` of WHEN to use it. You do NOT have "
+        "their instructions yet — only this list.\n"
+        "\n"
+        f"{manifest}\n"
+        "\n"
+        "For every user request, check this list against the task:\n"
+        "1. If a skill's description matches the task, your FIRST action MUST be "
+        "to call the `read_skill` tool with that skill's exact `name`. It "
+        "returns the skill's full instructions.\n"
+        "2. Then follow those instructions to complete the task. Do NOT perform "
+        "a skill's task from memory or improvise its format — you only have the "
+        "instructions after `read_skill` returns them.\n"
+        "3. If several skills match, call `read_skill` for each before starting. "
+        "If none match, just answer normally.\n"
+    )
+
+
+def skill_instructions_index(rows: List[Dict[str, Any]]) -> Dict[str, str]:
+    """``{skill_name: full_instructions}`` for enabled rows — the lookup the
+    ``use_skill`` tool resolves against."""
+    index: Dict[str, str] = {}
+    for row in rows:
+        r = resolve_enabled_skill(row)
+        if r:
+            index[r["name"]] = r["instructions"]
+    return index
+
+
+# ── Deterministic skill matching ─────────────────────────────────────────────
+# Smaller models don't reliably call the `use_skill` tool, so we also detect
+# which enabled skills are relevant to a message server-side (keyword match) and
+# apply them deterministically — injecting their instructions and emitting a
+# visible "Skill: <name>" UI event. Built-in skills use the curated triggers
+# below; custom skills derive keywords from their name + description.
+_TRIGGERS: Dict[str, List[str]] = {
+    "web-artifacts-builder": [
+        "app", "tool", "dashboard", "widget", "game", "calculator",
+        "interactive", "web page", "webpage", "demo", "counter", "timer",
+        "tracker", "form", "quiz",
+    ],
+    "skill-creator": ["skill", "new skill", "create a skill", "author a skill"],
+    "canvas-design": [
+        "design", "poster", "art", "artwork", "visual", "cover", "social",
+        "graphic", "post", "banner", "flyer", "illustration", "card", "logo",
+    ],
+    "mcp-builder": ["mcp", "model context protocol", "mcp server"],
+    "theme-factory": [
+        "theme", "restyle", "re-skin", "reskin", "styling", "color scheme",
+        "dark mode", "light mode", "look and feel",
+    ],
+    "brand-guidelines": [
+        "brand", "on-brand", "brand colors", "brand colours", "brand voice",
+        "brand guidelines",
+    ],
+    "doc-coauthoring": [
+        "document", "draft", "proposal", "spec", "readme", "article", "essay",
+        "co-write", "co-author", "write-up",
+    ],
+    "internal-comms": [
+        "announcement", "memo", "internal comms", "all-hands", "status update",
+        "incident note", "release note",
+    ],
+    "report-writer": [
+        "report", "summary", "analysis", "findings", "brief", "write up",
+    ],
+}
+
+_STOPWORDS = {
+    "the", "and", "for", "with", "your", "you", "use", "when", "user", "asks",
+    "create", "make", "that", "this", "from", "into", "their", "them", "they",
+    "skill", "task", "kind", "wants", "anything", "something", "other",
+}
+
+
+def _custom_triggers(name: str, description: str) -> List[str]:
+    words = re.findall(r"[a-z][a-z-]{3,}", f"{name} {description}".lower())
+    seen: List[str] = []
+    for w in words:
+        if w not in _STOPWORDS and w not in seen:
+            seen.append(w)
+    return seen[:12]
+
+
+def match_skills(message: str, rows: List[Dict[str, Any]]) -> List[str]:
+    """Return the names of enabled skills whose trigger keywords appear in the
+    message (word-boundary match). Deterministic and free — no LLM call."""
+    msg = (message or "").lower()
+    if not msg.strip():
+        return []
+    out: List[str] = []
+    for row in rows:
+        r = resolve_enabled_skill(row)
+        if not r:
+            continue
+        if row.get("is_custom"):
+            keywords = _custom_triggers(r["name"], r["description"])
+        else:
+            keywords = _TRIGGERS.get(row.get("catalog_slug") or "", [])
+        for kw in keywords:
+            if re.search(r"\b" + re.escape(kw) + r"\b", msg):
+                out.append(r["name"])
+                break
+    return out
+
+
+def resolve_skill_instructions_by_name(
+    name: str, custom_lookup: Optional[Dict[str, str]] = None
+) -> Optional[str]:
+    """Full instructions for a skill by name — built-in (from catalog) or a
+    custom skill supplied via ``custom_lookup`` ({name: instructions}).
+
+    Used by the ``/`` slash menu's force-activation path, which can invoke any
+    skill the user owns, not only the globally-enabled ones.
+    """
+    for entry in CATALOG:
+        if entry["name"] == name:
+            return entry["instructions"]
+    if custom_lookup and name in custom_lookup:
+        return custom_lookup[name]
+    return None

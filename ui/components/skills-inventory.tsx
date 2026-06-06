@@ -287,61 +287,33 @@ export function SkillsComposerFlyout({
   onManage: () => void
   onClose: () => void
 }) {
-  const { skills, loading, toggle, create } = useSkills()
+  const { create } = useSkills()
   const [adding, setAdding] = useState(false)
 
   return (
-    <div className="w-64 rounded-xl border border-lineStrong bg-ink-200 p-1 text-sm shadow-2xl shadow-black/60">
+    <div className="w-56 rounded-xl border border-lineStrong bg-ink-200 p-1 text-sm shadow-2xl shadow-black/60">
       <div className="px-3 pt-2 pb-1 text-[11px] uppercase tracking-wide text-fog-500">
         Skills
       </div>
-
-      <div className="max-h-64 overflow-y-auto py-1">
-        {loading ? (
-          <div className="px-3 py-3 text-[12px] text-fog-400">Loading…</div>
-        ) : skills.length === 0 ? (
-          <div className="px-3 py-3 text-[12px] text-fog-400">
-            No skills yet.
-          </div>
-        ) : (
-          skills.map((s) => (
-            <div
-              key={s.ref}
-              className="w-full px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5"
-            >
-              <span className="text-fog-300">
-                <SkillGlyph icon={s.icon} />
-              </span>
-              <div className="min-w-0 flex-1">
-                <div className="text-fog-100 truncate">{s.name}</div>
-              </div>
-              <Toggle on={s.enabled} onChange={(v) => toggle(s.ref, v)} />
-            </div>
-          ))
-        )}
-      </div>
-
-      <div className="border-t border-line mt-1 pt-1">
-        <button
-          type="button"
-          onClick={() => {
-            onClose()
-            onManage()
-          }}
-          className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5 text-fog-200"
-        >
-          <IconGear />
-          Manage skills
-        </button>
-        <button
-          type="button"
-          onClick={() => setAdding(true)}
-          className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5 text-fog-200"
-        >
-          <IconPlusSmall />
-          Add skill
-        </button>
-      </div>
+      <button
+        type="button"
+        onClick={() => {
+          onClose()
+          onManage()
+        }}
+        className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5 text-fog-200"
+      >
+        <IconGear />
+        Manage skills
+      </button>
+      <button
+        type="button"
+        onClick={() => setAdding(true)}
+        className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5 text-fog-200"
+      >
+        <IconPlusSmall />
+        Add skill
+      </button>
 
       {adding && (
         <SkillEditor

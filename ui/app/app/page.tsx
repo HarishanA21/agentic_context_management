@@ -323,6 +323,14 @@ export default function AppPage() {
   const [composerMenuOpen, setComposerMenuOpen] = useState(false)
   // Skills quick-toggle flyout that opens to the side of the composer "+" menu.
   const [skillsFlyoutOpen, setSkillsFlyoutOpen] = useState(false)
+  // "/" slash-menu: pick a skill to force-activate it for the next message.
+  const [slashMenuOpen, setSlashMenuOpen] = useState(false)
+  const [slashIndex, setSlashIndex] = useState(0)
+  const [skillList, setSkillList] = useState<
+    { name: string; description: string }[]
+  >([])
+  // Skills the user activated via "/" for the next message (names).
+  const [triggeredSkills, setTriggeredSkills] = useState<string[]>([])
   // Plugins manage page — swaps into the main pane like Skills/MCPs.
   const [pluginsOpen, setPluginsOpen] = useState(false)
   const [uploading, setUploading] = useState(false)
@@ -393,6 +401,7 @@ export default function AppPage() {
       loadStrategies()
       loadProfiles()
       loadProviders()
+      loadSkillList()
     })
     const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
       if (!session) router.replace('/login')
@@ -541,6 +550,10 @@ export default function AppPage() {
           // preview now that the canonical version is in `messages`.
           if (evt.role === 'assistant' && evt.content) {
             setLiveTokens('')
+            // Clear any forced-skill ("/") indicator rows for this turn.
+            setInflightTools((prev) =>
+              prev.filter((t) => t.tool_name !== 'skill_triggered'),
+            )
           }
           setMessages((prev) => mergeIncomingMessage(prev, evt))
           // Keep the floating ring's percentage in sync. Debounce so a
@@ -571,6 +584,23 @@ export default function AppPage() {
           // event was missed (e.g. tool errored without persisting).
           setInflightTools((prev) =>
             prev.filter((t) => t.run_id !== evt.run_id),
+          )
+        } else if (evt?.type === 'skill_triggered') {
+          // A skill the user force-activated via "/" was applied this turn —
+          // show it in the activity timeline like a tool/sandbox step.
+          setLlmThinking(false)
+          setInflightTools((prev) =>
+            prev.some((t) => t.run_id === `skill:${evt.skill_name}`)
+              ? prev
+              : [
+                  ...prev,
+                  {
+                    run_id: `skill:${evt.skill_name}`,
+                    tool_name: 'skill_triggered',
+                    args: { skill_name: evt.skill_name },
+                    started_at: Date.now(),
+                  },
+                ],
           )
         } else if (evt?.type === 'llm_started') {
           setLlmThinking(true)
@@ -883,6 +913,18 @@ export default function AppPage() {
   async function signOut() {
     await supabase.auth.signOut()
     router.replace('/login')
+  }
+  async function loadSkillList() {
+    try {
+      const r = await authFetch('/api/skills')
+      if (!r.ok) return
+      const list: any[] = await r.json()
+      setSkillList(
+        list.map((s) => ({ name: s.name, description: s.description || '' })),
+      )
+    } catch {
+      /* slash menu just stays empty */
+    }
   }
   async function loadSessions() {
     const r = await authFetch('/api/sessions')
@@ -1471,15 +1513,43 @@ export default function AppPage() {
     refreshFiles(sid)
   }
 
+  // "/" slash menu: skills matching the text typed after a leading "/".
+  function slashCandidates(): { name: string; description: string }[] {
+    if (!input.startsWith('/')) return []
+    const q = input.slice(1).toLowerCase().trim()
+    return skillList
+      .filter((s) => !triggeredSkills.includes(s.name))
+      .filter(
+        (s) =>
+          !q ||
+          s.name.toLowerCase().includes(q) ||
+          s.description.toLowerCase().includes(q),
+      )
+      .slice(0, 8)
+  }
+
+  function activateSkill(name: string) {
+    setTriggeredSkills((prev) =>
+      prev.includes(name) ? prev : [...prev, name],
+    )
+    setInput('')
+    setSlashMenuOpen(false)
+    setSlashIndex(0)
+    composerRef.current?.focus()
+  }
+
   async function send() {
     if (!input.trim() || !activeSession || !activeThread || sending) return
     const sid = activeSession
     const tid = activeThread
     const msg = input.trim()
     const filesToUpload = pendingFiles
+    const skillsToTrigger = triggeredSkills
     const isFirstMessage = messages.length === 0
     setInput('')
     setPendingFiles([])
+    setTriggeredSkills([])
+    setSlashMenuOpen(false)
     setSending(true)
     setMessages((prev) => [...prev, { role: 'user', content: msg }])
 
@@ -1560,6 +1630,7 @@ export default function AppPage() {
         thread_id: tid,
         message: msg,
         attached_files: attachedFiles,
+        triggered_skills: skillsToTrigger,
         model: selectedModel || undefined,
         context_strategy: selectedStrategy || undefined,
         context_profile_id: selectedProfileId || undefined,
@@ -2704,8 +2775,73 @@ export default function AppPage() {
                 e.preventDefault()
                 send()
               }}
-              className="rounded-3xl border border-line bg-ink-100/80 hover:border-lineStrong focus-within:border-lineStrong transition-colors px-3 py-2"
+              className="relative rounded-3xl border border-line bg-ink-100/80 hover:border-lineStrong focus-within:border-lineStrong transition-colors px-3 py-2"
             >
+              {/* "/" slash menu — pick a skill to activate it for this message */}
+              {slashMenuOpen &&
+                (() => {
+                  const cands = slashCandidates()
+                  if (!cands.length) return null
+                  return (
+                    <div className="absolute bottom-full left-0 right-0 mb-2 z-50 rounded-xl border border-lineStrong bg-ink-200 p-1 text-sm shadow-2xl shadow-black/60 max-h-72 overflow-y-auto">
+                      <div className="px-3 pt-2 pb-1 text-[11px] uppercase tracking-wide text-fog-500">
+                        Skills
+                      </div>
+                      {cands.map((s, i) => (
+                        <button
+                          key={s.name}
+                          type="button"
+                          onMouseEnter={() => setSlashIndex(i)}
+                          onClick={() => activateSkill(s.name)}
+                          className={`w-full text-left px-3 py-2 rounded-md flex items-start gap-2.5 ${
+                            i === slashIndex ? 'bg-soft/[0.08]' : 'hover:bg-soft/[0.06]'
+                          }`}
+                        >
+                          <span className="text-accent mt-0.5">
+                            <IconSkill />
+                          </span>
+                          <span className="min-w-0">
+                            <span className="text-fog-50 font-medium">
+                              /{s.name}
+                            </span>
+                            <span className="block text-[11px] text-fog-400 line-clamp-1">
+                              {s.description}
+                            </span>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )
+                })()}
+
+              {/* Active-skill chips (force-activated via "/") */}
+              {triggeredSkills.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 px-1.5 pb-2">
+                  {triggeredSkills.map((name) => (
+                    <span
+                      key={name}
+                      className="chip text-[11px] py-0.5 pr-1 bg-accent/10 border-accent/30 text-accent"
+                      title={`Skill ${name} will run for this message`}
+                    >
+                      <IconSkill />
+                      <span className="max-w-[180px] truncate">{name}</span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setTriggeredSkills((prev) =>
+                            prev.filter((n) => n !== name),
+                          )
+                        }
+                        className="ml-1 w-4 h-4 rounded-full text-accent/70 hover:text-accent hover:bg-soft/[0.1] flex items-center justify-center text-[10px]"
+                        aria-label={`Remove ${name}`}
+                      >
+                        ✕
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+
               {pendingFiles.length > 0 && (
                 <div className="flex flex-wrap gap-1.5 px-1.5 pb-2">
                   {pendingFiles.map((f) => (
@@ -2871,8 +3007,37 @@ export default function AppPage() {
                 <textarea
                   ref={composerRef}
                   value={input}
-                  onChange={(e) => setInput(e.target.value)}
+                  onChange={(e) => {
+                    const v = e.target.value
+                    setInput(v)
+                    const open = v.startsWith('/')
+                    setSlashMenuOpen(open)
+                    if (open) setSlashIndex(0)
+                  }}
                   onKeyDown={(e) => {
+                    const cands = slashMenuOpen ? slashCandidates() : []
+                    if (slashMenuOpen && cands.length) {
+                      if (e.key === 'ArrowDown') {
+                        e.preventDefault()
+                        setSlashIndex((i) => (i + 1) % cands.length)
+                        return
+                      }
+                      if (e.key === 'ArrowUp') {
+                        e.preventDefault()
+                        setSlashIndex((i) => (i - 1 + cands.length) % cands.length)
+                        return
+                      }
+                      if (e.key === 'Enter' || e.key === 'Tab') {
+                        e.preventDefault()
+                        activateSkill(cands[Math.min(slashIndex, cands.length - 1)].name)
+                        return
+                      }
+                      if (e.key === 'Escape') {
+                        e.preventDefault()
+                        setSlashMenuOpen(false)
+                        return
+                      }
+                    }
                     if (e.key === 'Enter' && !e.shiftKey) {
                       e.preventDefault()
                       send()
@@ -2882,7 +3047,7 @@ export default function AppPage() {
                   rows={1}
                   placeholder={
                     activeThread
-                      ? 'Reply to Agent…'
+                      ? 'Reply to Agent…  (type / for skills)'
                       : 'Start a new chat or pick one from the sidebar'
                   }
                   className="flex-1 resize-none bg-transparent outline-none px-1 py-2 text-[15px] placeholder:text-fog-400 disabled:opacity-50 leading-6"
@@ -3737,6 +3902,44 @@ function ToolMessageCard({
   if (name === 'list_project_files')
     return <ListFilesEventRow content={content} isError={isError} />
 
+  if (name === 'read_skill')
+    return (
+      <EventRow
+        icon={<SkillRunIcon />}
+        verb="Skill"
+        target={String(args?.skill_name ?? '')}
+        verbColor="text-accent"
+        subtext={
+          <span className="text-fog-500">
+            {isError ? 'not found' : 'instructions loaded'}
+          </span>
+        }
+      />
+    )
+
+  if (name === 'skill_used')
+    return (
+      <EventRow
+        icon={<SkillRunIcon />}
+        verb="Skill"
+        target={content}
+        verbColor="text-accent"
+        subtext={<span className="text-fog-500">applied</span>}
+      />
+    )
+
+  if (PLUGIN_TOOL_NAMES.has(name))
+    return (
+      <EventRow
+        icon={<PluginRunIcon />}
+        verb="Plugin"
+        target={name}
+        verbColor="text-accent"
+      >
+        <DetailsBlock content={content} />
+      </EventRow>
+    )
+
   return (
     <EventRow icon={<ToolIcon />} verb={name || 'tool'} verbColor="text-fog-200">
       <DetailsBlock content={content} />
@@ -4213,12 +4416,30 @@ function ToolErrorRow({
 }
 
 /** Tool whose result hasn't landed yet — shown with a spinner. */
+// Tool names contributed by plugins (backend/plugins_catalog.py). Used to badge
+// their calls as "Plugin" in the activity timeline.
+const PLUGIN_TOOL_NAMES = new Set([
+  'fetch_url',
+  'json_tool',
+  'convert_units',
+  'text_transform',
+  'generate_uuid',
+  'datetime_tool',
+  'regex_test',
+  'system_info',
+  'list_directory',
+  'review_python',
+])
+
 function InflightToolRow({ tool }: { tool: InflightTool }) {
   const args = tool.args || {}
   const name = tool.tool_name
   let verb = name
   let target: string | undefined
   let icon: React.ReactNode = <ToolIcon />
+  let subtext: React.ReactNode = (
+    <span className="text-fog-500 italic">running…</span>
+  )
   if (name === 'run_shell') {
     verb = 'Run'
     target = String(args.cmd ?? '')
@@ -4235,6 +4456,20 @@ function InflightToolRow({ tool }: { tool: InflightTool }) {
     verb = 'List'
     target = 'project files'
     icon = <ListIcon />
+  } else if (name === 'read_skill') {
+    verb = 'Skill'
+    target = String(args.skill_name ?? '')
+    icon = <SkillRunIcon />
+    subtext = <span className="text-fog-500 italic">loading…</span>
+  } else if (name === 'skill_triggered') {
+    verb = 'Skill'
+    target = String(args.skill_name ?? '')
+    icon = <SkillRunIcon />
+    subtext = <span className="text-fog-500 italic">applied</span>
+  } else if (PLUGIN_TOOL_NAMES.has(name)) {
+    verb = 'Plugin'
+    target = name
+    icon = <PluginRunIcon />
   }
   return (
     <EventRow
@@ -4242,8 +4477,25 @@ function InflightToolRow({ tool }: { tool: InflightTool }) {
       icon={icon}
       verb={verb}
       target={target}
-      subtext={<span className="text-fog-500 italic">running…</span>}
+      subtext={subtext}
     />
+  )
+}
+
+function SkillRunIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="text-accent">
+      <path d="M12 3l2.4 5.6L20 10l-4.5 3.9L17 20l-5-3-5 3 1.5-6.1L4 10l5.6-1.4z" />
+    </svg>
+  )
+}
+function PluginRunIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="text-accent">
+      <path d="M12 2a3 3 0 0 1 3 3v2h2a2 2 0 0 1 2 2v3a3 3 0 0 1 0 6 2 2 0 0 1-2 2h-3v-2a3 3 0 0 0-6 0v2H5a2 2 0 0 1-2-2v-3a3 3 0 0 0 0-6V9a2 2 0 0 1 2-2h2V5a3 3 0 0 1 3-3z" />
+    </svg>
   )
 }
 

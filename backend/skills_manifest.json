@@ -1,0 +1,49 @@
+{
+  "skills": [
+    {
+      "slug": "web-artifacts-builder",
+      "name": "web-artifacts-builder",
+      "description": "Build interactive, self-contained web artifacts — tools, dashboards, widgets, games, calculators, demos — using modern frontend techniques. Use when the user asks for an interactive UI or app (something that responds to input), not just static text."
+    },
+    {
+      "slug": "skill-creator",
+      "name": "skill-creator",
+      "description": "Help the user author a new skill, or improve an existing one. Use when the user wants to create, design, or refine a skill — it produces a ready-to-paste Name, Description, and Instructions for the 'Add skill' form."
+    },
+    {
+      "slug": "canvas-design",
+      "name": "canvas-design",
+      "description": "Create beautiful, original visual art driven by a design philosophy — posters, covers, social graphics, one-page layouts, diagrams. Use when the user asks to design a poster, piece of art, cover, or other static visual piece. Always create original work; never copy a specific artist's or brand's design."
+    },
+    {
+      "slug": "mcp-builder",
+      "name": "mcp-builder",
+      "description": "Build a high-quality MCP (Model Context Protocol) server that lets LLM clients call your tools. Use when the user wants to create, scaffold, or improve an MCP server, or expose an API/system as MCP tools."
+    },
+    {
+      "slug": "theme-factory",
+      "name": "theme-factory",
+      "description": "Apply a consistent, reusable theme across an artifact — slides, docs, reports, HTML pages. Use when the user wants a cohesive look or asks to theme / restyle / re-skin something so it can be changed in one place."
+    },
+    {
+      "slug": "brand-guidelines",
+      "name": "brand-guidelines",
+      "description": "Apply a brand's official colours, typography, and voice to any artifact so it looks on-brand. Use when the user wants something to match a brand, or provides brand guidelines / a logo / brand colours to follow."
+    },
+    {
+      "slug": "doc-coauthoring",
+      "name": "doc-coauthoring",
+      "description": "Co-write and edit long-form documents — proposals, specs, articles, READMEs — with structure, a consistent voice, and careful revisions. Use when the user wants to draft, expand, or iteratively edit a multi-section document together."
+    },
+    {
+      "slug": "internal-comms",
+      "name": "internal-comms",
+      "description": "Draft clear internal communications — announcements, status updates, incident notes, decision summaries. Use when the user needs to communicate something to a team or organisation in a skimmable, well-targeted message."
+    },
+    {
+      "slug": "report-writer",
+      "name": "report-writer",
+      "description": "Turn source material or findings into a well-structured Markdown report — title, executive summary, sections, findings, conclusion. Use when the user asks for a report, write-up, brief, analysis, or summary document."
+    }
+  ]
+}
