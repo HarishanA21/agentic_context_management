@@ -1,0 +1,55 @@
+name: Publish VSCode extension
+
+# Publishes the ACM VSCode extension to the VS Marketplace and Open VSX
+# (Open VSX is what Cursor / Antigravity / Windsurf install from).
+#
+# Trigger: push a tag like `vscode-v0.1.0`. Or run manually.
+#
+# Required repo secrets:
+#   VSCE_PAT  — Azure DevOps PAT with Marketplace > Manage scope (vsce publish)
+#   OVSX_PAT  — Open VSX access token (ovsx publish)
+
+on:
+  push:
+    tags:
+      - "vscode-v*"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
+    defaults:
+      run:
+        working-directory: extension/adapters/vscode
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        run: npm install
+
+      - name: Compile
+        run: npm run compile
+
+      - name: Package (.vsix)
+        run: npx --yes @vscode/vsce package --out acm-context-management.vsix
+
+      - name: Publish to VS Marketplace
+        if: ${{ env.VSCE_PAT != '' }}
+        run: npx --yes @vscode/vsce publish --packagePath acm-context-management.vsix --pat "$VSCE_PAT"
+
+      - name: Publish to Open VSX
+        if: ${{ env.OVSX_PAT != '' }}
+        run: npx --yes ovsx publish acm-context-management.vsix --pat "$OVSX_PAT"
+
+      - name: Upload .vsix artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: acm-context-management-vsix
+          path: extension/adapters/vscode/acm-context-management.vsix

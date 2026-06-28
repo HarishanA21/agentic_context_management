@@ -1,0 +1,10 @@
+{
+  "name": "acm-context-management",
+  "version": "0.1.0",
+  "description": "Context-management techniques (tool-result trimming, summarisation, image-recall, memory) for Claude Code via hooks + an MCP server. Pairs with acm-gateway for full-parity context editing.",
+  "author": { "name": "ACM" },
+  "homepage": "https://github.com/HarishanA21/agentic_context_management",
+  "repository": "https://github.com/HarishanA21/agentic_context_management",
+  "license": "MIT",
+  "keywords": ["context-management", "hooks", "mcp", "memory", "summarisation"]
+}

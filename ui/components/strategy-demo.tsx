@@ -18,6 +18,14 @@ import { useEffect, useState } from 'react'
 import { authFetch } from '@/lib/supabase'
 import { useTheme } from '@/lib/theme'
 
+// Models surfaced at the top of the picker (kept in sync with the backend's
+// promoted/pinned list and the chat picker's PRIMARY_MODEL_IDS).
+const PRIMARY_MODEL_IDS = [
+  'google/gemini-3.1-flash-lite',
+  'minimax/minimax-m3',
+  'stepfun/step-3.7-flash',
+]
+
 type ToolEvent = { name: string; args_keys: string[] }
 type Metrics = {
   latency_ms: number
@@ -25,21 +33,59 @@ type Metrics = {
   input_tokens?: number
   output_tokens?: number
   total_tokens?: number
+  // PR #5 — image-block visibility. The provider's input_tokens
+  // already includes the billed image cost; these counts just prove
+  // the compressed columns actually sent images.
+  image_blocks?: number
+  image_messages?: number
+  // Image-recall caching: prompt tokens served from / written to the
+  // provider cache across this column's model calls.
+  cache_read_tokens?: number
+  cache_write_tokens?: number
+  cache_hit_ratio?: number | null
 }
-type Accuracy = { score: number; reasoning?: string }
+type CriterionResult = {
+  score: number
+  baseline_answer?: string
+  candidate_answer?: string
+  match?: boolean
+  exact_values?: string[]
+  mutated_values?: string[]
+  covered?: string[]
+  missing?: string[]
+  hallucinated_claims?: string[]
+}
+type Accuracy = {
+  score: number
+  reasoning?: string
+  criteria?: {
+    c1_answer_correctness?: CriterionResult
+    c2_value_fidelity?: CriterionResult
+    c3_completeness?: CriterionResult
+    c4_hallucination?: CriterionResult
+  }
+}
 type Result = {
+  index?: number
   strategy: string
-  label?: string                                 // PR #3 — set when tab=visual
+  label?: string
   ok: boolean
   reply?: string
   error?: string
   metrics: Metrics
   tool_events: ToolEvent[]
-  accuracy?: Accuracy                            // PR #3 — judge score (Tab 2 only)
+  accuracy?: Accuracy
+  context_window?: Array<[string, string]>
 }
 type CompressionRatios = {
   column_2_vs_1?: number | null
   column_4_vs_3?: number | null
+  raw_cache_vs_image?: number | null
+  raw_evict_vs_image?: number | null
+  raw_cache_evict_vs_image?: number | null
+  ts_cache_vs_image?: number | null
+  ts_evict_vs_image?: number | null
+  ts_cache_evict_vs_image?: number | null
 }
 type CompareResponse = {
   prompt: string
@@ -87,6 +133,13 @@ export function StrategyDemoPanel() {
   const [models, setModels] = useState<ModelInfo[]>([])
   const [defaultModel, setDefaultModel] = useState<string>('')
   const [selectedModel, setSelectedModel] = useState<string>('')
+  const [activeModal, setActiveModal] = useState<{ type: 'context' | 'judge'; colIdx: number } | null>(null)
+  // Tab 2 runs its 10 columns in batches of 2 (to dodge provider rate
+  // limits). Columns land here by index as each batch returns, so the UI
+  // fills in progressively. `batchProgress` drives the "X / 10" hint.
+  const VISUAL_COLUMN_COUNT = 10
+  const [visualCols, setVisualCols] = useState<(Result | null)[]>([])
+  const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -124,45 +177,107 @@ export function StrategyDemoPanel() {
     setError(null)
     setResponse(null)
     try {
-      // PR #3: when Tab 2 is active, the backend orchestrates 4 columns
-      // + a GPT-4o judge. Tab 1 still hits the 2-column path. The body
-      // shape stays back-compat (`tab` is optional on the server).
-      const body =
-        tab === 'visual_compression'
-          ? {
-              prompt: prompt.trim(),
-              model: selectedModel || undefined,
-              tab: 'visual_compression',
-            }
-          : {
-              prompt: prompt.trim(),
-              strategies: ['tool_calling', 'ts_code_mode'],
-              model: selectedModel || undefined,
-            }
-      const r = await authFetch('/api/demo/compare', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      })
-      if (!r.ok) {
-        const body = await r.json().catch(() => ({}))
-        setError(`${r.status} ${r.statusText} — ${body?.detail ?? 'unknown error'}`)
+      if (tab === 'visual_compression') {
+        await runVisualStream()
       } else {
-        const body: CompareResponse = await r.json()
-        setResponse(body)
+        const r = await authFetch('/api/demo/compare', {
+          method: 'POST',
+          body: JSON.stringify({
+            prompt: prompt.trim(),
+            strategies: ['tool_calling', 'ts_code_mode'],
+            model: selectedModel || undefined,
+          }),
+        })
+        if (!r.ok) {
+          const b = await r.json().catch(() => ({}))
+          setError(`${r.status} ${r.statusText} — ${b?.detail ?? 'unknown error'}`)
+        } else {
+          setResponse(await r.json())
+        }
       }
     } catch (e: any) {
       setError(e?.message ?? 'network error')
     } finally {
       setRunning(false)
+      setBatchProgress(null)
     }
   }
 
-  // Tab 1 ordering: tool_calling left, ts_code_mode right.
-  // Tab 2 ordering: backend already returns the 4 columns in the
-  // canonical order baked into _VISUAL_COLUMNS, so preserve as-is.
+  // Tab 2: stream the 10 columns over SSE. The backend runs up to 4 in
+  // parallel and pushes one `column` frame per column the instant its run +
+  // judge finish, so the grid fills in live (in completion order). Column 0
+  // is the ground-truth baseline judged at 100; the rest are scored against
+  // it server-side.
+  async function runVisualStream() {
+    const cols: (Result | null)[] = Array(VISUAL_COLUMN_COUNT).fill(null)
+    setVisualCols(cols.slice())
+    setBatchProgress({ done: 0, total: VISUAL_COLUMN_COUNT })
+
+    const r = await authFetch('/api/demo/compare/stream', {
+      method: 'POST',
+      body: JSON.stringify({
+        prompt: prompt.trim(),
+        model: selectedModel || undefined,
+        tab: 'visual_compression',
+      }),
+    })
+    if (!r.ok || !r.body) {
+      const b = await r.json().catch(() => ({}))
+      setError(`${r.status} ${r.statusText} — ${b?.detail ?? 'stream failed'}`)
+      return
+    }
+
+    const reader = r.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    let done = 0
+
+    const handle = (evt: any) => {
+      if (evt?.type === 'meta') {
+        // Carries prompt/model/judge_model for the footer + total/concurrency.
+        setResponse({
+          prompt: evt.prompt,
+          model: evt.model,
+          judge_model: evt.judge_model,
+          results: [],
+        })
+        setBatchProgress({ done: 0, total: evt.total ?? VISUAL_COLUMN_COUNT })
+      } else if (evt?.type === 'column' && evt.result) {
+        const res: Result = evt.result
+        const idx = res.index ?? -1
+        if (idx >= 0 && idx < VISUAL_COLUMN_COUNT) {
+          cols[idx] = res
+          setVisualCols(cols.slice()) // live, per-column render
+          done += 1
+          setBatchProgress({ done, total: VISUAL_COLUMN_COUNT })
+        }
+      }
+    }
+
+    // Parse the SSE byte stream: frames are separated by a blank line, each
+    // carrying a single `data: {json}` line.
+    while (true) {
+      const { value, done: streamDone } = await reader.read()
+      if (streamDone) break
+      buf += decoder.decode(value, { stream: true })
+      const frames = buf.split('\n\n')
+      buf = frames.pop() ?? ''
+      for (const frame of frames) {
+        const line = frame.split('\n').find((l) => l.startsWith('data:'))
+        if (!line) continue
+        try {
+          handle(JSON.parse(line.slice(5).trim()))
+        } catch {
+          // ignore keepalives / malformed frames
+        }
+      }
+    }
+  }
+
+  // Tab 1 ordering: tool_calling left, ts_code_mode right. (Tab 2 renders
+  // straight off `visualCols`, which is already index-aligned.)
   const ordered: Result[] = (() => {
     const r = response?.results ?? []
-    if (tab === 'visual_compression') return r.slice()
     return r.slice().sort((a, b) => {
       const rank = (s: string) => (s === 'tool_calling' ? 0 : 1)
       return rank(a.strategy) - rank(b.strategy)
@@ -173,6 +288,8 @@ export function StrategyDemoPanel() {
     if (next === tab) return
     setTab(next)
     setResponse(null)
+    setVisualCols([])
+    setBatchProgress(null)
     setError(null)
     setPrompt((cur) => {
       const samples = next === 'visual_compression' ? VISUAL_SAMPLE_PROMPTS : SAMPLE_PROMPTS
@@ -280,15 +397,27 @@ export function StrategyDemoPanel() {
                       className="bg-transparent text-xs text-fog-50 outline-none max-w-[16rem] truncate disabled:opacity-50"
                       title="Model used for both strategies in the comparison"
                     >
-                      {models.map((m) => (
-                        <option
-                          key={m.id}
-                          value={m.id}
-                          className="bg-ink-200 text-fog-50"
-                        >
-                          {m.name.replace(/\s*\(free\)\s*$/i, '')}
-                        </option>
-                      ))}
+                      {(() => {
+                        const primary = PRIMARY_MODEL_IDS
+                          .map((id) => models.find((m) => m.id === id))
+                          .filter(Boolean) as ModelInfo[]
+                        const rest = models.filter((m) => !PRIMARY_MODEL_IDS.includes(m.id))
+                        const opt = (m: ModelInfo) => (
+                          <option key={m.id} value={m.id} className="bg-ink-200 text-fog-50">
+                            {m.name.replace(/\s*\(free\)\s*$/i, '')}
+                          </option>
+                        )
+                        return (
+                          <>
+                            {primary.length > 0 && (
+                              <optgroup label="Primary models">{primary.map(opt)}</optgroup>
+                            )}
+                            {rest.length > 0 && (
+                              <optgroup label="Other models">{rest.map(opt)}</optgroup>
+                            )}
+                          </>
+                        )
+                      })()}
                     </select>
                   </div>
                 ) : (
@@ -304,7 +433,7 @@ export function StrategyDemoPanel() {
                 >
                   {running
                     ? tab === 'visual_compression'
-                      ? 'Running 4 columns + judge…'
+                      ? 'Streaming 10 columns…'
                       : 'Running both strategies…'
                     : 'Run comparison'}
                 </button>
@@ -339,44 +468,100 @@ export function StrategyDemoPanel() {
               />
             </div>
           ) : (
-            /* Tab 2: 4-column visual compression bench. Backend returns
-               the columns in canonical order so we render by index.
-               Col 2 (idx 1) compares vs Col 1 (idx 0); Col 4 (idx 3)
-               vs Col 3 (idx 2). */
+            /* Tab 2: 10-column visual bench. Cols 0-3 are the baseline
+               methods; cols 4-9 apply the 3 image-recall techniques to the
+               raw-image (vs col 1) and TS+image (vs col 3) methods. */
             <>
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
-                {[0, 1, 2, 3].map((idx) => {
-                  const r = ordered[idx] ?? null
-                  const compareIdx = idx === 1 ? 0 : idx === 3 ? 2 : null
-                  const compareWith = compareIdx != null ? ordered[compareIdx] ?? null : null
-                  // Pull the per-pair compression ratio if available.
-                  const cr = response?.compression_ratios ?? {}
-                  const ratio =
-                    idx === 1
-                      ? cr.column_2_vs_1
-                      : idx === 3
-                        ? cr.column_4_vs_3
-                        : null
+              {batchProgress && (
+                <div className="mb-3 flex items-center gap-2 text-[11px] text-fog-400">
+                  <div className="flex-1 h-1.5 rounded-full bg-soft/[0.06] overflow-hidden">
+                    <div
+                      className="h-full bg-accent transition-all"
+                      style={{ width: `${(batchProgress.done / batchProgress.total) * 100}%` }}
+                    />
+                  </div>
+                  <span className="font-mono">
+                    {batchProgress.done} / {batchProgress.total} columns
+                    {batchProgress.done < batchProgress.total ? ' · streaming, 4 in parallel' : ' · done'}
+                  </span>
+                </div>
+              )}
+              {(() => {
+                // Compression ratios computed client-side from the columns
+                // gathered so far (each image-recall column vs the image
+                // method it builds on). Null until both columns are present.
+                const inTok = (i: number) => visualCols[i]?.metrics?.input_tokens ?? 0
+                const ratio = (after: number, before: number): number | null => {
+                  const b = inTok(before)
+                  if (!b || !visualCols[after]) return null
+                  return Math.max(0, b - inTok(after)) / b
+                }
+                // index → compare index (for token delta + savings badge).
+                const cmp: Record<number, number | null> = {
+                  0: null, 1: 0, 2: null, 3: 2,
+                  4: 1, 5: 1, 6: 1, 7: 3, 8: 3, 9: 3,
+                }
+                const renderCol = (idx: number) => {
+                  const r = visualCols[idx] ?? null
+                  const compareIdx = cmp[idx]
+                  const compareWith = compareIdx != null ? visualCols[compareIdx] ?? null : null
                   return (
                     <ResultColumn
                       key={idx}
                       strategy={r?.strategy ?? ''}
                       label={r?.label ?? `Column ${idx + 1}`}
-                      loading={running && !response}
+                      loading={running && !r}
                       result={r}
                       compareWith={compareWith}
-                      compressionRatio={ratio ?? undefined}
+                      compressionRatio={compareIdx != null ? ratio(idx, compareIdx) ?? undefined : undefined}
                       showAccuracy
+                      onContextWindow={r ? () => setActiveModal({ type: 'context', colIdx: idx }) : undefined}
+                      onJudgeResult={r?.accuracy ? () => setActiveModal({ type: 'judge', colIdx: idx }) : undefined}
                     />
                   )
-                })}
-              </div>
+                }
+                return (
+                  <div className="flex flex-col gap-4">
+                    <div>
+                      <div className="text-xs font-semibold text-fog-200 mb-2">Baseline methods</div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+                        {[0, 1, 2, 3].map(renderCol)}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-xs font-semibold text-fog-200 mb-2">
+                        Image-recall techniques · raw-image (vs col 2) &amp; TS+image (vs col 4)
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                        {[4, 5, 6, 7, 8, 9].map(renderCol)}
+                      </div>
+                    </div>
+                  </div>
+                )
+              })()}
               {response?.judge_model && (
                 <div className="mt-3 text-[11px] text-fog-500">
                   Accuracy judged by{' '}
                   <span className="text-fog-300">{response.judge_model}</span>{' '}
-                  against Column 1's raw tool outputs (ground truth).
+                  — Column 1 is the baseline (100 / 100). Cache/evict columns
+                  reuse the image method they sit under.
                 </div>
+              )}
+
+              {activeModal && visualCols[activeModal.colIdx] && (
+                activeModal.type === 'context' ? (
+                  <ContextWindowModal
+                    label={visualCols[activeModal.colIdx]!.label ?? `Column ${activeModal.colIdx + 1}`}
+                    contextWindow={visualCols[activeModal.colIdx]!.context_window ?? []}
+                    onClose={() => setActiveModal(null)}
+                  />
+                ) : (
+                  <JudgeResultModal
+                    label={visualCols[activeModal.colIdx]!.label ?? `Column ${activeModal.colIdx + 1}`}
+                    accuracy={visualCols[activeModal.colIdx]!.accuracy!}
+                    onClose={() => setActiveModal(null)}
+                  />
+                )
               )}
             </>
           )}
@@ -417,6 +602,8 @@ function ResultColumn({
   compareWith,
   compressionRatio,
   showAccuracy,
+  onContextWindow,
+  onJudgeResult,
 }: {
   strategy: string
   label?: string
@@ -425,6 +612,8 @@ function ResultColumn({
   compareWith: Result | null
   compressionRatio?: number
   showAccuracy?: boolean
+  onContextWindow?: () => void
+  onJudgeResult?: () => void
 }) {
   const displayLabel = label ?? STRATEGY_LABEL[strategy] ?? strategy
   // Mark the "+ Image" columns with the accent colour so eyes find them.
@@ -464,8 +653,60 @@ function ResultColumn({
             </div>
           )}
 
+          {/* PR #5 — image-block visibility. Shown only when at least
+              one image actually crossed the wire, so the baseline /
+              text-only columns stay quiet. */}
+          {(result.metrics.image_blocks ?? 0) > 0 && (
+            <div className="text-[11px] flex items-baseline justify-between gap-2 text-fog-400">
+              <span className="uppercase tracking-widest">Images sent</span>
+              <span className="font-mono text-fog-200">
+                🖼️ {result.metrics.image_blocks} block
+                {(result.metrics.image_blocks ?? 0) === 1 ? '' : 's'} in{' '}
+                {result.metrics.image_messages} message
+                {(result.metrics.image_messages ?? 0) === 1 ? '' : 's'}
+              </span>
+            </div>
+          )}
+
+          {/* Image-recall caching — shown only when the provider reported
+              cache activity (cache columns on cache-capable providers). */}
+          {((result.metrics.cache_read_tokens ?? 0) > 0 ||
+            (result.metrics.cache_write_tokens ?? 0) > 0) && (
+            <div className="text-[11px] flex items-baseline justify-between gap-2 bg-sky-500/8 border border-sky-500/25 rounded-md px-3 py-2">
+              <span className="text-fog-400 uppercase tracking-widest">Cache</span>
+              <span className="font-mono text-sky-300">
+                ⚡ {(result.metrics.cache_read_tokens ?? 0).toLocaleString()} read
+                {(result.metrics.cache_write_tokens ?? 0) > 0 &&
+                  ` · ${(result.metrics.cache_write_tokens ?? 0).toLocaleString()} write`}
+                {result.metrics.cache_hit_ratio != null &&
+                  ` · ${(result.metrics.cache_hit_ratio * 100).toFixed(0)}% hit`}
+              </span>
+            </div>
+          )}
+
           {showAccuracy && result.accuracy && (
             <AccuracyRow accuracy={result.accuracy} />
+          )}
+
+          {(onContextWindow || onJudgeResult) && (
+            <div className="flex gap-2">
+              {onContextWindow && (
+                <button
+                  onClick={onContextWindow}
+                  className="flex-1 text-[11px] py-1.5 rounded-md border border-line text-fog-300 hover:text-fog-50 hover:border-lineStrong hover:bg-soft/[0.06] transition"
+                >
+                  Context Window
+                </button>
+              )}
+              {onJudgeResult && (
+                <button
+                  onClick={onJudgeResult}
+                  className="flex-1 text-[11px] py-1.5 rounded-md border border-line text-fog-300 hover:text-fog-50 hover:border-lineStrong hover:bg-soft/[0.06] transition"
+                >
+                  Judge Result
+                </button>
+              )}
+            </div>
           )}
 
           {result.tool_events.length > 0 && (
@@ -680,6 +921,227 @@ function deltaSuffix(
   const tone: 'good' | 'bad' =
     (lowerIsBetter && pct < 0) || (!lowerIsBetter && pct > 0) ? 'good' : 'bad'
   return { text: `${sign}${pct}% vs other`, tone }
+}
+
+function Modal({
+  title,
+  onClose,
+  children,
+}: {
+  title: string
+  onClose: () => void
+  children: React.ReactNode
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
+      onClick={(e) => { if (e.target === e.currentTarget) onClose() }}
+    >
+      <div className="relative bg-ink-100 border border-line rounded-xl shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col">
+        <div className="flex items-center justify-between px-5 py-3 border-b border-line shrink-0">
+          <span className="text-sm font-semibold text-fog-100">{title}</span>
+          <button
+            onClick={onClose}
+            className="w-6 h-6 flex items-center justify-center rounded text-fog-400 hover:text-fog-50 hover:bg-soft/[0.08] transition text-base leading-none"
+          >
+            ×
+          </button>
+        </div>
+        <div className="overflow-y-auto flex-1 p-5">{children}</div>
+      </div>
+    </div>
+  )
+}
+
+function ContextWindowModal({
+  label,
+  contextWindow,
+  onClose,
+}: {
+  label: string
+  contextWindow: Array<[string, string]>
+  onClose: () => void
+}) {
+  const isImageMethod = label.toLowerCase().includes('+ image')
+  return (
+    <Modal title={`Context Window — ${label}`} onClose={onClose}>
+      {isImageMethod && (
+        <div className="mb-4 text-[11px] bg-amber-500/10 border border-amber-500/30 rounded-md px-3 py-2 text-amber-300">
+          This method converts tool outputs to images before sending to the LLM.
+          The text below is the raw content before image rendering.
+        </div>
+      )}
+      {contextWindow.length === 0 ? (
+        <p className="text-sm text-fog-500">No tool outputs were recorded for this run.</p>
+      ) : (
+        <div className="space-y-4">
+          {contextWindow.map(([toolName, text], i) => (
+            <div key={i}>
+              <div className="text-[11px] uppercase tracking-widest text-fog-500 mb-1.5">
+                Tool: <span className="text-fog-300 normal-case font-mono">{toolName}</span>
+              </div>
+              <pre className="text-xs font-mono text-fog-200 bg-ink-200 border border-line rounded-md p-3 whitespace-pre-wrap break-all leading-relaxed overflow-x-auto">
+                {text || '(empty output)'}
+              </pre>
+            </div>
+          ))}
+        </div>
+      )}
+    </Modal>
+  )
+}
+
+const CRITERIA_META: Record<string, { label: string; description: string; primary?: boolean }> = {
+  c1_answer_correctness: {
+    label: 'C1 — Answer Correctness',
+    description: 'Does the final answer match the baseline?',
+  },
+  c2_value_fidelity: {
+    label: 'C2 — Value Fidelity',
+    description: 'Are exact numbers / strings reproduced without mutation?',
+    primary: true,
+  },
+  c3_completeness: {
+    label: 'C3 — Completeness',
+    description: 'Were all sub-tasks from the baseline addressed?',
+  },
+  c4_hallucination: {
+    label: 'C4 — Hallucination',
+    description: 'Did the candidate add claims not in the baseline? (25 = none)',
+    primary: true,
+  },
+}
+
+function JudgeResultModal({
+  label,
+  accuracy,
+  onClose,
+}: {
+  label: string
+  accuracy: Accuracy
+  onClose: () => void
+}) {
+  const score = Math.max(-1, Math.min(100, accuracy.score))
+  const tone = score >= 80 ? 'text-emerald-400' : score >= 60 ? 'text-amber-400' : 'text-red-400'
+  const bar = score >= 80 ? 'bg-emerald-500' : score >= 60 ? 'bg-amber-500' : 'bg-red-500'
+
+  return (
+    <Modal title={`Judge Result — ${label}`} onClose={onClose}>
+      <div className="space-y-5">
+        {/* Overall score */}
+        <div className="bg-ink-200 border border-line rounded-md px-4 py-3 space-y-2">
+          <div className="flex items-baseline justify-between">
+            <span className="text-[11px] uppercase tracking-widest text-fog-400">Overall Score</span>
+            <span className={`text-lg font-mono font-semibold ${tone}`}>{score < 0 ? 'N/A' : `${score} / 100`}</span>
+          </div>
+          {score >= 0 && (
+            <div className="h-2 rounded-full bg-soft/[0.08] overflow-hidden">
+              <div className={`h-full ${bar} transition-all`} style={{ width: `${score}%` }} />
+            </div>
+          )}
+          {accuracy.reasoning && (
+            <p className="text-xs text-fog-400 leading-snug">{accuracy.reasoning}</p>
+          )}
+        </div>
+
+        {/* Per-criterion breakdown */}
+        {accuracy.criteria && Object.keys(accuracy.criteria).length > 0 ? (
+          <div className="space-y-3">
+            <div className="text-[11px] uppercase tracking-widest text-fog-500">Criteria Breakdown</div>
+            {(Object.entries(accuracy.criteria) as [string, CriterionResult][]).map(([key, c]) => {
+              const meta = CRITERIA_META[key]
+              const criterionTone = c.score >= 20 ? 'text-emerald-400' : c.score >= 13 ? 'text-amber-400' : 'text-red-400'
+              const criterionBar = c.score >= 20 ? 'bg-emerald-500' : c.score >= 13 ? 'bg-amber-500' : 'bg-red-500'
+              return (
+                <div key={key} className="bg-ink-200 border border-line rounded-md px-3 py-2.5 space-y-2">
+                  <div className="flex items-baseline justify-between gap-2">
+                    <div>
+                      <span className={`text-[11px] font-medium ${meta?.primary ? 'text-fog-100' : 'text-fog-300'}`}>
+                        {meta?.label ?? key}
+                      </span>
+                      {meta?.primary && (
+                        <span className="ml-1.5 text-[9px] uppercase tracking-wider text-accent">primary</span>
+                      )}
+                      {meta?.description && (
+                        <div className="text-[10px] text-fog-500 mt-0.5">{meta.description}</div>
+                      )}
+                    </div>
+                    <span className={`text-sm font-mono font-semibold shrink-0 ${criterionTone}`}>{c.score} / 25</span>
+                  </div>
+                  <div className="h-1 rounded-full bg-soft/[0.08] overflow-hidden">
+                    <div className={`h-full ${criterionBar}`} style={{ width: `${(c.score / 25) * 100}%` }} />
+                  </div>
+
+                  {/* Evidence details */}
+                  {key === 'c1_answer_correctness' && (
+                    <div className="text-[10px] text-fog-500 space-y-0.5">
+                      {c.baseline_answer && <div><span className="text-fog-400">Baseline:</span> {c.baseline_answer}</div>}
+                      {c.candidate_answer && <div><span className="text-fog-400">Candidate:</span> {c.candidate_answer}</div>}
+                      {c.match != null && (
+                        <div className={c.match ? 'text-emerald-400' : 'text-red-400'}>
+                          {c.match ? 'Answers match' : 'Answers differ'}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {key === 'c2_value_fidelity' && (
+                    <EvidenceLists good={c.exact_values} bad={c.mutated_values} goodLabel="Exact" badLabel="Mutated" />
+                  )}
+                  {key === 'c3_completeness' && (
+                    <EvidenceLists good={c.covered} bad={c.missing} goodLabel="Covered" badLabel="Missing" />
+                  )}
+                  {key === 'c4_hallucination' && c.hallucinated_claims && c.hallucinated_claims.length > 0 && (
+                    <div className="text-[10px] space-y-0.5">
+                      <div className="text-red-400">Hallucinated claims:</div>
+                      {c.hallucinated_claims.map((item, i) => (
+                        <div key={i} className="text-fog-400 pl-2">• {item}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        ) : (
+          <p className="text-xs text-fog-500">
+            {label.toLowerCase().includes('baseline')
+              ? 'Baseline column — no judge evaluation needed.'
+              : 'No per-criterion data available.'}
+          </p>
+        )}
+      </div>
+    </Modal>
+  )
+}
+
+function EvidenceLists({
+  good,
+  bad,
+  goodLabel,
+  badLabel,
+}: {
+  good?: string[]
+  bad?: string[]
+  goodLabel: string
+  badLabel: string
+}) {
+  if (!good?.length && !bad?.length) return null
+  return (
+    <div className="text-[10px] space-y-1">
+      {good && good.length > 0 && (
+        <div>
+          <span className="text-emerald-400">{goodLabel}:</span>
+          {good.map((item, i) => <div key={i} className="text-fog-400 pl-2">• {item}</div>)}
+        </div>
+      )}
+      {bad && bad.length > 0 && (
+        <div>
+          <span className="text-red-400">{badLabel}:</span>
+          {bad.map((item, i) => <div key={i} className="text-fog-400 pl-2">• {item}</div>)}
+        </div>
+      )}
+    </div>
+  )
 }
 
 function HeaderTheme() {

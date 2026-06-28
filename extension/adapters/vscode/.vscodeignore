@@ -1,0 +1,13 @@
+.vscode/**
+src/**
+node_modules/**
+tsconfig.json
+tsconfig.ui.json
+esbuild.mjs
+UI_PLAN.md
+media/make_icon.py
+media/make_logo.py
+.gitignore
+**/*.map
+**/*.ts
+!out/**/*.js
