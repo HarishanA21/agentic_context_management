@@ -38,6 +38,14 @@ class Settings:
     anthropic_base_url: str
     anthropic_api_key: Optional[str]
     anthropic_version: str
+    # Dedicated cheap/fast model for the relevance auditor (LLM-as-judge). Kept
+    # separate from the chat model so audits stay cheap and don't compete with
+    # the user's main model. A profile's ``judge_model`` overrides this per use.
+    judge_model: str
+    # Optional local cross-encoder for relevance scoring (Provence-style ONNX or
+    # a sentence-transformers model). Empty -> the encoder falls back to its
+    # dependency-free lexical backend, so ensemble mode still works.
+    encoder_path: str
     config_path: Path
     log_events: bool
 
@@ -59,6 +67,8 @@ class Settings:
             anthropic_api_key=os.getenv("ACM_ANTHROPIC_API_KEY")
             or os.getenv("ANTHROPIC_API_KEY"),
             anthropic_version=os.getenv("ACM_ANTHROPIC_VERSION", "2023-06-01"),
+            judge_model=os.getenv("ACM_JUDGE_MODEL", "openai/gpt-4o-mini"),
+            encoder_path=os.getenv("ACM_ENCODER_PATH", ""),
             config_path=_resolve_config_path(),
             log_events=os.getenv("ACM_LOG_EVENTS", "1") not in {"0", "false", "no"},
         )

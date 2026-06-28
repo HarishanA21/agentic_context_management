@@ -24,7 +24,7 @@ from langchain_core.messages import ToolMessage
 
 from .auxiliary_llm import format_via_aux_async, format_via_aux_sync
 from .indexer import build_references_block, extract_references
-from .rasterizer import render_2col
+from .rasterizer import render_2col_pages
 from .templates import format_for_tool, has_template
 
 
@@ -51,28 +51,41 @@ def _pack_message(
     *,
     tool_call_id: str,
 ) -> ToolMessage:
-    """Build the multimodal ToolMessage payload (text REFERENCES +
-    base64 image). Every provider adapter we ship serialises this
-    shape — OpenAI/Azure/OpenRouter as `image_url`, Anthropic and
-    Bedrock-Claude as `image` source blocks."""
-    png_bytes = render_2col(formatted_text)
-    b64 = base64.b64encode(png_bytes).decode("ascii")
+    """Build the multimodal ToolMessage payload (text REFERENCES + one or
+    more base64 page images). Large outputs paginate into several legible
+    pages instead of one downscaled strip. Every provider adapter we ship
+    serialises this shape — OpenAI/Azure/OpenRouter as `image_url`,
+    Anthropic and Bedrock-Claude as `image` source blocks."""
+    pages = render_2col_pages(formatted_text)
+    n = len(pages)
     refs_block = build_references_block(refs)
-    text_part = refs_block or (
+    intro = refs_block or (
         f"(tool: {tool_name} — see image for full output; nothing to cite verbatim)"
     )
+    if n > 1:
+        intro = f"{intro}\n(output rendered as {n} page images below; read all pages)"
+
+    content: list = [{"type": "text", "text": intro}]
+    for i, png_bytes in enumerate(pages, start=1):
+        b64 = base64.b64encode(png_bytes).decode("ascii")
+        if n > 1:
+            content.append({"type": "text", "text": f"[page {i}/{n}]"})
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{b64}"},
+            }
+        )
+    # Capture a one-line digest of the formatted output now, while we have
+    # it cheaply. If image_recall eviction later drops these pixels, the
+    # digest is prepended to the surviving text so the model keeps a gist
+    # of what the image held (see context_editing.evict_stale_images).
+    digest = " ".join((formatted_text or "").split())[:240]
     return ToolMessage(
         tool_call_id=tool_call_id or "",
         name=tool_name,
-        content=[
-            {"type": "text", "text": text_part},
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/png;base64,{b64}",
-                },
-            },
-        ],
+        content=content,
+        additional_kwargs={"image_digest": digest} if digest else {},
     )
 
 

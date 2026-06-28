@@ -2,9 +2,10 @@
   "name": "acm-context-management",
   "displayName": "ACM — Context Management",
   "description": "Bring the ACM context-management techniques (trimming, summarisation, image-recall, memory) into VSCode via the gateway, Language Model Tools, and a settings panel.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "acm",
   "license": "MIT",
+  "icon": "media/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/HarishanA21/agentic_context_management.git",
@@ -153,7 +154,10 @@
     "build:host": "tsc -p ./",
     "build:ui": "node esbuild.mjs",
     "compile": "npm run build:host && npm run build:ui",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --no-dependencies",
+    "publish:vsce": "vsce publish --no-dependencies",
+    "publish:ovsx": "ovsx publish --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^20",

@@ -39,7 +39,11 @@ class Upstream:
             async with client.stream(
                 "POST", url, headers=self._headers(), json=body
             ) as resp:
-                async for chunk in resp.aiter_raw():
+                # aiter_bytes() yields content-decoded bytes (httpx undoes the
+                # upstream's gzip/br). aiter_raw() would forward still-compressed
+                # bytes, which the IDE — told it's plain text/event-stream —
+                # can't parse, so it silently retries. See the SSE passthrough.
+                async for chunk in resp.aiter_bytes():
                     yield chunk
 
     async def chat(self, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -65,7 +69,11 @@ class GenericUpstream:
             async with client.stream(
                 "POST", self.url, headers=self.headers, json=body
             ) as resp:
-                async for chunk in resp.aiter_raw():
+                # aiter_bytes() yields content-decoded bytes (httpx undoes the
+                # upstream's gzip/br). aiter_raw() would forward still-compressed
+                # bytes, which the IDE — told it's plain text/event-stream —
+                # can't parse, so it silently retries. See the SSE passthrough.
+                async for chunk in resp.aiter_bytes():
                     yield chunk
 
     async def chat(self, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -84,28 +92,59 @@ class AnthropicUpstream:
         self.api_key = api_key
         self.version = version
 
-    def _headers(self) -> Dict[str, str]:
+    def _headers(self, beta: str | None = None) -> Dict[str, str]:
         h = {
             "Content-Type": "application/json",
             "anthropic-version": self.version,
         }
         if self.api_key:
             h["x-api-key"] = self.api_key
+        # Forward the client's anthropic-beta header — Claude Code gates
+        # features (interleaved thinking, fine-grained tool streaming, 1M
+        # context, …) behind it; dropping it turns the body into a 400.
+        if beta:
+            h["anthropic-beta"] = beta
         return h
 
-    async def messages_stream(self, body: Dict[str, Any]) -> AsyncIterator[bytes]:
-        url = f"{self.base_url}/messages"
+    def _url(self, beta_query: bool) -> str:
+        return f"{self.base_url}/messages" + ("?beta=true" if beta_query else "")
+
+    async def messages_stream(
+        self, body: Dict[str, Any], *, beta: str | None = None, beta_query: bool = False
+    ) -> AsyncIterator[bytes]:
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream(
-                "POST", url, headers=self._headers(), json=body
+                "POST", self._url(beta_query), headers=self._headers(beta), json=body
             ) as resp:
-                async for chunk in resp.aiter_raw():
+                if resp.status_code >= 400:
+                    # Surface the upstream error inside the SSE stream so the
+                    # IDE shows the real reason instead of choking on a JSON
+                    # error body it expected to be event-stream.
+                    import json as _json
+
+                    raw = await resp.aread()
+                    try:
+                        err = _json.loads(raw.decode())
+                    except Exception:
+                        err = {"type": "error", "error": {
+                            "type": "upstream_error",
+                            "message": raw.decode(errors="replace")[:1000]}}
+                    yield (f"event: error\ndata: {_json.dumps(err)}\n\n").encode()
+                    return
+                # aiter_bytes() yields content-decoded bytes (httpx undoes the
+                # upstream's gzip/br). aiter_raw() would forward still-compressed
+                # bytes, which the IDE — told it's plain text/event-stream —
+                # can't parse, so it silently retries.
+                async for chunk in resp.aiter_bytes():
                     yield chunk
 
-    async def messages(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        url = f"{self.base_url}/messages"
+    async def messages(
+        self, body: Dict[str, Any], *, beta: str | None = None, beta_query: bool = False
+    ) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
-            resp = await client.post(url, headers=self._headers(), json=body)
+            resp = await client.post(
+                self._url(beta_query), headers=self._headers(beta), json=body
+            )
             resp.raise_for_status()
             return resp.json()
 

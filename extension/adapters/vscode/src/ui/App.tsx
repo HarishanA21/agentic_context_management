@@ -1,5 +1,9 @@
 import { useEffect, useState, useCallback } from 'react';
-import { rpc } from './bridge';
+import { rpc, getState, setState } from './bridge';
+
+type Theme = 'auto' | 'light' | 'dark';
+const THEME_ICON: Record<Theme, string> = { auto: '◐', light: '☀', dark: '☾' };
+const NEXT_THEME: Record<Theme, Theme> = { auto: 'light', light: 'dark', dark: 'auto' };
 
 const clone = <T,>(o: T): T => JSON.parse(JSON.stringify(o));
 const useReload = (): [number, () => void] => {
@@ -14,14 +18,43 @@ function rel(ts: number): string {
   if (s < 86400) return Math.floor(s / 3600) + 'h ago';
   return Math.floor(s / 86400) + 'd ago';
 }
-const ROLE = (r: string): { cls: string; label: string } => {
-  if (r === 'human') return { cls: 'user', label: 'User' };
-  if (r === 'ai') return { cls: 'assistant', label: 'Assistant' };
-  if (r === 'tool') return { cls: 'tool', label: 'Tool' };
-  return { cls: 'system', label: 'System' };
+// Claude Code injects its system prompt, <system-reminder> blocks, agent-type
+// lists and claudeMd as *user*-role messages. Tag those as "Context" so they're
+// visually separated from your real prompts and don't each become their own turn.
+const CONTEXT_RE =
+  /^\s*(<system-reminder>|Available agent types|#\s*claudeMd|x-anthropic-billing-header|You are Claude Code|<command-|<local-command)/i;
+function classify(m: any): { cls: string; label: string; context: boolean } {
+  const r = String(m.role || '').toLowerCase();
+  if (r === 'ai' || r === 'assistant') return { cls: 'assistant', label: 'Assistant', context: false };
+  if (r === 'tool') return { cls: 'tool', label: 'Tool', context: false };
+  if (r === 'human' || r === 'user') {
+    return CONTEXT_RE.test(String(m.preview || ''))
+      ? { cls: 'context', label: 'Context', context: true }
+      : { cls: 'user', label: 'User', context: false };
+  }
+  return { cls: 'system', label: 'System', context: true };
+}
+
+const TABS = ['Overview', 'Chats', 'Cleanup', 'Techniques', 'Profiles', 'Providers', 'Memory'];
+
+// Per-label colour for relevance suggestion cards (theme-agnostic alpha fills).
+const LABEL_STYLE: Record<string, { bg: string; fg: string; label: string }> = {
+  DROP: { bg: 'rgba(220,80,80,0.16)', fg: '#e06c6c', label: 'Drop' },
+  SUMMARIZE: { bg: 'rgba(210,160,60,0.16)', fg: '#d2a03c', label: 'Summarize' },
+  KEEP: { bg: 'rgba(90,180,120,0.16)', fg: '#5ab478', label: 'Keep' },
 };
 
-const TABS = ['Overview', 'Chats', 'Techniques', 'Profiles', 'Providers', 'Memory'];
+// One-word status derived from the judge's reason, so the list reads at a
+// glance (done / error / duplicate / empty / active) instead of a sentence.
+function statusWord(s: any): { w: string; bg: string; fg: string } {
+  const r = String(s.reason || '').toLowerCase();
+  if (/(fail|error|crash|exception|denied)/.test(r)) return { w: 'error', bg: 'rgba(220,80,80,0.16)', fg: '#e06c6c' };
+  if (/(duplicate|redundant|repeat)/.test(r)) return { w: 'duplicate', bg: 'rgba(210,160,60,0.16)', fg: '#d2a03c' };
+  if (/(empty|no-op|nothing|blank)/.test(r)) return { w: 'empty', bg: 'rgba(150,150,150,0.16)', fg: '#999' };
+  if (/(in progress|pending|ongoing|working)/.test(r)) return { w: 'active', bg: 'rgba(90,150,220,0.16)', fg: '#5a96dc' };
+  if (/(success|added|complete|done|implement|created|updated|wrote|finish)/.test(r)) return { w: 'done', bg: 'rgba(90,180,120,0.16)', fg: '#5ab478' };
+  return { w: String(s.label || '').toLowerCase(), bg: 'rgba(150,150,150,0.12)', fg: '#999' };
+}
 
 const TECHS = [
   { key: 'tool_result_trimming', name: 'Tool-result trimming', desc: 'Replace old, large tool outputs with a short placeholder once the chat passes a token threshold.', params: [['trigger_tokens', 'Trigger (tokens)'], ['keep_recent', 'Keep recent']] },
@@ -36,6 +69,13 @@ export function App() {
   const [tab, setTab] = useState('Overview');
   const [status, setStatus] = useState<any>(null);
   const [reachable, setReachable] = useState<boolean | null>(null);
+  const [theme, setTheme] = useState<Theme>(() => (getState().theme as Theme) || 'auto');
+
+  const cycleTheme = () => {
+    const next = NEXT_THEME[theme];
+    setTheme(next);
+    setState({ theme: next });
+  };
 
   const poll = useCallback(() => {
     rpc('status').then((s) => { setStatus(s); setReachable(true); }).catch(() => setReachable(false));
@@ -47,20 +87,26 @@ export function App() {
   }, [poll]);
 
   return (
-    <div className="acm">
+    <div className="acm" data-theme={theme}>
       <header className="hd">
         <svg className="logo" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
           <path d="M12 3 3 7.5 12 12l9-4.5L12 3Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
           <path d="m3 12 9 4.5L21 12M3 16.5l9 4.5 9-4.5" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
         </svg>
-        <div>
+        <div style={{ minWidth: 0 }}>
           <div className="title">ACM Context Management</div>
           <div className="sub">{status?.upstream || 'local gateway'}</div>
         </div>
-        <span className="pill">
-          <span className={'dot ' + (reachable === null ? '' : reachable ? 'ok' : 'bad')} />
-          {reachable === null ? 'Connecting…' : reachable ? 'Connected' : 'Offline'}
-        </span>
+        <div className="right">
+          <button className="theme-btn" title={`Theme: ${theme} (click to change)`} onClick={cycleTheme}>
+            <span aria-hidden>{THEME_ICON[theme]}</span>
+            <span style={{ textTransform: 'capitalize' }}>{theme}</span>
+          </button>
+          <span className="pill">
+            <span className={'dot ' + (reachable === null ? '' : reachable ? 'ok' : 'bad')} />
+            {reachable === null ? 'Connecting…' : reachable ? 'Connected' : 'Offline'}
+          </span>
+        </div>
       </header>
 
       {reachable === false && (
@@ -79,6 +125,7 @@ export function App() {
       <main className="body">
         {tab === 'Overview' && <Overview status={status} reachable={reachable} onRefresh={poll} />}
         {tab === 'Chats' && <Chats />}
+        {tab === 'Cleanup' && <Cleanup />}
         {tab === 'Techniques' && <Techniques />}
         {tab === 'Profiles' && <Profiles />}
         {tab === 'Providers' && <Providers />}
@@ -102,24 +149,83 @@ function Loading() {
 }
 
 // ── Overview ───────────────────────────────────────────────────────────
+function prettySurface(s: string): string {
+  if (s === 'ts_code_mode') return 'TS Code Mode';
+  if (s === 'tool_calling') return 'Tool calling';
+  return s || '—';
+}
+function hostOf(url: string): string {
+  try { return new URL(url).host; } catch { return url; }
+}
+
 function Overview({ status, reachable, onRefresh }: any) {
   if (reachable === false) return <p className="muted">Gateway offline — start it to see status.</p>;
   if (!status) return <Loading />;
   const tech = status.techniques || {};
   const on = (v: any) => v && v !== 'off';
+  const activeCount = Object.values(tech).filter(on).length;
   const events = (status.last_events || []).slice(-12).reverse();
+
+  const ctx = status.context || {};
+  const live = Number(ctx.tokens || 0);
+  const saved = Number(ctx.saved_tokens || 0);
+  const orig = live + saved;
+  const livePct = orig > 0 ? Math.max(2, Math.round((live / orig) * 100)) : 100;
+  const savedPct = orig > 0 ? Math.round((saved / orig) * 100) : 0;
+
   return (
     <div>
+      {/* Context gauge — the headline number for a context-management tool */}
+      <div className="card" style={{ padding: 14 }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 26, fontWeight: 700, lineHeight: 1.1 }}>
+              {fmtTok(live)}
+              <span className="muted" style={{ fontSize: 13, fontWeight: 400 }}> tokens in context</span>
+            </div>
+            <div className="muted tiny" style={{ marginTop: 3 }}>
+              {(ctx.messages || 0)} message{(ctx.messages || 0) === 1 ? '' : 's'}
+              {ctx.dropped ? ` · ${ctx.dropped} removed` : ''}
+              {ctx.conversation ? ` · ${ctx.conversation}` : ' · no conversation yet'}
+            </div>
+          </div>
+          {saved > 0 && (
+            <span className="badge context" title="Tokens ACM has trimmed from this conversation">
+              −{fmtTok(saved)} saved
+            </span>
+          )}
+        </div>
+
+        {/* live vs saved bar (only meaningful once ACM has trimmed something) */}
+        {saved > 0 && (
+          <>
+            <div style={{ display: 'flex', height: 8, borderRadius: 5, overflow: 'hidden', marginTop: 12, background: 'rgba(127,127,127,0.18)' }}>
+              <div style={{ width: livePct + '%', background: 'var(--accent)' }} title={`${fmtTok(live)} live`} />
+              <div style={{ width: savedPct + '%', background: 'rgba(138,109,59,0.8)' }} title={`${fmtTok(saved)} saved`} />
+            </div>
+            <div className="muted tiny" style={{ display: 'flex', justifyContent: 'space-between', marginTop: 5 }}>
+              <span>● live {fmtTok(live)} ({livePct}%)</span>
+              <span>● saved {fmtTok(saved)} ({savedPct}%)</span>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Connection / routing details */}
+      <h3 className="sec">Gateway</h3>
       <div className="card">
         <div className="kv">
-          <span className="k">Upstream</span><span><code>{status.upstream}</code></span>
-          <span className="k">Tool surface</span><span><code>{status.tool_surface}</code></span>
-          <span className="k">Default provider</span><span>{status.providers?.default || 'env fallback'}</span>
-          <span className="k">Config</span><span className="tiny"><code>{status.config_path}</code></span>
+          <span className="k">Upstream</span>
+          <span><span className="dot ok" /> <code title={status.upstream}>{hostOf(status.upstream)}</code></span>
+          <span className="k">Default provider</span>
+          <span>{status.providers?.default || <span className="muted">env fallback</span>}{(status.providers?.configured || []).length ? <span className="muted tiny"> · {(status.providers.configured).length} configured</span> : null}</span>
+          <span className="k">Tool surface</span><span>{prettySurface(status.tool_surface)}</span>
+          <span className="k">Config</span>
+          <span className="tiny"><code title={status.config_path}>{String(status.config_path || '').split('/').pop()}</code></span>
         </div>
       </div>
 
-      <h3 className="sec">Active techniques</h3>
+      <h3 className="sec">Active techniques <span className="muted tiny">({activeCount} on)</span></h3>
       <div className="chips">
         {Object.entries(tech).map(([k, v]) => (
           <span key={k} className={'chip ' + (on(v) ? 'on' : 'off')}>
@@ -159,6 +265,7 @@ function Chats() {
   const [sel, setSel] = useState<string>('');
   const [msgs, setMsgs] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [raw, setRaw] = useState(true); // raw = every message in order (like the website)
   const [n, reload] = useReload();
 
   useEffect(() => {
@@ -194,7 +301,12 @@ function Chats() {
       <div className="conv-list">
         {convs.map((c) => (
           <div key={c.key} className={'conv' + (c.key === sel ? ' active' : '')} onClick={() => setSel(c.key)}>
-            <span className="id">{c.key}</span>
+            <span className="id" title={c.key} style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {c.title || 'Untitled conversation'}
+              </span>
+              <span className="muted tiny" style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)' }}>{c.key}</span>
+            </span>
             <span className="meta">
               <span className="count-badge">{c.count} msg</span>
               {c.dropped ? <> · <span className="muted">{c.dropped} removed</span></> : null}
@@ -204,31 +316,374 @@ function Chats() {
         ))}
       </div>
 
-      <h3 className="sec">Transcript <span className="muted tiny">— removing hides a message from the model on every future turn (the IDE still shows it)</span></h3>
+      <div className="row" style={{ alignItems: 'center', justifyContent: 'space-between', marginTop: 14 }}>
+        <h3 className="sec" style={{ margin: 0 }}>
+          Transcript <span className="muted tiny">— {msgs.length} message{msgs.length === 1 ? '' : 's'} in context order</span>
+        </h3>
+        <div className="row" style={{ gap: 4 }}>
+          <button className={'btn sm ' + (raw ? '' : 'ghost')} onClick={() => setRaw(true)}>Raw</button>
+          <button className={'btn sm ' + (raw ? 'ghost' : '')} onClick={() => setRaw(false)}>Grouped</button>
+        </div>
+      </div>
+      <p className="muted tiny" style={{ marginTop: -4 }}>
+        Removing hides a message from the model on every future turn (the IDE still shows it).
+      </p>
       <div className="card">
         {msgs.length === 0 ? <p className="muted tiny">No messages recorded for this conversation.</p> :
-          msgs.map((m) => {
-            const r = ROLE(m.role);
-            return (
-              <div key={m.fp} className={'msg ' + r.cls + (m.dropped ? ' dropped' : '')}>
-                <div className="rail" />
-                <div className="content">
-                  <div className="head">
-                    <span className={'badge ' + r.cls}>{r.label}</span>
-                    <span className="muted tiny"><code>{m.fp}</code></span>
-                    <span className="act">
-                      {m.dropped
-                        ? <button className="btn ghost sm" onClick={() => act('restoreMessage', m.fp)}>Restore</button>
-                        : <button className="btn ghost sm" onClick={() => act('dropMessage', m.fp)}>Remove</button>}
-                    </span>
-                  </div>
-                  <div className="text">{m.preview || <span className="muted">(empty)</span>}</div>
-                </div>
-              </div>
-            );
-          })}
+          raw
+            ? msgs.map((m, i) => <MsgRow key={m.fp ?? i} m={m} conv={sel} onAct={act} />)
+            : groupTurns(msgs).map((t, i) => (
+                <TurnGroup key={t.user?.fp ?? 'turn-' + i} turn={t} conv={sel} onAct={act} />
+              ))}
       </div>
       <p><button className="btn sec sm" onClick={reload}>Refresh</button></p>
+    </div>
+  );
+}
+
+// Show the "this can't be undone" confirm only once per session, then remove
+// straight away on later clicks (better UX for bulk cleanup).
+let skipDropConfirm = false;
+function confirmDrop(): boolean {
+  if (skipDropConfirm) return true;
+  let ok = true;
+  try {
+    ok = window.confirm(
+      "Remove this message from the model's context on every future turn? " +
+        "You won't be asked again this session.",
+    );
+  } catch {
+    ok = true; // confirm unavailable in this webview — proceed
+  }
+  if (ok) skipDropConfirm = true;
+  return ok;
+}
+
+// One transcript row: role badge, preview, remove/restore, and — for tool
+// results — a "View image" toggle that shows the visual-method page render.
+function MsgRow({ m, conv, onAct }: { m: any; conv: string; onAct: (method: string, fp: string) => void }) {
+  const r = classify(m);
+  const [imgs, setImgs] = useState<string[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [full, setFull] = useState<string | null>(null); // expanded full text
+  const [fullBusy, setFullBusy] = useState(false);
+  const isTool = String(m.role || '').toLowerCase() === 'tool';
+  const truncated = String(m.preview || '').endsWith('…');
+
+  const viewImages = async () => {
+    if (imgs) { setImgs(null); return; } // toggle closed
+    setBusy(true); setErr('');
+    try {
+      const d: any = await rpc('messageImages', { fp: m.fp, conv });
+      if (d?.error) setErr(d.error);
+      const list = d.images || [];
+      setImgs(list);
+      if (list.length === 0 && !d?.error) setErr('output too small to rasterise');
+    } catch (e: any) {
+      setErr(e.message || 'failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleFull = async () => {
+    if (full !== null) { setFull(null); return; } // collapse
+    setFullBusy(true);
+    try {
+      const d: any = await rpc('messageText', { fp: m.fp, conv });
+      setFull(d?.text || m.preview || '');
+    } catch {
+      setFull(m.preview || '');
+    } finally {
+      setFullBusy(false);
+    }
+  };
+
+  return (
+    <div className={'msg ' + r.cls + (m.dropped ? ' dropped' : '')}>
+      <div className="rail" />
+      <div className="content">
+        <div className="head">
+          <span className={'badge ' + r.cls}>{r.label}</span>
+          <span className="muted tiny"><code>{m.fp}</code></span>
+          {m.dropped && <span className="muted tiny" style={{ color: 'var(--bad, #e06c6c)' }}>removed</span>}
+          <span className="act">
+            {isTool && (
+              <button className="btn ghost sm" onClick={viewImages}>
+                {busy ? '…' : imgs ? 'Hide' : '🖼 View'}
+              </button>
+            )}
+            {m.dropped
+              ? <button className="btn ghost sm" onClick={() => onAct('restoreMessage', m.fp)}>Restore</button>
+              : <button className="btn ghost sm" onClick={() => { if (confirmDrop()) onAct('dropMessage', m.fp); }}>Remove</button>}
+          </span>
+        </div>
+        {/* click to expand the full message (rows only store a short preview) */}
+        <div
+          className="text"
+          style={{ cursor: 'pointer', whiteSpace: full !== null ? 'pre-wrap' : 'normal' }}
+          title={full !== null ? 'Click to collapse' : 'Click to expand full message'}
+          onClick={toggleFull}
+        >
+          {fullBusy
+            ? <span className="muted">loading…</span>
+            : full !== null
+              ? full
+              : (m.preview || <span className="muted">(empty)</span>)}
+        </div>
+        {truncated && (
+          <button className="btn ghost sm" style={{ marginTop: 4 }} onClick={toggleFull}>
+            {fullBusy ? '…' : full !== null ? 'Show less' : 'Show full message'}
+          </button>
+        )}
+        {err && <div className="muted tiny" style={{ marginTop: 4 }}>{err}</div>}
+        {imgs && imgs.length > 0 && (
+          <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {imgs.map((src, i) => (
+              <div key={i} style={{ border: '1px solid var(--vscode-panel-border)', borderRadius: 4, overflow: 'hidden', background: '#fff' }}>
+                <div className="muted tiny" style={{ padding: '2px 6px' }}>page {i + 1}/{imgs.length}</div>
+                <img src={src} alt={'page ' + (i + 1)} style={{ width: '100%', display: 'block' }} />
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function fmtTok(n: number): string {
+  return n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K' : String(n);
+}
+
+// Group the flat transcript into conversation turns: a user message starts a
+// turn; the assistant/tool messages it produced are its children.
+type ChatTurn = { user: any | null; children: any[] };
+function groupTurns(msgs: any[]): ChatTurn[] {
+  const groups: ChatTurn[] = [];
+  let cur: ChatTurn | null = null;
+  for (const m of msgs) {
+    // Only a REAL user prompt opens a turn. System + injected-context messages
+    // (which Claude Code sends as user-role) attach to the surrounding group, so
+    // the noise collapses and your actual prompts stand out.
+    const startsTurn = classify(m).cls === 'user';
+    if (startsTurn) {
+      if (cur) groups.push(cur);
+      cur = { user: m, children: [] };
+    } else {
+      if (!cur) cur = { user: null, children: [] };
+      cur.children.push(m);
+    }
+  }
+  if (cur) groups.push(cur);
+  return groups;
+}
+
+// A collapsible turn: user prompt + token total at the top; expand to inspect
+// and remove the assistant/tool messages it produced.
+function TurnGroup({ turn, conv, onAct }: { turn: ChatTurn; conv: string; onAct: (m: string, fp: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const total =
+    (turn.user ? (turn.user.tokens || 0) : 0) +
+    turn.children.reduce((a, m) => a + (m.tokens || 0), 0);
+  const isContextGroup = !turn.user;
+  const badgeCls = isContextGroup ? 'context' : 'user';
+  const badgeLabel = isContextGroup ? 'Context' : 'User';
+  const preview = isContextGroup
+    ? `${turn.children.length} context / system message${turn.children.length === 1 ? '' : 's'}`
+    : turn.user.preview || '(empty)';
+  return (
+    <div className="turn" style={{ borderBottom: '1px solid var(--vscode-panel-border)', paddingBottom: 6, marginBottom: 6 }}>
+      <div className="row" onClick={() => setOpen((v) => !v)} style={{ cursor: 'pointer', gap: 6 }}>
+        <span className="muted">{open ? '▾' : '▸'}</span>
+        <span className={'badge ' + badgeCls}>{badgeLabel}</span>
+        <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, fontSize: 13 }}>{preview}</span>
+        <span className="muted tiny" style={{ whiteSpace: 'nowrap' }}>{turn.children.length} msg</span>
+        <span className="muted tiny" style={{ whiteSpace: 'nowrap' }}>≈{fmtTok(total)} tok</span>
+      </div>
+      {open && (
+        <div style={{ marginTop: 6 }}>
+          {turn.user && <MsgRow m={turn.user} conv={conv} onAct={onAct} />}
+          {turn.children.map((m) => <MsgRow key={m.fp} m={m} conv={conv} onAct={onAct} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Cleanup (task-aware relevance suggestions) ─────────────────────────
+function Cleanup() {
+  const [convs, setConvs] = useState<any[]>([]);
+  const [sel, setSel] = useState<string>('');
+  const [sugs, setSugs] = useState<any[] | null>(null);
+  const [info, setInfo] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    rpc('conversations').then((d: any) => {
+      const list = d.conversations || [];
+      setConvs(list);
+      setSel((cur) => cur || (list[0] ? list[0].key : ''));
+    }).catch(() => {});
+  }, []);
+
+  const analyze = async () => {
+    setBusy(true); setErr(''); setSugs(null); setInfo(null);
+    try {
+      const d: any = await rpc('relevanceSuggest', { conv: sel });
+      if (d.error) setErr(d.error);
+      setSugs(d.suggestions || []);
+      setInfo(d.info || null);
+      if (d.conversation && d.conversation !== sel) setSel(d.conversation);
+    } catch (e: any) {
+      setErr(e.message || 'failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Apply a decision to one suggestion and log the user's choice for training.
+  const decide = async (s: any, action: 'accept_drop' | 'reject' | 'restore') => {
+    const conv = sel;
+    try {
+      if (action === 'accept_drop') {
+        await rpc('dropMany', { fps: s.member_fps, conv });
+      } else if (action === 'restore') {
+        for (const fp of s.member_fps) await rpc('restoreMessage', { fp, conv });
+      }
+      await rpc('relevanceFeedback', {
+        payload: {
+          conv,
+          episode_id: s.episode_id,
+          title: s.title,
+          shown_label: s.label,
+          user_action: action,
+          final_label: action === 'accept_drop' ? s.label : 'KEEP',
+          score: s.score,
+          source: s.source,
+          tokens: s.freed_tokens,
+        },
+      });
+    } catch (e: any) {
+      setErr(e.message || 'action failed');
+      return;
+    }
+    setSugs((cur) =>
+      (cur || []).map((x) =>
+        x.episode_id === s.episode_id ? { ...x, dropped: action === 'accept_drop' } : x,
+      ),
+    );
+  };
+
+  // Replace an episode with a short summary (saves tokens, keeps the gist).
+  const summarize = async (s: any) => {
+    const conv = sel;
+    try {
+      const d: any = await rpc('relevanceSummarize', {
+        member_fps: s.member_fps,
+        conv,
+        title: s.title,
+      });
+      if (d?.error) { setErr(d.error); return; }
+      await rpc('relevanceFeedback', {
+        payload: {
+          conv,
+          episode_id: s.episode_id,
+          title: s.title,
+          shown_label: s.label,
+          user_action: 'accept_summarize',
+          final_label: 'SUMMARIZE',
+          score: s.score,
+          source: s.source,
+          tokens: s.freed_tokens,
+        },
+      });
+    } catch (e: any) {
+      setErr(e.message || 'summarize failed');
+      return;
+    }
+    setSugs((cur) =>
+      (cur || []).map((x) =>
+        x.episode_id === s.episode_id ? { ...x, dropped: true, summarized: true } : x,
+      ),
+    );
+  };
+
+  const actionable = (sugs || []).filter((s) => s.label !== 'KEEP');
+  const kept = (sugs || []).filter((s) => s.label === 'KEEP');
+
+  return (
+    <div>
+      <p className="muted tiny">
+        The auditor splits this conversation into episodes and suggests which finished or
+        unrelated ones to remove. Nothing is removed until you click — and every choice is
+        logged to improve the model.
+      </p>
+      <div className="row">
+        <select value={sel} onChange={(e) => setSel(e.target.value)} style={{ minWidth: 0, flex: 1 }}>
+          {convs.length === 0 && <option value="">(no conversations seen yet)</option>}
+          {convs.map((c) => (
+            <option key={c.key} value={c.key}>{c.key} · {c.count} msg</option>
+          ))}
+        </select>
+        <button className="btn" onClick={analyze} disabled={busy || !sel}>
+          {busy ? <><span className="spin" /> Analyzing…</> : 'Analyze'}
+        </button>
+      </div>
+
+      {err && <div className="banner" style={{ marginTop: 10 }}>{err}</div>}
+
+      {info && (
+        <h3 className="sec">
+          {info.candidates || 0} candidate{(info.candidates || 0) === 1 ? '' : 's'} ·
+          {' '}{info.drop || 0} drop · {info.summarize || 0} summarize ·
+          {' '}~{info.potential_freed_tokens || 0} tokens recoverable
+        </h3>
+      )}
+
+      {actionable.map((s) => {
+        const sw = statusWord(s);
+        const canSummarize = s.label === 'SUMMARIZE';
+        return (
+          <div className="card" key={s.episode_id} style={{ opacity: s.dropped ? 0.55 : 1, padding: '8px 10px' }}>
+            <div className="row">
+              <span title={s.reason} style={{ background: sw.bg, color: sw.fg, padding: '1px 6px', borderRadius: 5, fontWeight: 600, fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.4 }}>
+                {sw.w}
+              </span>
+              <strong title={s.title + '\n' + s.reason} style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 13 }}>{s.title}</strong>
+              <span className="muted tiny" style={{ marginLeft: 'auto', whiteSpace: 'nowrap' }}>~{s.freed_tokens} tok</span>
+            </div>
+            <div className="row" style={{ marginTop: 6 }}>
+              {s.dropped
+                ? <span className="muted tiny">{s.summarized ? 'summarized' : 'removed'} · <button className="btn ghost sm" onClick={() => decide(s, 'restore')}>Restore</button></span>
+                : <>
+                    {canSummarize && <button className="btn ghost sm" onClick={() => summarize(s)}>Summarize</button>}
+                    <button className="btn sm" onClick={() => decide(s, 'accept_drop')}>Remove</button>
+                    <button className="btn ghost sm" onClick={() => decide(s, 'reject')}>Keep</button>
+                  </>}
+              <span className="muted tiny" style={{ marginLeft: 'auto' }}><code>{s.source}</code> · {s.member_fps.length} msg</span>
+            </div>
+          </div>
+        );
+      })}
+
+      {sugs && actionable.length === 0 && !err && (
+        <p className="muted tiny" style={{ marginTop: 10 }}>Nothing to remove — every episode looks relevant to the current task.</p>
+      )}
+
+      {kept.length > 0 && (
+        <>
+          <h3 className="sec">Kept ({kept.length})</h3>
+          {kept.map((s) => (
+            <div className="card tiny" key={s.episode_id}>
+              <span className="muted">KEEP</span> · {s.title}
+              <span className="muted"> — {s.reason}</span>
+            </div>
+          ))}
+        </>
+      )}
     </div>
   );
 }
@@ -293,6 +748,39 @@ function Techniques() {
           </div>
         </div>
       </div>
+
+      {cm.relevance_pruning && (
+        <div className="card tech">
+          <Toggle on={!!cm.relevance_pruning.enabled} onChange={(v) => setCM('relevance_pruning', 'enabled', v)} />
+          <div className="meta">
+            <div className="name">Relevance cleanup</div>
+            <div className="desc">Split the chat into episodes and suggest which finished/unrelated ones to remove. Suggest-only — review &amp; apply in the Cleanup tab.</div>
+            {cm.relevance_pruning.enabled && (
+              <div className="params">
+                <label className="field">Engine
+                  <select value={cm.relevance_pruning.mode} onChange={(e) => setCM('relevance_pruning', 'mode', e.target.value)}>
+                    <option value="judge">judge (LLM)</option>
+                    <option value="encoder">encoder (local)</option>
+                    <option value="ensemble">ensemble (both)</option>
+                  </select>
+                </label>
+                {cm.relevance_pruning.mode === 'ensemble' && (
+                  <label className="field">On disagreement
+                    <select value={cm.relevance_pruning.arbitration} onChange={(e) => setCM('relevance_pruning', 'arbitration', e.target.value)}>
+                      <option value="safest">safest (keep)</option>
+                      <option value="judge_wins">judge wins</option>
+                      <option value="agreement_only">only if both agree</option>
+                    </select>
+                  </label>
+                )}
+                <label className="field">Keep recent episodes
+                  <input type="number" value={cm.relevance_pruning.keep_recent} onChange={(e) => setCM('relevance_pruning', 'keep_recent', Number(e.target.value))} />
+                </label>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       <div className="card tech">
         <Toggle on={!!vm.enabled} onChange={(v) => setVm({ ...vm, enabled: v })} />

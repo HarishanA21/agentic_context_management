@@ -106,6 +106,43 @@ _SELECT_FIELDS = (
 )
 
 
+def _validate_model_id(
+    provider, model_id: str, credentials: Dict[str, str]
+) -> None:
+    """Best-effort guard: reject a ``model_id`` the provider doesn't
+    actually offer, so a typo can't be saved and then silently break
+    every chat turn (the usual symptom is a 404 from the upstream API).
+
+    Only runs for providers that publish a model list. If the list can't
+    be fetched (network/credentials hiccup) or comes back empty, we skip
+    validation rather than block a legitimate save on a transient error.
+    """
+    if not getattr(provider, "supports_model_listing", False):
+        return
+    try:
+        models = provider.list_models(credentials)
+    except Exception:
+        return  # transient — don't block the save on a flaky listing call
+    if not models:
+        return  # nothing to validate against
+    if model_id in models:
+        return
+    # Catalogs sometimes carry ":free"/region variants of the same model —
+    # accept a base-name match so we don't reject a valid pick on a suffix.
+    base = model_id.split(":")[0]
+    if any(m == base or m.split(":")[0] == base for m in models):
+        return
+    import difflib
+
+    close = difflib.get_close_matches(model_id, models, n=3, cutoff=0.5)
+    hint = f" Did you mean: {', '.join(close)}?" if close else ""
+    raise HTTPException(
+        400,
+        f"Model '{model_id}' isn't offered by this provider.{hint} "
+        "Click 'Fetch available' to see the valid model IDs.",
+    )
+
+
 # ── Request models ─────────────────────────────────────────────────────────
 
 
@@ -225,6 +262,8 @@ def create_provider(req: CreateProviderRequest, request: Request) -> Dict[str, A
             raise HTTPException(400, str(e))
         except Exception as e:
             raise HTTPException(400, f"Verification failed: {e}")
+        # Credentials are good — now make sure the model actually exists.
+        _validate_model_id(provider, model_id, req.credentials)
         last_error = None
 
     blob = encrypt_credentials(req.credentials)
@@ -302,6 +341,8 @@ def update_provider(
             raise HTTPException(400, str(e))
         except Exception as e:
             raise HTTPException(400, f"Verification failed: {e}")
+        # Credentials are good — now make sure the model actually exists.
+        _validate_model_id(provider, new_model_id, creds_for_test)
 
     # Build the UPDATE dynamically — every field below is independent.
     set_clauses: list[str] = ["label = %s", "model_id = %s"]

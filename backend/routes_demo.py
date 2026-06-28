@@ -32,6 +32,7 @@ from time import perf_counter
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
@@ -57,6 +58,14 @@ class DemoCompareRequest(BaseModel):
     # the global default by _normalise_strategy.
     strategies: Optional[List[str]] = None
     model: Optional[str] = None
+    # Visual-compression tab batching: the client runs the 10 columns in
+    # small batches (2 at a time) to avoid provider rate limits, so it asks
+    # for a subset of column indices per request. None ⇒ run all columns.
+    columns: Optional[List[int]] = None
+    # When a batch doesn't include column 0 (the ground-truth baseline), the
+    # client passes the baseline's reply (captured from the first batch) so
+    # this batch's columns can still be judged against it.
+    baseline_reply: Optional[str] = None
     # PR #3 — Tab selector for the Strategy Demo page.
     #   None / "current_methods"     → 2-column current behaviour
     #   "visual_compression"         → 4-column bench:
@@ -82,6 +91,7 @@ def _build_demo_agent(
     *,
     compress: Optional[Dict[str, Any]] = None,
     on_raw: Optional[Callable[[str, str], None]] = None,
+    image_recall: Optional[Dict[str, Any]] = None,
 ):
     """Construct a throwaway agent. Fresh InMemorySaver per call so two
     parallel runs (one per strategy) can't see each other's state.
@@ -125,11 +135,27 @@ def _build_demo_agent(
             on_raw=on_raw,
         )
 
+    # Optional image-recall technique (caching and/or within-loop image
+    # eviction). When set, attach the provider-agnostic middleware so the
+    # demo's single-turn tool loop exercises the selected method.
+    middleware = []
+    if image_recall and (image_recall.get("mode") or "off") != "off":
+        from cache_layout import ImageRecallMiddleware  # lazy
+
+        middleware = [
+            ImageRecallMiddleware(
+                mode=str(image_recall.get("mode") or "off"),
+                keep_recent_images=int(image_recall.get("keep_recent_images") or 3),
+                ttl=str(image_recall.get("cache_ttl") or "5m"),
+            )
+        ]
+
     return create_agent(
         model=_build_model(model_name),
         tools=agent_tools,
         system_prompt=system_prompt,
         checkpointer=saver,
+        middleware=middleware,
     )
 
 
@@ -142,6 +168,7 @@ async def _run_one(
     thread_id: str,
     *,
     compress: Optional[Dict[str, Any]] = None,
+    image_recall: Optional[Dict[str, Any]] = None,
     label: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one strategy end-to-end and collect metrics.
@@ -172,6 +199,7 @@ async def _run_one(
             model_name,
             compress=compress,
             on_raw=_collect_raw,
+            image_recall=image_recall,
         )
     except Exception as e:
         return {
@@ -227,16 +255,40 @@ async def _run_one(
         }
     latency_ms = int((perf_counter() - t0) * 1000)
 
+    from cache_layout import read_cache_tokens  # lazy
+
     messages = result.get("messages") or []
     input_tokens = 0
     output_tokens = 0
+    cache_read_tokens = 0   # image-recall caching: tokens served from cache
+    cache_write_tokens = 0  # tokens written into the cache (first sighting)
+    image_blocks = 0       # PR #5 — count multimodal image parts the agent saw
+    image_messages = 0     # PR #5 — distinct ToolMessages that carried at least one image
     tool_events: list[dict] = []
     final_reply = ""
     for m in messages:
+        # PR #5: count image content blocks across all messages. The
+        # provider's input_tokens already includes their billed cost,
+        # so we don't double-count tokens — we just surface the count
+        # so the user can verify the compressed columns sent images.
+        content = getattr(m, "content", None)
+        if isinstance(content, list):
+            n_images = sum(
+                1
+                for b in content
+                if isinstance(b, dict)
+                and b.get("type") in {"image_url", "image"}
+            )
+            if n_images:
+                image_blocks += n_images
+                image_messages += 1
         if isinstance(m, AIMessage):
             um = getattr(m, "usage_metadata", None) or {}
             input_tokens += int(um.get("input_tokens") or 0)
             output_tokens += int(um.get("output_tokens") or 0)
+            ct = read_cache_tokens(m)
+            cache_read_tokens += ct["cache_read"]
+            cache_write_tokens += ct["cache_write"]
             for tc in m.tool_calls or []:
                 tool_events.append(
                     {
@@ -262,6 +314,21 @@ async def _run_one(
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
+            # PR #5 — provability that image-bearing tool messages
+            # actually reached the model. Provider's input_tokens
+            # already includes their billed cost — we don't double-count.
+            "image_blocks": image_blocks,
+            "image_messages": image_messages,
+            # Image-recall caching: tokens served from / written to the
+            # provider prompt cache across this column's model calls. Zero
+            # for non-cache columns (and for providers that don't report it).
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "cache_hit_ratio": (
+                round(cache_read_tokens / input_tokens, 4)
+                if input_tokens
+                else None
+            ),
         },
         "tool_events": tool_events,
         # Plain-text record of every tool call's *uncompressed* output.
@@ -312,98 +379,207 @@ _VISUAL_COLUMNS: List[Dict[str, Any]] = [
             "only_tools": ["describe_tools", "execute_typescript"],
         },
     },
+    # ── image-recall columns (5-10). Each applies ONE technique on top of an
+    #    existing image method — NOT a mix across columns:
+    #      Col 5-7  = Col 2 ("Normal Tool Call + Image", raw-image) + cache / evict / both
+    #      Col 8-10 = Col 4 ("Code Mode + Image", TS+image)        + cache / evict / both
+    #    They reuse the exact compress config of Col 2 / Col 4 so the only
+    #    variable is the image_recall mode. Columns 1-4 carry no image_recall.
+    {
+        # Col 5 = Col 2 + caching only
+        "label": "Col 2 + Caching",
+        "strategy": "tool_calling",
+        "compress": {"mode": "auxiliary", "threshold_tokens": 500, "exclude_tools": ["calculator", "get_weather"]},
+        "image_recall": {"mode": "cache", "cache_ttl": "5m"},
+    },
+    {
+        # Col 6 = Col 2 + evicting only
+        "label": "Col 2 + Evicting (K=3)",
+        "strategy": "tool_calling",
+        "compress": {"mode": "auxiliary", "threshold_tokens": 500, "exclude_tools": ["calculator", "get_weather"]},
+        "image_recall": {"mode": "evict", "keep_recent_images": 3},
+    },
+    {
+        # Col 7 = Col 2 + caching + evicting
+        "label": "Col 2 + Caching + Evicting (K=3)",
+        "strategy": "tool_calling",
+        "compress": {"mode": "auxiliary", "threshold_tokens": 500, "exclude_tools": ["calculator", "get_weather"]},
+        "image_recall": {"mode": "cache_evict", "keep_recent_images": 3, "cache_ttl": "5m"},
+    },
+    {
+        # Col 8 = Col 4 + caching only
+        "label": "Col 4 + Caching",
+        "strategy": "ts_code_mode",
+        "compress": {"mode": "templated", "threshold_tokens": 500, "only_tools": ["describe_tools", "execute_typescript"]},
+        "image_recall": {"mode": "cache", "cache_ttl": "5m"},
+    },
+    {
+        # Col 9 = Col 4 + evicting only
+        "label": "Col 4 + Evicting (K=3)",
+        "strategy": "ts_code_mode",
+        "compress": {"mode": "templated", "threshold_tokens": 500, "only_tools": ["describe_tools", "execute_typescript"]},
+        "image_recall": {"mode": "evict", "keep_recent_images": 3},
+    },
+    {
+        # Col 10 = Col 4 + caching + evicting
+        "label": "Col 4 + Caching + Evicting (K=3)",
+        "strategy": "ts_code_mode",
+        "compress": {"mode": "templated", "threshold_tokens": 500, "only_tools": ["describe_tools", "execute_typescript"]},
+        "image_recall": {"mode": "cache_evict", "keep_recent_images": 3, "cache_ttl": "5m"},
+    },
 ]
 
 
 # Pin the judge model so accuracy scores stay stable across runs.
 # Override with `DEMO_JUDGE_MODEL` env var if you want to test another.
-_JUDGE_MODEL_DEFAULT = "openai/gpt-4o"
+_JUDGE_MODEL_DEFAULT = "google/gemini-3.1-flash-lite"
 
-_JUDGE_SYSTEM = (
-    "You are a strict factual-grounding judge. Given the user's prompt, "
-    "the raw tool outputs the agent had access to, and the agent's final "
-    "reply, score the reply 0-100 on whether its claims, names, URLs, and "
-    "citations are actually supported by the raw tool outputs. Penalise "
-    "fabricated facts, mis-spelled author names, invented URLs, and "
-    "claims that contradict the source. Reward concise faithful answers."
-)
+_JUDGE_SYSTEM = """\
+You are an output-comparison judge. Your job is to measure how faithfully a candidate
+agent reply preserves the meaning and key values of a baseline reply.
+
+The baseline is the ground truth. The candidate received the same underlying data
+in a different encoding (compressed image, code-mode text, or image of code output).
+Your role is to reason carefully about each difference you find — not to pattern-match
+on surface text — and then score based on your conclusions.\
+"""
 
 _JUDGE_PROMPT_TEMPLATE = """\
-USER PROMPT:
+ORIGINAL USER PROMPT:
 <<<
 {prompt}
 >>>
 
-GROUND-TRUTH RAW TOOL OUTPUTS (the agent had this data available — the
-agent itself may have seen text or an image, but you always score against
-the raw text):
+BASELINE REPLY (ground truth — treat this as 100% correct):
 <<<
-{raw}
+{baseline_reply}
 >>>
 
-AGENT'S FINAL REPLY:
+CANDIDATE REPLY (the method being evaluated):
 <<<
-{reply}
+{candidate_reply}
 >>>
 
-Score the reply 0-100 across these criteria, weighted equally:
-  1. Factual Precision  — are claims actually in the raw outputs?
-  2. Reference Verification — are URLs / citations real and unmodified?
-  3. Source Coverage — does it use the relevant tool data?
-  4. Hallucination Severity (inverted) — how much is fabricated?
+════════════════════════════════════════
+STEP 1 — ANALYSE EVERY DIFFERENCE FIRST
+════════════════════════════════════════
 
-Reply with ONLY a JSON object:
-  {{"score": <int 0-100>, "reasoning": "<one sentence>"}}
+Before scoring anything, go through every difference you notice and answer these
+questions for each one. Write your answers in the "thinking" field.
 
-Do not include code fences or any other text.
+For each differing NUMBER:
+  Q1. If I round the baseline value to the same number of decimal places the
+      candidate used, do they match?
+  Q2. Are any significant digits actually wrong — i.e. would the difference matter
+      to someone reading the final answer?
+  Q3. Based on Q1 and Q2: is this a precision/rounding difference, or a real error?
+
+For each differing PHRASE, LABEL, or TIME EXPRESSION:
+  Q4. Does each version describe the same quantity or event, just worded differently?
+  Q5. Would a reader of the candidate reach a different factual conclusion than a
+      reader of the baseline?
+  Q6. Based on Q4 and Q5: is this a presentation difference, or a meaning difference?
+
+For each item the candidate contains that the baseline does NOT:
+  Q7. Can this item be derived from, or is it equivalent to, something already in
+      the baseline (e.g. a reformatted label, a rounded number, a synonym)?
+  Q8. Does it assert a new fact, value, or claim that has no basis in the baseline?
+  Q9. Based on Q7 and Q8: is this a formatting choice, or a fabricated addition?
+
+Only after answering those questions proceed to Step 2.
+
+════════════════════════════
+STEP 2 — SCORE FOUR CRITERIA
+════════════════════════════
+
+Use ONLY the conclusions from Step 1 to justify each score. Do not re-examine the
+raw text — score based on what your analysis determined.
+
+  C1. Answer Correctness (1-25)
+      Did the candidate's final answer or conclusion match the baseline's?
+      Score on meaning, not wording. Use your Step 1 findings on whether differences
+      were real errors or presentation choices.
+      25 = same meaning; 1 = completely wrong or absent conclusion.
+
+  C2. Value Fidelity (1-25)  [PRIMARY — detects encoding/OCR corruption]
+      Were key values faithfully preserved?
+      Only count items where Step 1 determined there is a REAL error (Q2=yes or Q3=real error).
+      Items where Q3 = "rounding/precision difference" must NOT appear in mutated_values.
+      25 = no real corruptions found; 1 = most values are genuinely wrong.
+
+  C3. Completeness (1-25)
+      Did the candidate address every sub-task the baseline addressed?
+      Count distinct questions or steps in the baseline, check whether each was
+      answered in the candidate. Presentation order does not matter.
+      25 = all sub-tasks covered; 1 = most sub-tasks missing.
+
+  C4. Hallucination (1-25)  [INVERTED — 25 = no hallucination]
+      Did the candidate fabricate anything?
+      Only count items where Step 1 determined Q8=yes (new fact with no basis in baseline).
+      Items where Q9 = "formatting choice" must NOT appear in hallucinated_claims.
+      25 = no fabrications found; 1 = heavily fabricated content.
+
+════════════════
+OUTPUT (JSON only — no prose, no code fences)
+════════════════
+
+{{
+  "thinking": "<your Step 1 Q1-Q9 analysis for every non-trivial difference>",
+  "c1_answer_correctness": {{
+    "score": <int 1-25>,
+    "baseline_answer": "<final answer from baseline>",
+    "candidate_answer": "<final answer from candidate>",
+    "match": <true|false>
+  }},
+  "c2_value_fidelity": {{
+    "score": <int 1-25>,
+    "exact_values": ["<value correctly reproduced>"],
+    "mutated_values": ["<only items where Q3=real error: baseline X → candidate Y>"]
+  }},
+  "c3_completeness": {{
+    "score": <int 1-25>,
+    "covered": ["..."],
+    "missing": ["..."]
+  }},
+  "c4_hallucination": {{
+    "score": <int 1-25>,
+    "hallucinated_claims": ["<only items where Q8=yes and Q9=fabricated addition>"]
+  }},
+  "total_score": <int 0-100>,
+  "summary": "<one sentence on the most significant real difference found, or 'no substantive differences' if none>"
+}}
+
+Compute total_score as: c1 + c2 + c3 + c4  (they already sum to 100).
 """
-
-
-def _flatten_raw_outputs(items: List[Tuple[str, str]], *, cap: int = 12_000) -> str:
-    """Concatenate the (tool_name, text) pairs into a single block the
-    judge can read, with a hard byte cap so a runaway tool doesn't blow
-    out the judge's context."""
-    parts: List[str] = []
-    used = 0
-    for name, text in items:
-        header = f"\n--- tool: {name} ---\n"
-        chunk = header + (text or "")
-        if used + len(chunk) > cap:
-            remaining = cap - used
-            if remaining > len(header) + 20:
-                parts.append(header + (text or "")[: remaining - len(header) - 4] + " […]")
-            break
-        parts.append(chunk)
-        used += len(chunk)
-    return "".join(parts) or "(no tool outputs recorded)"
 
 
 async def _run_judge(
     prompt: str,
-    reply: str,
-    raw_outputs: List[Tuple[str, str]],
+    baseline_reply: str,
+    candidate_reply: str,
 ) -> Dict[str, Any]:
-    """One GPT-4o call. Returns ``{"score": int, "reasoning": str}``.
+    """One Qwen3-Max call. Compares candidate_reply against baseline_reply.
+    Returns {"score": int, "reasoning": str, "criteria": {...}}.
     Always returns a result block — never raises into the demo path."""
     import json
     from langchain_core.messages import HumanMessage, SystemMessage
     from api import _build_model  # lazy
 
-    if not (reply or "").strip():
-        return {"score": 0, "reasoning": "agent produced no reply"}
+    if not (candidate_reply or "").strip():
+        return {"score": 0, "reasoning": "agent produced no reply", "criteria": {}}
 
     judge_slug = (
         os.getenv("DEMO_JUDGE_MODEL") or _JUDGE_MODEL_DEFAULT
     ).strip() or _JUDGE_MODEL_DEFAULT
     try:
-        model = _build_model(judge_slug)
+        model = _build_model(judge_slug).bind(temperature=0.0)
     except Exception as e:
-        return {"score": -1, "reasoning": f"judge build failed: {e}"}
+        return {"score": -1, "reasoning": f"judge build failed: {e}", "criteria": {}}
 
     user = _JUDGE_PROMPT_TEMPLATE.format(
         prompt=(prompt or "")[:2_000],
-        raw=_flatten_raw_outputs(raw_outputs),
-        reply=(reply or "")[:6_000],
+        baseline_reply=(baseline_reply or "")[:6_000],
+        candidate_reply=(candidate_reply or "")[:6_000],
     )
     try:
         resp = await model.ainvoke(
@@ -411,7 +587,7 @@ async def _run_judge(
         )
         text = resp.content if isinstance(resp.content, str) else str(resp.content)
     except Exception as e:
-        return {"score": -1, "reasoning": f"judge call failed: {type(e).__name__}: {e}"}
+        return {"score": -1, "reasoning": f"judge call failed: {type(e).__name__}: {e}", "criteria": {}}
 
     # Tolerant JSON parse — model may add prose despite instructions.
     text = (text or "").strip()
@@ -425,11 +601,16 @@ async def _run_judge(
         text = text[start : end + 1]
     try:
         parsed = json.loads(text)
-        score = int(parsed.get("score", -1))
-        reasoning = str(parsed.get("reasoning", ""))[:300]
-        return {"score": max(-1, min(100, score)), "reasoning": reasoning}
+        score = int(parsed.get("total_score", -1))
+        summary = str(parsed.get("summary", ""))[:300]
+        criteria = {
+            k: parsed[k]
+            for k in ("c1_answer_correctness", "c2_value_fidelity", "c3_completeness", "c4_hallucination")
+            if k in parsed
+        }
+        return {"score": max(-1, min(100, score)), "reasoning": summary, "criteria": criteria}
     except Exception as e:
-        return {"score": -1, "reasoning": f"judge parse failed: {e}"}
+        return {"score": -1, "reasoning": f"judge parse failed: {e}", "criteria": {}}
 
 
 async def _run_visual_compression_tab(
@@ -438,26 +619,45 @@ async def _run_visual_compression_tab(
     real_tools: list,
     model_name: str,
 ) -> Dict[str, Any]:
-    """4-column run for Tab 2. Runs every column in parallel, then fires
-    one judge call per column once the runs settle."""
+    """Run a *subset* of the 10 visual-bench columns (Tab 2).
+
+    The client drives batching: it asks for a few column indices at a time
+    (2, to dodge provider rate limits) via ``body.columns``, shows each
+    batch's results, then requests the next. We run only the requested
+    columns in parallel, judge them against the baseline reply (column 0's
+    output — included in the first batch, then echoed back by the client on
+    later batches), and tag every result with its column ``index`` so the UI
+    can slot it into the right position. ``columns=None`` runs all columns.
+    """
+    n_cols = len(_VISUAL_COLUMNS)
+    # Resolve + sanitise the requested indices (dedup, in-range, sorted).
+    if body.columns is None:
+        indices = list(range(n_cols))
+    else:
+        indices = sorted({i for i in body.columns if isinstance(i, int) and 0 <= i < n_cols})
+    if not indices:
+        raise HTTPException(400, "no valid column indices")
+
     rid = uuid.uuid4().hex[:8]
     tasks = [
         _run_one(
-            col["strategy"],
+            _VISUAL_COLUMNS[i]["strategy"],
             body.prompt.strip(),
             model_name,
             user_id,
             real_tools,
             thread_id=f"demo:{user_id}:{rid}:v{i}",
-            compress=col.get("compress"),
-            label=col["label"],
+            compress=_VISUAL_COLUMNS[i].get("compress"),
+            image_recall=_VISUAL_COLUMNS[i].get("image_recall"),
+            label=_VISUAL_COLUMNS[i]["label"],
         )
-        for i, col in enumerate(_VISUAL_COLUMNS)
+        for i in indices
     ]
     raw = await asyncio.gather(*tasks, return_exceptions=True)
 
     results: List[Dict[str, Any]] = []
-    for col, item in zip(_VISUAL_COLUMNS, raw):
+    for i, item in zip(indices, raw):
+        col = _VISUAL_COLUMNS[i]
         if isinstance(item, BaseException):
             import traceback
 
@@ -469,6 +669,7 @@ async def _run_visual_compression_tab(
             traceback.print_exc()
             results.append(
                 {
+                    "index": i,
                     "strategy": col["strategy"],
                     "label": col["label"],
                     "ok": False,
@@ -480,48 +681,39 @@ async def _run_visual_compression_tab(
                 }
             )
         else:
+            item["index"] = i
             results.append(item)
 
-    # Use Column 1 (baseline tool_calling) raw outputs as ground truth
-    # for every judge call — the paper's pattern. Falls back to each
-    # column's own raw outputs if the baseline had none.
-    baseline_raw = results[0].get("raw_tool_outputs") if results else []
+    by_index = {r["index"]: r for r in results}
 
-    judge_tasks = [
-        _run_judge(
-            body.prompt.strip(),
-            r.get("reply", ""),
-            baseline_raw or r.get("raw_tool_outputs", []),
-        )
-        for r in results
-    ]
-    judge_results = await asyncio.gather(*judge_tasks, return_exceptions=True)
-    for r, j in zip(results, judge_results):
+    # Baseline reply (column 0 = raw text, ground truth). Prefer column 0's
+    # reply when this batch ran it; otherwise use the one the client passed.
+    if 0 in by_index:
+        baseline_reply = by_index[0].get("reply") or ""
+        by_index[0]["accuracy"] = {
+            "score": 100,
+            "reasoning": "baseline — raw text, ground truth",
+            "criteria": {},
+        }
+    else:
+        baseline_reply = (body.baseline_reply or "")
+
+    # Judge every non-baseline column in this batch against the baseline reply.
+    to_judge = [r for r in results if r["index"] != 0]
+    judge_results = await asyncio.gather(
+        *[
+            _run_judge(body.prompt.strip(), baseline_reply, r.get("reply", ""))
+            for r in to_judge
+        ],
+        return_exceptions=True,
+    )
+    for r, j in zip(to_judge, judge_results):
         if isinstance(j, BaseException):
-            r["accuracy"] = {"score": -1, "reasoning": f"{type(j).__name__}"}
+            r["accuracy"] = {"score": -1, "reasoning": f"{type(j).__name__}", "criteria": {}}
         else:
             r["accuracy"] = j
-        # Strip raw outputs from the wire payload — they were only for
-        # the judge step. Saves a chunk of response bytes.
-        r.pop("raw_tool_outputs", None)
-
-    # Compression ratios: Col 2 vs Col 1, Col 4 vs Col 3 (per the plan).
-    def _input_tokens(idx: int) -> int:
-        try:
-            return int(results[idx]["metrics"].get("input_tokens") or 0)
-        except (KeyError, IndexError, TypeError):
-            return 0
-
-    def _ratio(after: int, before: int) -> Optional[float]:
-        if not before:
-            return None
-        saved = max(0, before - after)
-        return round(saved / before, 4)
-
-    compression_ratios = {
-        "column_2_vs_1": _ratio(_input_tokens(1), _input_tokens(0)),
-        "column_4_vs_3": _ratio(_input_tokens(3), _input_tokens(2)),
-    }
+    for r in results:
+        r["context_window"] = r.pop("raw_tool_outputs", [])
 
     return {
         "prompt": body.prompt.strip(),
@@ -532,8 +724,147 @@ async def _run_visual_compression_tab(
         ).strip()
         or _JUDGE_MODEL_DEFAULT,
         "results": results,
-        "compression_ratios": compression_ratios,
+        # Echo the baseline reply so the client can carry it into later
+        # batches (which won't re-run column 0). Compression ratios are
+        # computed client-side from the accumulated columns' input tokens.
+        "baseline_reply": baseline_reply,
     }
+
+
+# ─── streaming visual bench (SSE, 4 columns in parallel) ───────────────
+
+# How many columns run concurrently. 4 keeps the UI lively while staying
+# well under provider rate limits (the old client batched 2 at a time).
+_VISUAL_STREAM_CONCURRENCY = 4
+
+
+async def _visual_stream_events(
+    body: DemoCompareRequest,
+    user_id: str,
+    real_tools: list,
+    model_name: str,
+):
+    """Async generator of SSE frames for the streaming visual bench.
+
+    Runs all 10 columns with a concurrency cap of ``_VISUAL_STREAM_CONCURRENCY``
+    and emits one ``column`` frame the moment a column's run *and* its judge
+    call have both finished — so the UI fills in live, in completion order.
+    Column 0 (raw text) is the ground-truth baseline every other column is
+    judged against; non-baseline columns wait for it before judging.
+    """
+    import json as _json
+
+    judge_model = (
+        os.getenv("DEMO_JUDGE_MODEL") or _JUDGE_MODEL_DEFAULT
+    ).strip() or _JUDGE_MODEL_DEFAULT
+    prompt = (body.prompt or "").strip()
+    indices = list(range(len(_VISUAL_COLUMNS)))
+    rid = uuid.uuid4().hex[:8]
+
+    def _sse(obj: Dict[str, Any]) -> bytes:
+        return f"data: {_json.dumps(obj)}\n\n".encode("utf-8")
+
+    yield _sse(
+        {
+            "type": "meta",
+            "prompt": prompt,
+            "model": model_name,
+            "judge_model": judge_model,
+            "total": len(indices),
+            "concurrency": _VISUAL_STREAM_CONCURRENCY,
+        }
+    )
+
+    sem = asyncio.Semaphore(_VISUAL_STREAM_CONCURRENCY)
+    baseline_reply = {"v": ""}
+    baseline_ready = asyncio.Event()
+
+    async def run_col(i: int) -> Dict[str, Any]:
+        col = _VISUAL_COLUMNS[i]
+        async with sem:
+            res = await _run_one(
+                col["strategy"],
+                prompt,
+                model_name,
+                user_id,
+                real_tools,
+                thread_id=f"demo:{user_id}:{rid}:v{i}",
+                compress=col.get("compress"),
+                image_recall=col.get("image_recall"),
+                label=col["label"],
+            )
+        res["index"] = i
+        if i == 0:
+            baseline_reply["v"] = res.get("reply") or ""
+            baseline_ready.set()
+        return res
+
+    tasks = [asyncio.create_task(run_col(i)) for i in indices]
+    if 0 not in indices:  # defensive — col 0 is always present for a full run
+        baseline_ready.set()
+
+    try:
+        for fut in asyncio.as_completed(tasks):
+            res = await fut
+            i = res["index"]
+            if i == 0:
+                res["accuracy"] = {
+                    "score": 100,
+                    "reasoning": "baseline — raw text, ground truth",
+                    "criteria": {},
+                }
+            else:
+                await baseline_ready.wait()
+                try:
+                    res["accuracy"] = await _run_judge(
+                        prompt, baseline_reply["v"], res.get("reply", "")
+                    )
+                except Exception as e:
+                    res["accuracy"] = {
+                        "score": -1,
+                        "reasoning": f"{type(e).__name__}",
+                        "criteria": {},
+                    }
+            res["context_window"] = res.pop("raw_tool_outputs", [])
+            yield _sse({"type": "column", "result": res})
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+
+    yield _sse({"type": "done"})
+
+
+@router.post("/demo/compare/stream")
+async def demo_compare_stream(request: Request, body: DemoCompareRequest):
+    """SSE variant of the visual bench: streams each of the 10 columns as it
+    completes (up to 4 running in parallel), so the UI updates in real time."""
+    user_id = _auth(request)
+    from api import DEFAULT_MODEL, _collect_mcp_tools_async  # lazy
+    from Tools import all_tools
+
+    prompt = (body.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(400, "prompt required")
+    model_name = (body.model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+
+    try:
+        mcp_tools = await _collect_mcp_tools_async(user_id)
+    except Exception as e:
+        print(f"[/demo/compare/stream] MCP discovery failed: {e!r}", flush=True)
+        mcp_tools = []
+    safe_builtins = [t for t in all_tools if t.name in _DEMO_SAFE_BUILTINS]
+    real_tools = safe_builtins + list(mcp_tools)
+
+    return StreamingResponse(
+        _visual_stream_events(body, user_id, real_tools, model_name),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.post("/demo/compare")
@@ -583,9 +914,31 @@ async def demo_compare(request: Request, body: DemoCompareRequest):
     # when the new tab is selected. Tab 1 (or no tab) falls through to
     # the original 2-column path below — fully back-compat.
     if (body.tab or "").strip() == "visual_compression":
-        return await _run_visual_compression_tab(
-            body, user_id, real_tools, model_name
-        )
+        try:
+            return await _run_visual_compression_tab(
+                body, user_id, real_tools, model_name
+            )
+        except HTTPException:
+            raise
+        except BaseException as e:
+            # Last-ditch — surfaces as a structured 500 with a real
+            # detail field so the UI's "unknown error" fallback never
+            # fires. Stack trace also lands in the uvicorn log.
+            import traceback
+            from api import _unwrap_exc  # lazy, matches other call sites
+
+            inner = _unwrap_exc(e) if isinstance(e, Exception) else e
+            print(
+                f"[/demo/compare] visual-compression orchestrator crashed: "
+                f"{type(inner).__name__}: {inner}",
+                flush=True,
+            )
+            traceback.print_exc()
+            raise HTTPException(
+                500,
+                f"visual-compression run failed: "
+                f"{type(inner).__name__}: {str(inner)[:300]}",
+            )
 
     rid = uuid.uuid4().hex[:8]
     tasks = [

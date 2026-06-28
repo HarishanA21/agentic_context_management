@@ -29,6 +29,25 @@ uploads/
 
 current.md
 note.txt
+hello.txt
+
+# macOS junk
+.DS_Store
+
+# Stray binaries / scratch artifacts
+*.pdf
+
+# Generated visual-method rasterizer output (debug dumps)
+backend/visual_images/
+*__read_project_file.png
+
+# TS incremental build cache
+ui/tsconfig.tsbuildinfo
+
+# Planning docs — kept locally, not pushed
+documents/
+Future.md
+PROJECT.md
 
 # Generated extension docs/plans — kept locally, not pushed
 /EXTENSION_PLAN.md

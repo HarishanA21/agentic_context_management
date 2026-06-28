@@ -57,6 +57,29 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
+  // Status-bar HUD — live context-token estimate for the latest conversation
+  // the gateway has seen. Click opens the status detail.
+  const hud = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  hud.command = 'acm.showStatus';
+  context.subscriptions.push(hud);
+
+  async function refreshHud(): Promise<void> {
+    try {
+      const s: any = await client().status();
+      const tok = Number(s?.context?.tokens || 0);
+      const fmt = tok >= 1000 ? (tok / 1000).toFixed(1).replace(/\.0$/, '') + 'K' : String(tok);
+      hud.text = `$(history) ACM ${fmt}`;
+      hud.tooltip = `ACM context: ~${tok.toLocaleString()} tokens (latest conversation) · click for status`;
+    } catch {
+      hud.text = '$(history) ACM offline';
+      hud.tooltip = 'ACM gateway unreachable — start it to manage context';
+    }
+    hud.show();
+  }
+  void refreshHud();
+  const hudTimer = setInterval(() => void refreshHud(), 15000);
+  context.subscriptions.push({ dispose: () => clearInterval(hudTimer) });
+
   registerChatParticipant(context);
 }
 

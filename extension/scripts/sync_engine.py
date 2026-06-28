@@ -22,7 +22,13 @@ import shutil
 import sys
 from pathlib import Path
 
-VENDORED = ["context_profiles.py", "context_editing.py", "cache_layout.py"]
+VENDORED = [
+    "context_profiles.py",
+    "context_editing.py",
+    "cache_layout.py",
+    "relevance.py",
+    "relevance_encoder.py",
+]
 # Framework-free subset of visual_tool the gateway's visual method needs.
 VENDORED_VISUAL = ["rasterizer.py", "indexer.py"]
 

@@ -111,6 +111,51 @@ export class AcmClient {
     return this.request('POST', '/messages/restore', { fp, conv: conv || null });
   }
 
+  dropMany(fps: string[], conv = ''): Promise<{ ok: boolean; dropped: string[] }> {
+    return this.request('POST', '/messages/drop_many', { fps, conv: conv || null });
+  }
+
+  // ── relevance pruning (task-aware suggestions) ──────────────────────
+  relevanceSuggest(conv = ''): Promise<RelevanceResult> {
+    return this.request<RelevanceResult>('GET', '/relevance/suggest?conv=' + encodeURIComponent(conv));
+  }
+
+  relevanceFeedback(payload: Record<string, unknown>): Promise<{ ok: boolean }> {
+    return this.request('POST', '/relevance/feedback', payload);
+  }
+
+  relevanceSummarize(payload: {
+    member_fps: string[];
+    conv?: string;
+    title?: string;
+    model?: string;
+  }): Promise<{ ok: boolean; summary?: string; error?: string }> {
+    return this.request('POST', '/relevance/summarize', payload);
+  }
+
+  messageImages(
+    fp: string,
+    conv = '',
+  ): Promise<{ images: string[]; count: number; error?: string }> {
+    return this.request(
+      'GET',
+      '/messages/images?conv=' +
+        encodeURIComponent(conv) +
+        '&fp=' +
+        encodeURIComponent(fp),
+    );
+  }
+
+  messageText(fp: string, conv = ''): Promise<{ text: string; error?: string }> {
+    return this.request(
+      'GET',
+      '/messages/text?conv=' +
+        encodeURIComponent(conv) +
+        '&fp=' +
+        encodeURIComponent(fp),
+    );
+  }
+
   // ── multi-provider ──────────────────────────────────────────────────
   providers(): Promise<{ default: string | null; providers: Record<string, any> }> {
     return this.request('GET', '/providers');
@@ -135,4 +180,25 @@ export interface AcmMessageRow {
   preview: string;
   tool_call_id: string;
   dropped: boolean;
+}
+
+export interface RelevanceSuggestion {
+  episode_id: string;
+  episode_index: number;
+  label: 'KEEP' | 'SUMMARIZE' | 'DROP';
+  score: number;
+  reason: string;
+  source: 'encoder' | 'judge' | 'ensemble' | 'rule';
+  freed_tokens: number;
+  member_indices: number[];
+  member_fps: string[];
+  title: string;
+  dropped: boolean;
+}
+
+export interface RelevanceResult {
+  conversation: string;
+  suggestions: RelevanceSuggestion[];
+  info: Record<string, number>;
+  error?: string;
 }

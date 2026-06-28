@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,6 +34,9 @@ from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolM
 
 _DEFAULT_PATH = Path(
     os.getenv("ACM_DROPLIST_PATH", str(Path.home() / ".acm" / "dropped.json"))
+)
+_SUMMARY_PATH = Path(
+    os.getenv("ACM_SUMMARY_PATH", str(Path.home() / ".acm" / "summaries.json"))
 )
 
 
@@ -75,29 +79,54 @@ def fingerprint(msg: BaseMessage) -> str:
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
 
 
+# Claude Code rotates a billing/cache header on every turn — e.g.
+# ``x-anthropic-billing-header: cc_version=2.1.168.ed1; cc_entrypoint=cli;
+# cch=c3ce6; You are Claude Code …``. Hashing it would mint a fresh
+# conversation key each turn (the churning list you saw) and a Remove on one
+# turn wouldn't carry to the next. We strip the volatile header so one session
+# stays one conversation.
+_VOLATILE_RE = re.compile(
+    r"x-anthropic-billing-header:.*?(?=You are Claude Code|$)", re.S | re.I
+)
+
+
+def _stable_for_key(text: str) -> str:
+    return _VOLATILE_RE.sub("", text)
+
+
 def conversation_key(
     messages: List[BaseMessage], explicit: Optional[str] = None
 ) -> str:
     """Identify the conversation. Prefer an explicit id from the client; else
-    hash the settled prefix (first system + first non-system message), which is
-    stable within a session."""
+    hash the settled prefix (first system + first non-system message) with the
+    per-turn billing header stripped, so it stays stable across a session."""
     if explicit:
         return explicit.strip()[:64]
     system = next((m for m in messages if isinstance(m, SystemMessage)), None)
     first = next((m for m in messages if not isinstance(m, SystemMessage)), None)
-    basis = _norm_text(getattr(system, "content", "")) + "␟" + _norm_text(
-        getattr(first, "content", "")
+    basis = _stable_for_key(_norm_text(getattr(system, "content", ""))) + "␟" + (
+        _norm_text(getattr(first, "content", ""))
     )
     return "c_" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:14]
 
 
 class DropStore:
-    def __init__(self, path: Path = _DEFAULT_PATH) -> None:
+    def __init__(
+        self, path: Path = _DEFAULT_PATH, summary_path: Path = _SUMMARY_PATH
+    ) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._dropped: Dict[str, List[str]] = self._load()
+        # Summaries replace a whole episode: its members go on the drop-list and
+        # one summary note is injected on every request. conv -> [summary text].
+        self.summary_path = summary_path
+        self._summaries: Dict[str, List[str]] = self._load_summaries()
         # in-memory: conv_key -> {"ts", "messages": [ {fp, role, preview, tool_call_id} ]}
         self._seen: Dict[str, Dict[str, Any]] = {}
+        # in-memory: conv_key -> the full BaseMessage list last seen, so the
+        # relevance auditor can re-read the real conversation on demand without
+        # the gateway storing it to disk. Indices line up 1:1 with self._seen.
+        self._seen_msgs: Dict[str, List[BaseMessage]] = {}
 
     # ── persistence ──────────────────────────────────────────────────────
     def _load(self) -> Dict[str, List[str]]:
@@ -108,6 +137,51 @@ class DropStore:
 
     def _save(self) -> None:
         self.path.write_text(json.dumps(self._dropped, indent=2))
+
+    def _load_summaries(self) -> Dict[str, List[str]]:
+        try:
+            return json.loads(self.summary_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _save_summaries(self) -> None:
+        self.summary_path.write_text(json.dumps(self._summaries, indent=2))
+
+    # ── summaries (episode → one injected note) ──────────────────────────
+    def summaries(self, conv: str) -> List[str]:
+        return list(self._summaries.get(conv, []))
+
+    def summarize(self, conv: str, member_fps: List[str], summary: str) -> None:
+        """Drop the whole episode and remember a summary note to inject in its
+        place on every future request."""
+        for fp in member_fps:
+            self.drop(conv, fp)
+        bucket = self._summaries.setdefault(conv, [])
+        bucket.append(summary)
+        self._save_summaries()
+
+    def clear_summaries(self, conv: str) -> None:
+        if self._summaries.pop(conv, None) is not None:
+            self._save_summaries()
+
+    def _inject_summaries(
+        self, conv: str, messages: List[BaseMessage]
+    ) -> List[BaseMessage]:
+        """Insert this conversation's summary notes as SystemMessages right
+        after the first system message (or at the front). No tool_calls/ids, so
+        they never create orphan-cascade issues."""
+        summ = self._summaries.get(conv) or []
+        if not summ:
+            return messages
+        notes = [SystemMessage(content=s) for s in summ]
+        out: List[BaseMessage] = []
+        inserted = False
+        for m in messages:
+            out.append(m)
+            if not inserted and isinstance(m, SystemMessage):
+                out.extend(notes)
+                inserted = True
+        return out if inserted else notes + messages
 
     # ── drop-list ────────────────────────────────────────────────────────
     def dropped(self, conv: str) -> List[str]:
@@ -137,7 +211,8 @@ class DropStore:
         rows = []
         for m in messages:
             fp = fingerprint(m)
-            preview = _norm_text(getattr(m, "content", "")).strip().replace("\n", " ")
+            full = _norm_text(getattr(m, "content", ""))
+            preview = full.strip().replace("\n", " ")
             rows.append(
                 {
                     "fp": fp,
@@ -145,12 +220,56 @@ class DropStore:
                     "preview": (preview[:120] + "…") if len(preview) > 120 else preview,
                     "tool_call_id": getattr(m, "tool_call_id", "") or "",
                     "dropped": self.is_dropped(conv, fp),
+                    # Each message's OWN size (counted once) — a ~4 chars/token
+                    # estimate. Summed for the context HUD; never per-call totals.
+                    "tokens": max(1, len(full) // 4) if full else 0,
                 }
             )
         self._seen[conv] = {"ts": time.time(), "messages": rows}
+        self._seen_msgs[conv] = list(messages)
 
     def seen(self, conv: str) -> List[Dict[str, Any]]:
-        return self._seen.get(conv, {}).get("messages", [])
+        # Recompute `dropped` against the LIVE drop-list on every read — the
+        # cached rows freeze it at record time, so without this a freshly
+        # dropped/restored message wouldn't reflect until the next turn (the UI
+        # would look like Remove did nothing).
+        rows = self._seen.get(conv, {}).get("messages", [])
+        live = set(self._dropped.get(conv, []))
+        return [{**r, "dropped": r.get("fp") in live} for r in rows]
+
+    def context_tokens(self, conv: str) -> int:
+        """Estimated tokens currently in this conversation's context — the sum
+        of each *non-dropped* message's own size (counted once)."""
+        return sum(
+            int(r.get("tokens", 0)) for r in self.seen(conv) if not r.get("dropped")
+        )
+
+    def seen_full(self, conv: str) -> List[BaseMessage]:
+        """The real BaseMessage list last seen for ``conv`` — what the relevance
+        auditor segments. Indices match :meth:`seen`, so an episode's member
+        indices map straight onto fingerprints via :func:`fingerprint`."""
+        return self._seen_msgs.get(conv, [])
+
+    # Markers for messages that are injected context, not a real user prompt —
+    # used to pick a human-readable conversation title.
+    _CTX_MARKERS = (
+        "<system-reminder>", "available agent types", "# claudemd",
+        "x-anthropic-billing-header", "you are claude code", "<command-",
+        "<local-command",
+    )
+
+    def _title(self, rows: List[Dict[str, Any]]) -> str:
+        for r in rows:
+            role = (r.get("role") or "").lower()
+            prev = (r.get("preview") or "").strip()
+            if role in ("human", "user") and not any(
+                prev.lower().startswith(c) for c in self._CTX_MARKERS
+            ):
+                return prev[:60]
+        for r in rows:  # fallback: first non-system message
+            if (r.get("role") or "").lower() not in ("system", "systemmessage"):
+                return (r.get("preview") or "")[:60]
+        return ""
 
     def conversations(self) -> List[Dict[str, Any]]:
         out = []
@@ -158,6 +277,7 @@ class DropStore:
             out.append(
                 {
                     "key": k,
+                    "title": self._title(v.get("messages", [])),
                     "ts": v.get("ts", 0),
                     "count": len(v.get("messages", [])),
                     "dropped": len(self._dropped.get(k, [])),
@@ -177,11 +297,11 @@ class DropStore:
         and its dependent tool-call/tool-result — stripped out."""
         drop_fps = set(self._dropped.get(conv, []))
         if not drop_fps:
-            return messages, 0
+            return self._inject_summaries(conv, messages), 0
 
         removed = [m for m in messages if fingerprint(m) in drop_fps]
         if not removed:
-            return messages, 0
+            return self._inject_summaries(conv, messages), 0
 
         # tool_call ids issued by dropped assistant messages -> drop their results
         orphan_result_for: set[str] = set()
@@ -224,4 +344,4 @@ class DropStore:
                         id=getattr(m, "id", None),
                     )
             filtered.append(m)
-        return filtered, count
+        return self._inject_summaries(conv, filtered), count

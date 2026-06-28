@@ -37,25 +37,35 @@ def _content_has_image(content: Any) -> bool:
 
 def _rasterise(text: str, tool_name: str) -> Optional[Tuple[list, str]]:
     """Return ``(multimodal_content, digest)`` for a text blob, or None if the
-    rasteriser/indexer is unavailable (then we leave the message untouched)."""
+    rasteriser/indexer is unavailable (then we leave the message untouched).
+
+    Large outputs paginate into several legible page images instead of one
+    tall strip that vision models downscale into unreadable noise — mirrors
+    ``visual_tool.compressor._pack_message``."""
     try:
-        from visual_tool.rasterizer import render_2col
+        from visual_tool.rasterizer import render_2col_pages
         from visual_tool.indexer import build_references_block, extract_references
     except Exception as e:  # Pillow missing / vendored module absent
         log.warning("[visual] rasteriser unavailable: %r — skipping", e)
         return None
 
     refs = extract_references(text)
-    png = render_2col(text)
-    b64 = base64.b64encode(png).decode("ascii")
-    refs_block = build_references_block(refs) or (
+    pages = render_2col_pages(text)
+    n = len(pages)
+    intro = build_references_block(refs) or (
         f"(tool: {tool_name} — see image for full output; nothing to cite verbatim)"
     )
+    if n > 1:
+        intro = f"{intro}\n(output rendered as {n} page images below; read all pages)"
     digest = " ".join((text or "").split())[:240]
-    content = [
-        {"type": "text", "text": refs_block},
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-    ]
+    content: list = [{"type": "text", "text": intro}]
+    for i, png in enumerate(pages, start=1):
+        b64 = base64.b64encode(png).decode("ascii")
+        if n > 1:
+            content.append({"type": "text", "text": f"[page {i}/{n}]"})
+        content.append(
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+        )
     return content, digest
 
 

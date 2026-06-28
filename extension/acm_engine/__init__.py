@@ -70,6 +70,26 @@ from cache_layout import (  # noqa: E402
     read_cache_tokens,
 )
 
+# Task-aware relevance pruning (suggest-only; judge engine ships now, encoder
+# seam ready for Phase 2). Pure, message-list-level like the rest.
+from relevance import (  # noqa: E402
+    Episode,
+    JudgeSuggester,
+    Suggestion,
+    active_task,
+    build_audit_rows,
+    load_audits,
+    load_feedback,
+    record_audit,
+    record_feedback,
+    segment_into_episodes,
+    suggest_removals,
+)
+
+# Local encoder engine (no LLM call). Heavy ML libs load lazily, so importing
+# the class here stays cheap even on a minimal install.
+from relevance_encoder import EncoderSuggester  # noqa: E402
+
 # Where the engine was actually loaded from (vendored copy or repo backend).
 ENGINE_DIR = _ENGINE_DIR
 BACKEND_DIR = _ENGINE_DIR  # back-compat alias
@@ -89,4 +109,16 @@ __all__ = [
     "evict_stale_images",
     "annotate_cache_breakpoints",
     "read_cache_tokens",
+    "Episode",
+    "Suggestion",
+    "JudgeSuggester",
+    "segment_into_episodes",
+    "active_task",
+    "suggest_removals",
+    "record_feedback",
+    "load_feedback",
+    "build_audit_rows",
+    "record_audit",
+    "load_audits",
+    "EncoderSuggester",
 ]

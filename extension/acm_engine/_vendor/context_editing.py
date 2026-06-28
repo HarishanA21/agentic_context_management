@@ -289,6 +289,61 @@ def evict_stale_images(
     return replacements, info
 
 
+def strip_all_images(
+    messages: List[BaseMessage],
+) -> Tuple[List[BaseMessage], Dict[str, Any]]:
+    """Drop EVERY image block from the message list, keeping the text
+    REFERENCES + digest (same contract as :func:`evict_stale_images`).
+
+    Used as a safety net when the active model can't accept image input:
+    a text-only model would 404 on any image still in the thread (e.g. a
+    visual-method result left over from when a vision model was selected).
+    Stripping them lets the turn proceed as plain text instead of failing.
+
+    Returns ``(replacements, info)``; ``info`` = {stripped, freed_tokens}.
+    """
+    info: Dict[str, Any] = {"stripped": 0, "freed_tokens": 0}
+    replacements: List[BaseMessage] = []
+    for m in messages:
+        if not isinstance(m, ToolMessage):
+            continue
+        if _content_image_count(getattr(m, "content", None)) == 0:
+            continue
+        before = _msg_tokens(m, _rough_tokens)
+        digest = (getattr(m, "additional_kwargs", None) or {}).get("image_digest")
+        new_content = _strip_images_keep_text(m.content, digest)
+        new_msg = ToolMessage(
+            content=new_content,
+            tool_call_id=getattr(m, "tool_call_id", "") or "",
+            name=getattr(m, "name", None),
+            id=getattr(m, "id", None),  # same id ⇒ in-place replace
+        )
+        after = _msg_tokens(new_msg, _rough_tokens)
+        info["stripped"] += 1
+        info["freed_tokens"] += max(0, before - after)
+        replacements.append(new_msg)
+    return replacements, info
+
+
+def sanitize_images_for_text_model(agent, config: Dict[str, Any]) -> int:
+    """If the thread carries image blocks but the active model is text-only,
+    rewrite those messages to drop the pixels. Best-effort; returns the
+    number of messages stripped (0 if none / on any failure)."""
+    try:
+        state = agent.get_state(config)
+        messages = list((state.values or {}).get("messages", []) or [])
+        if not messages:
+            return 0
+        replacements, info = strip_all_images(messages)
+        if not replacements:
+            return 0
+        agent.update_state(config, {"messages": replacements})
+        return int(info["stripped"])
+    except Exception as e:
+        print(f"[context_editing] image sanitize failed: {e!r}", flush=True)
+        return 0
+
+
 # ─── B1: summarisation ──────────────────────────────────────────────────
 
 

@@ -20,6 +20,7 @@ import re
 import time
 from typing import Any, Dict, List
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -28,8 +29,14 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from acm_engine import (
     BUILTIN_PRESETS,
     DEFAULT_SUMMARY_SYSTEM,
+    EncoderSuggester,
     PRESET_SUMMARY,
+    active_task,
+    build_audit_rows,
     parse_profile,
+    record_audit,
+    record_feedback,
+    suggest_removals,
 )
 from acm_mcp.memory_store import MemoryStore
 
@@ -40,7 +47,7 @@ from .config import (
     load_visual_cfg,
     user_config_path,
 )
-from .droplist import DropStore, conversation_key
+from .droplist import DropStore, _norm_text, conversation_key, fingerprint
 from .pipeline import run_pipeline
 from .providers_store import ProviderStore
 from .translate import lc_to_openai, openai_to_lc
@@ -132,9 +139,16 @@ def status() -> Dict[str, Any]:
         "memory": cm.memory.enabled,
         "subagent": cm.subagent.enabled,
         "jit_tools": cm.jit_tools.enabled,
+        "relevance_pruning": getattr(
+            getattr(cm, "relevance_pruning", None), "enabled", False
+        ),
         "visual_method": bool(load_visual_cfg(active_config_path()).get("enabled")),
     }
     prov = _PROVIDERS.list(mask=True)
+    latest = _DROP.latest_conversation() or ""
+    rows = _DROP.seen(latest) if latest else []
+    live_tok = sum(int(r.get("tokens", 0)) for r in rows if not r.get("dropped"))
+    saved_tok = sum(int(r.get("tokens", 0)) for r in rows if r.get("dropped"))
     return {
         "ok": True,
         "upstream": _SETTINGS.upstream_base_url,
@@ -144,6 +158,16 @@ def status() -> Dict[str, Any]:
         "providers": {
             "default": prov["default"],
             "configured": sorted(prov["providers"].keys()),
+        },
+        # Live context of the latest conversation (each message counted once):
+        # `tokens` = what the model still sees, `saved_tokens` = what ACM has
+        # removed. Drives the Overview gauge + the status-bar HUD.
+        "context": {
+            "conversation": latest,
+            "tokens": live_tok,
+            "saved_tokens": saved_tok,
+            "messages": len(rows),
+            "dropped": sum(1 for r in rows if r.get("dropped")),
         },
         "last_events": _LAST_EVENTS[-20:],
     }
@@ -345,6 +369,58 @@ def list_messages(conv: str = "") -> Dict[str, Any]:
     return {"conversation": key, "messages": _DROP.seen(key)}
 
 
+@app.get("/messages/text")
+def message_text(conv: str = "", fp: str = "") -> Dict[str, Any]:
+    """Full text of one message — the seen rows only carry a 120-char preview,
+    so the transcript fetches this on expand-to-read."""
+    key = conv or _DROP.latest_conversation() or ""
+    if not key or not fp:
+        return {"text": "", "error": "missing conv/fp"}
+    msg = next((m for m in _DROP.seen_full(key) if fingerprint(m) == fp), None)
+    if msg is None:
+        return {"text": "", "error": "message not found"}
+    return {"text": _norm_text(getattr(msg, "content", ""))}
+
+
+@app.get("/messages/images")
+def message_images(conv: str = "", fp: str = "") -> Dict[str, Any]:
+    """Visual-method page images for one tool message, as data URLs the webview
+    can preview. If the message is already multimodal we return its images;
+    otherwise we rasterise its text on demand (same renderer as the pipeline)."""
+    key = conv or _DROP.latest_conversation() or ""
+    if not key or not fp:
+        return {"images": [], "count": 0, "error": "missing conv/fp"}
+    msg = next((m for m in _DROP.seen_full(key) if fingerprint(m) == fp), None)
+    if msg is None:
+        return {"images": [], "count": 0, "error": "message not found"}
+
+    content = getattr(msg, "content", "")
+    images: List[str] = []
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "image_url":
+                url = (b.get("image_url") or {}).get("url", "")
+                if url:
+                    images.append(url)
+        if images:
+            return {"images": images, "count": len(images)}
+        content = _norm_text(content)
+    if not isinstance(content, str) or not content.strip():
+        return {"images": [], "count": 0}
+    try:
+        import base64 as _b64
+
+        from visual_tool.rasterizer import render_2col_pages
+
+        for png in render_2col_pages(content):
+            images.append(
+                "data:image/png;base64," + _b64.b64encode(png).decode("ascii")
+            )
+    except Exception as e:  # pragma: no cover - defensive
+        return {"images": [], "count": 0, "error": f"{type(e).__name__}: {e}"}
+    return {"images": images, "count": len(images)}
+
+
 @app.post("/messages/drop")
 async def drop_message(request: Request) -> Any:
     """Tombstone a message so the model never sees it again. Body:
@@ -372,6 +448,227 @@ async def restore_message(request: Request) -> Any:
         return JSONResponse({"error": "no conversation known yet"}, status_code=400)
     ok = _DROP.restore(conv, fp)
     return JSONResponse({"ok": ok, "conversation": conv, "dropped": _DROP.dropped(conv)})
+
+
+@app.post("/messages/drop_many")
+async def drop_many(request: Request) -> Any:
+    """Tombstone several messages at once — used when the user accepts a
+    relevance suggestion (one episode = many messages). Body: ``{conv?, fps}``."""
+    body: Dict[str, Any] = await request.json()
+    fps = body.get("fps") or []
+    if not isinstance(fps, list) or not fps:
+        return JSONResponse({"error": "missing 'fps' (non-empty list)"}, status_code=400)
+    conv = body.get("conv") or _DROP.latest_conversation()
+    if not conv:
+        return JSONResponse({"error": "no conversation known yet"}, status_code=400)
+    for fp in fps:
+        _DROP.drop(conv, str(fp))
+    return JSONResponse(
+        {"ok": True, "conversation": conv, "dropped": _DROP.dropped(conv)}
+    )
+
+
+# ─── relevance pruning (task-aware removal suggestions) ──────────────────
+
+
+# Cache one encoder per (path, thresholds) so the model loads at most once.
+_ENCODER_CACHE: Dict[tuple, Any] = {}
+
+
+def _get_encoder(path: str, drop_t: float, summ_t: float):
+    """Build (and cache) the local relevance encoder. Never raises — on any
+    construction error returns ``None`` so ensemble mode degrades to judge-only
+    and encoder-only mode reports a clean error."""
+    cache_key = (path or "", round(drop_t, 3), round(summ_t, 3))
+    if cache_key in _ENCODER_CACHE:
+        return _ENCODER_CACHE[cache_key]
+    try:
+        enc = EncoderSuggester(
+            path or None, drop_threshold=drop_t, summarize_threshold=summ_t
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[acm-gateway] encoder init failed: {e!r}", flush=True)
+        enc = None
+    _ENCODER_CACHE[cache_key] = enc
+    return enc
+
+
+@app.get("/relevance/suggest")
+def relevance_suggest(conv: str = "") -> Dict[str, Any]:
+    """Audit the last-seen conversation and return per-episode KEEP/SUMMARIZE/
+    DROP suggestions. Suggest-only: nothing is removed here. Each suggestion
+    carries ``member_fps`` so the UI can drop the whole episode in one call.
+
+    ``mode`` (from the profile) selects the engine(s): ``judge`` (LLM only),
+    ``encoder`` (local model only), or ``ensemble`` (both, reconciled by
+    ``arbitration``)."""
+    profile = load_profile(active_config_path())
+    cfg = getattr(profile.context_management, "relevance_pruning", None)
+    key = conv or _DROP.latest_conversation() or ""
+    if not key:
+        return {"conversation": "", "suggestions": [], "info": {}, "error": "no conversation seen yet"}
+    messages = _DROP.seen_full(key)
+    if not messages:
+        return {
+            "conversation": key,
+            "suggestions": [],
+            "info": {},
+            "error": "no messages recorded for this conversation yet",
+        }
+
+    keep_recent = int(getattr(cfg, "keep_recent", 3) if cfg else 3)
+    mode = str(getattr(cfg, "mode", "judge") if cfg else "judge")
+    arbitration = str(getattr(cfg, "arbitration", "safest") if cfg else "safest")
+    drop_t = float(getattr(cfg, "drop_threshold", 0.35) if cfg else 0.35)
+    summ_t = float(getattr(cfg, "summarize_threshold", 0.6) if cfg else 0.6)
+    judge_model = (getattr(cfg, "judge_model", None) if cfg else None) or _SETTINGS.judge_model
+    encoder_path = (getattr(cfg, "encoder_path", None) if cfg else None) or _SETTINGS.encoder_path
+
+    need_judge = mode in ("judge", "ensemble")
+    need_encoder = mode in ("encoder", "ensemble")
+
+    judge = _pick_summariser(judge_model) if need_judge else None
+    if need_judge and judge is None and mode == "judge":
+        return {
+            "conversation": key,
+            "suggestions": [],
+            "info": {},
+            "error": "no upstream API key configured for the auditor",
+        }
+    encoder = _get_encoder(encoder_path, drop_t, summ_t) if need_encoder else None
+    if need_encoder and encoder is None and mode == "encoder":
+        return {
+            "conversation": key,
+            "suggestions": [],
+            "info": {},
+            "error": "relevance encoder could not be loaded",
+        }
+
+    suggestions, info, episodes = suggest_removals(
+        messages,
+        keep_recent=keep_recent,
+        mode=mode,
+        arbitration=arbitration,
+        judge_client=judge,
+        encoder=encoder,
+        return_episodes=True,
+    )
+    if bool(getattr(cfg, "feedback_logging", True)):
+        try:
+            record_audit(
+                build_audit_rows(
+                    episodes, suggestions,
+                    task=active_task(messages), conv=key, surface="gateway",
+                )
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            print(f"[acm-gateway] audit log failed: {e!r}", flush=True)
+    out: List[Dict[str, Any]] = []
+    for s in suggestions:
+        member_fps = [
+            fingerprint(messages[i]) for i in s.member_indices if 0 <= i < len(messages)
+        ]
+        dropped = bool(member_fps) and all(_DROP.is_dropped(key, fp) for fp in member_fps)
+        out.append({**s.to_dict(), "member_fps": member_fps, "dropped": dropped})
+    _record([{"type": "relevance_suggestions", "conversation": key,
+              "candidates": info.get("candidates", 0), "drop": info.get("drop", 0),
+              "summarize": info.get("summarize", 0)}])
+    return {"conversation": key, "suggestions": out, "info": info}
+
+
+@app.post("/relevance/feedback")
+async def relevance_feedback(request: Request) -> Any:
+    """Log the user's decision on a suggestion (accept/reject/edit) to the
+    feedback JSONL — the dataset the encoder re-train + judge DPO read later.
+    Body: ``{conv?, episode_id, shown_label, user_action, final_label, ...}``."""
+    body: Dict[str, Any] = await request.json()
+    record = {
+        "conv": body.get("conv") or _DROP.latest_conversation() or "",
+        "episode_id": body.get("episode_id"),
+        "title": body.get("title"),
+        "shown_label": body.get("shown_label"),
+        "user_action": body.get("user_action"),
+        "final_label": body.get("final_label"),
+        "score": body.get("score"),
+        "source": body.get("source"),
+        "tokens": body.get("tokens"),
+        "surface": "gateway",
+    }
+    try:
+        path = record_feedback(record)
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+    return JSONResponse({"ok": True, "logged_to": str(path)})
+
+
+@app.post("/relevance/summarize")
+async def relevance_summarize(request: Request) -> Any:
+    """Replace an episode with a short summary instead of dropping it — saves
+    tokens while keeping the gist. Drops the episode's messages and injects one
+    summary note on every future request. Body: ``{conv?, member_fps, title?,
+    model?}``."""
+    body: Dict[str, Any] = await request.json()
+    fps = body.get("member_fps") or body.get("fps") or []
+    if not isinstance(fps, list) or not fps:
+        return JSONResponse(
+            {"error": "missing 'member_fps' (non-empty list)"}, status_code=400
+        )
+    conv = body.get("conv") or _DROP.latest_conversation()
+    if not conv:
+        return JSONResponse({"error": "no conversation known yet"}, status_code=400)
+
+    fp_set = {str(f) for f in fps}
+    members = [m for m in _DROP.seen_full(conv) if fingerprint(m) in fp_set]
+    if not members:
+        return JSONResponse(
+            {"error": "no matching messages for this episode"}, status_code=404
+        )
+
+    summariser = _pick_summariser(body.get("model"))
+    if summariser is None:
+        return JSONResponse(
+            {"error": "no upstream API key configured for summarization"},
+            status_code=503,
+        )
+
+    transcript = "\n".join(
+        f"[{getattr(m, 'type', None) or m.__class__.__name__}] "
+        f"{_norm_text(getattr(m, 'content', ''))[:2000]}"
+        for m in members
+    )[:12000]
+    try:
+        resp = summariser.invoke(
+            [
+                SystemMessage(content=DEFAULT_SUMMARY_SYSTEM),
+                HumanMessage(
+                    content="Summarise this finished portion of the "
+                    f"conversation:\n\n{transcript}"
+                ),
+            ]
+        )
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=502)
+    summary = resp.content if isinstance(resp.content, str) else str(resp.content)
+    summary = (summary or "").strip()
+    if not summary:
+        return JSONResponse(
+            {"error": "summariser returned empty text"}, status_code=502
+        )
+
+    title = (body.get("title") or "earlier step").strip()
+    note = f"[Summary of earlier step — {title}]\n{summary}"
+    _DROP.summarize(conv, [str(f) for f in fps], note)
+    _record(
+        [{"type": "relevance_summarize", "conversation": conv, "members": len(fps)}]
+    )
+    return JSONResponse(
+        {
+            "ok": True,
+            "conversation": conv,
+            "summary": note,
+            "dropped": _DROP.dropped(conv),
+        }
+    )
 
 
 # ─── multi-provider management ───────────────────────────────────────────
@@ -545,9 +842,34 @@ async def anthropic_messages(request: Request) -> Any:
         body["model"] = target.model
     else:
         up = _anthropic_upstream()
+
+    # Pass through Claude Code's beta opt-ins: the `anthropic-beta` header and
+    # the `?beta=true` endpoint selector. Stripping these makes the upstream
+    # 400 on otherwise-valid requests. We drop only auth-mode-specific betas
+    # (``oauth-*``) — we forward with x-api-key, not the user's OAuth token, so
+    # an oauth beta would itself be rejected.
+    beta = request.headers.get("anthropic-beta")
+    if beta:
+        beta = ",".join(
+            b.strip()
+            for b in beta.split(",")
+            if b.strip() and not b.strip().startswith("oauth")
+        ) or None
+    beta_query = request.query_params.get("beta") in ("true", "1")
+
     if body.get("stream"):
         return StreamingResponse(
-            up.messages_stream(body), media_type="text/event-stream"
+            up.messages_stream(body, beta=beta, beta_query=beta_query),
+            media_type="text/event-stream",
         )
-    data = await up.messages(body)
+    try:
+        data = await up.messages(body, beta=beta, beta_query=beta_query)
+    except httpx.HTTPStatusError as e:
+        # Surface the upstream's real status + body instead of a bare 500, so
+        # the IDE stops retrying blindly and shows the actual reason.
+        try:
+            payload = e.response.json()
+        except Exception:
+            payload = {"error": {"message": e.response.text[:1000]}}
+        return JSONResponse(payload, status_code=e.response.status_code)
     return JSONResponse(data)

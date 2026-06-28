@@ -43,8 +43,19 @@ const DEFAULT_BODY: any = {
     subagent: { enabled: false, max_depth: 1, token_budget: 20000, parallel_limit: 3, inherit_memory: false },
     jit_tools: { enabled: false },
     sliding_window: { enabled: false, keep_recent: 12 },
+    image_recall: { mode: 'off', keep_recent_images: 3, cache_ttl: '5m', evict_batch_turns: 1 },
+    visual_method: { enabled: false, mode: 'templated', threshold_tokens: 500, only_tools: [], exclude_tools: [] },
   },
 }
+
+// The three mutually-exclusive image-recall techniques. A single-select
+// (radio) is what enforces "pick at most one — can't select two at a time".
+const IMAGE_RECALL_OPTIONS: { value: string; label: string; help: string }[] = [
+  { value: 'off', label: 'Off', help: 'Raw image method as today — every image stays in context.' },
+  { value: 'cache', label: 'Caching only', help: 'Prompt-cache the settled prefix. Cheaper + faster; output identical (does NOT fix multi-image confusion).' },
+  { value: 'evict', label: 'Evicting only', help: 'Keep the last K images as pixels; older ones collapse to their REFERENCES + a digest. Fixes accuracy.' },
+  { value: 'cache_evict', label: 'Caching + Evicting', help: 'Both layers. Recommended for long, image-heavy sessions.' },
+]
 
 export function ContextProfilesPanel({ onPickProfile, onListChanged }: Props) {
   const [tab, setTab] = useState<'presets' | 'yours'>('presets')
@@ -262,6 +273,10 @@ function ProfileCard({
   if (cm.subagent?.enabled) on.push('subagent')
   if (cm.jit_tools?.enabled) on.push('jit')
   if (cm.sliding_window?.enabled) on.push('sliding')
+  if (cm.visual_method?.enabled) on.push('visual')
+  if (cm.image_recall?.mode && cm.image_recall.mode !== 'off') {
+    on.push(cm.image_recall.mode === 'cache' ? 'cache' : cm.image_recall.mode === 'evict' ? 'evict' : 'cache+evict')
+  }
   return (
     <div className="surface p-4 flex flex-col gap-3">
       <div className="flex items-center justify-between">
@@ -539,6 +554,84 @@ function ProfileEditor({
               label="Keep recent messages"
               value={cm.sliding_window?.keep_recent ?? 12}
               onChange={(v) => patchBody(['context_management', 'sliding_window', 'keep_recent'], v)}
+            />
+          </TechniqueSection>
+
+          <div className="surface p-3 flex flex-col gap-2">
+            <div>
+              <div className="text-xs font-semibold text-fog-50">Image recall (visual method)</div>
+              <p className="text-[11px] text-fog-500 mt-0.5">
+                Pick at most one. Caching cuts cost/latency (output identical); eviction
+                keeps the last K tool images as pixels and digests older ones to fix
+                multi-image accuracy. Combines with the techniques above.
+              </p>
+            </div>
+            <div className="flex flex-col gap-1">
+              {IMAGE_RECALL_OPTIONS.map((opt) => {
+                const active = (cm.image_recall?.mode ?? 'off') === opt.value
+                return (
+                  <label
+                    key={opt.value}
+                    className={`flex items-start gap-2 rounded-md px-2 py-1.5 cursor-pointer border ${active ? 'border-accent bg-accent/[0.08]' : 'border-line hover:bg-soft/[0.05]'}`}
+                  >
+                    <input
+                      type="radio"
+                      name="image_recall_mode"
+                      className="mt-0.5 accent-[var(--accent,#6ea8fe)]"
+                      checked={active}
+                      onChange={() => patchBody(['context_management', 'image_recall', 'mode'], opt.value)}
+                    />
+                    <span>
+                      <span className="text-xs text-fog-100">{opt.label}</span>
+                      <span className="block text-[10px] text-fog-500">{opt.help}</span>
+                    </span>
+                  </label>
+                )
+              })}
+            </div>
+            {['evict', 'cache_evict'].includes(cm.image_recall?.mode ?? 'off') && (
+              <NumberKnob
+                label="Keep recent images (K)"
+                value={cm.image_recall?.keep_recent_images ?? 3}
+                onChange={(v) => patchBody(['context_management', 'image_recall', 'keep_recent_images'], v)}
+              />
+            )}
+            {['cache', 'cache_evict'].includes(cm.image_recall?.mode ?? 'off') && (
+              <label className="flex items-center justify-between text-[11px] text-fog-300">
+                <span>Cache TTL</span>
+                <select
+                  className="bg-ink-300 border border-line rounded-md px-2 py-1 text-fog-100"
+                  value={cm.image_recall?.cache_ttl ?? '5m'}
+                  onChange={(e) => patchBody(['context_management', 'image_recall', 'cache_ttl'], e.target.value)}
+                >
+                  <option value="5m">5 minutes</option>
+                  <option value="1h">1 hour</option>
+                </select>
+              </label>
+            )}
+          </div>
+
+          <TechniqueSection
+            label="Visual method (rasterise tool outputs)"
+            note="Turn large tool outputs into a formatted image the model reads instead of text — saves tokens on big/noisy outputs. Needs a vision-capable chat model; small outputs stay as text."
+            enabled={!!cm.visual_method?.enabled}
+            onToggle={(v) => patchBody(['context_management', 'visual_method', 'enabled'], v)}
+          >
+            <label className="flex items-center justify-between text-[11px] text-fog-300">
+              <span>Mode</span>
+              <select
+                className="bg-ink-300 border border-line rounded-md px-2 py-1 text-fog-100"
+                value={cm.visual_method?.mode ?? 'templated'}
+                onChange={(e) => patchBody(['context_management', 'visual_method', 'mode'], e.target.value)}
+              >
+                <option value="templated">templated (+ auxiliary fallback)</option>
+                <option value="auxiliary">auxiliary (LLM-generated)</option>
+              </select>
+            </label>
+            <NumberKnob
+              label="Rasterise above (tokens)"
+              value={cm.visual_method?.threshold_tokens ?? 500}
+              onChange={(v) => patchBody(['context_management', 'visual_method', 'threshold_tokens'], v)}
             />
           </TechniqueSection>
 

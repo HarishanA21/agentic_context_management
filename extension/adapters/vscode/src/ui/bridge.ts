@@ -27,3 +27,12 @@ export function rpc<T = any>(method: string, params?: any): Promise<T> {
 }
 
 export const mount: string = (window as Window).acmMount || 'panel';
+
+// Persisted webview state (theme choice, last tab, …). acquireVsCodeApi can only
+// be called once, so these reuse the single instance above.
+export function getState(): any {
+  return (vscode.getState() as any) || {};
+}
+export function setState(patch: Record<string, unknown>): void {
+  vscode.setState({ ...getState(), ...patch });
+}

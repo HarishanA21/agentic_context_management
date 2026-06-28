@@ -41,7 +41,14 @@ MARGIN = 16
 COLUMN_GAP = 24
 DEFAULT_FONT_SIZE = 12
 LINE_HEIGHT = 16        # 12 pt + ~30 % leading
-MAX_CANVAS_HEIGHT = 8192  # safety cap
+MAX_CANVAS_HEIGHT = 8192  # safety cap (single-image back-compat path)
+
+# Per-page height for the paginated renderer. Kept small so the long edge
+# stays under the threshold where vision models downscale (~1568 px for
+# Claude, ~768 short-edge for GPT-4o). A tall single strip gets squashed
+# ~5x and the text becomes unreadable; a stack of short pages does not.
+PAGE_HEIGHT = 1280
+MAX_PAGES = 8            # bound cost — at ~156 lines/page that's ~1.2k lines
 
 
 # ── font discovery ──────────────────────────────────────────────────────
@@ -121,18 +128,57 @@ def _wrap_text_hard(text: str, max_chars: int) -> list[str]:
     return out
 
 
-def render_2col(
+def _draw_column(draw, lines, x, font, page_height):
+    """Draw one column of pre-wrapped lines starting at ``x``."""
+    y = MARGIN
+    for line in lines:
+        if y + LINE_HEIGHT > page_height - MARGIN:
+            break
+        draw.text((x, y), line, font=font, fill="black")
+        y += LINE_HEIGHT
+
+
+def _render_one_page(
+    col1: list[str],
+    col2: list[str],
+    *,
+    width: int,
+    font,
+    col_width_px: int,
+    page_height: int,
+    header: Optional[str] = None,
+) -> bytes:
+    """Render a single 2-column page to PNG bytes."""
+    rows = max(len(col1), len(col2))
+    height = min(page_height, MARGIN * 2 + rows * LINE_HEIGHT)
+    if header:
+        height = min(page_height, height + LINE_HEIGHT)
+    img = Image.new("RGB", (width, height), color="white")
+    draw = ImageDraw.Draw(img)
+    _draw_column(draw, col1, MARGIN, font, height)
+    _draw_column(draw, col2, MARGIN + col_width_px + COLUMN_GAP, font, height)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def render_2col_pages(
     text: str,
     *,
     width: int = CANVAS_WIDTH,
     font_size: int = DEFAULT_FONT_SIZE,
-) -> bytes:
-    """Render ``text`` to a fixed-width 2-column PNG and return raw bytes.
+    page_height: int = PAGE_HEIGHT,
+    max_pages: int = MAX_PAGES,
+) -> list[bytes]:
+    """Render ``text`` to a *list* of fixed-width 2-column PNG pages.
 
-    The text is hard-wrapped to the per-column character width, split
-    in half by line count, and drawn left-then-right with a fixed
-    gutter. Pure-black ink on pure-white background — high contrast
-    matters more for OCR accuracy than aesthetics here.
+    The text is hard-wrapped to the per-column character width, then laid
+    out column-by-column, page-by-page. Each page is at most
+    ``page_height`` px tall so the long edge stays under the size where
+    vision models downscale — keeping the rendered text legible (a single
+    tall strip gets squashed ~5x and becomes unreadable). Returns one PNG
+    per page; capped at ``max_pages`` with a truncation note on the last
+    page when content overflows.
     """
     if not text:
         text = "(empty)"
@@ -143,33 +189,47 @@ def render_2col(
     chars_per_col = max(20, int(col_width_px // cw))
 
     lines = _wrap_text_hard(text, chars_per_col)
-    half = (len(lines) + 1) // 2
-    col1, col2 = lines[:half], lines[half:]
-    rows = max(len(col1), len(col2))
+    lines_per_col = max(1, (page_height - 2 * MARGIN) // LINE_HEIGHT)
+    lines_per_page = lines_per_col * 2
 
-    height = min(MAX_CANVAS_HEIGHT, MARGIN * 2 + rows * LINE_HEIGHT)
-    img = Image.new("RGB", (width, height), color="white")
-    draw = ImageDraw.Draw(img)
+    # Split into page-sized chunks of lines, then each chunk into 2 columns.
+    pages: list[bytes] = []
+    total = len(lines)
+    n_pages = (total + lines_per_page - 1) // lines_per_page
+    capped = min(n_pages, max_pages)
+    for p in range(capped):
+        chunk = lines[p * lines_per_page : (p + 1) * lines_per_page]
+        # On the final allowed page, if more lines remain, flag truncation.
+        if p == capped - 1 and capped < n_pages:
+            dropped = total - (capped * lines_per_page)
+            chunk = chunk[: lines_per_page - 1]
+            chunk.append(f"… [truncated {dropped} more line(s) — see REFERENCES]")
+        col1 = chunk[:lines_per_col]
+        col2 = chunk[lines_per_col:]
+        pages.append(
+            _render_one_page(
+                col1, col2,
+                width=width, font=font,
+                col_width_px=col_width_px, page_height=page_height,
+            )
+        )
+    return pages or [
+        _render_one_page(
+            ["(empty)"], [], width=width, font=font,
+            col_width_px=col_width_px, page_height=page_height,
+        )
+    ]
 
-    # Column 1 — left
-    y = MARGIN
-    for line in col1:
-        if y + LINE_HEIGHT > height - MARGIN:
-            draw.text((MARGIN, y), "… [truncated]", font=font, fill="black")
-            break
-        draw.text((MARGIN, y), line, font=font, fill="black")
-        y += LINE_HEIGHT
 
-    # Column 2 — right
-    col2_x = MARGIN + col_width_px + COLUMN_GAP
-    y = MARGIN
-    for line in col2:
-        if y + LINE_HEIGHT > height - MARGIN:
-            draw.text((col2_x, y), "… [truncated]", font=font, fill="black")
-            break
-        draw.text((col2_x, y), line, font=font, fill="black")
-        y += LINE_HEIGHT
+def render_2col(
+    text: str,
+    *,
+    width: int = CANVAS_WIDTH,
+    font_size: int = DEFAULT_FONT_SIZE,
+) -> bytes:
+    """Back-compat single-image renderer — returns the first page only.
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
+    New callers should use :func:`render_2col_pages` so large outputs stay
+    legible across multiple pages instead of one downscaled strip.
+    """
+    return render_2col_pages(text, width=width, font_size=font_size)[0]

@@ -10,6 +10,17 @@ import { useTheme } from '@/lib/theme'
 import { MCPInventoryPanel } from '@/components/mcp-inventory'
 import { StrategyDemoPanel } from '@/components/strategy-demo'
 import { ContextProfilesPanel } from '@/components/context-profiles'
+import { RelevanceCleanupSection } from '@/components/relevance-cleanup'
+
+// Models surfaced at the top of every model picker (chat + demo). Kept in
+// sync with the backend's _PROMOTED_PAID_MODELS / _PINNED_MODELS so the
+// requested primary models are always one click away rather than buried in
+// the alphabetical free-tier list.
+const PRIMARY_MODEL_IDS = [
+  'google/gemini-3.1-flash-lite',
+  'minimax/minimax-m3',
+  'stepfun/step-3.7-flash',
+]
 
 /* ─────────────────────────── types ─────────────────────────── */
 
@@ -317,7 +328,7 @@ export default function AppPage() {
   const [uploading, setUploading] = useState(false)
   // Model picker
   const [models, setModels] = useState<
-    { id: string; name: string; context_length: number }[]
+    { id: string; name: string; context_length: number; vision?: boolean }[]
   >([])
   const [selectedModel, setSelectedModel] = useState<string>('')
   // Phase F: user's configured LLM providers + per-session preference.
@@ -1057,6 +1068,33 @@ export default function AppPage() {
     } finally {
       setContextLoading(false)
     }
+  }
+
+  // Soft refresh — re-fetch the context drawer data WITHOUT nulling it first,
+  // so children (e.g. the Relevance cleanup list) don't unmount and lose their
+  // local state. Used after a relevance Remove so the remaining suggestions
+  // stay on screen instead of forcing a re-Analyze.
+  async function softRefreshContext() {
+    if (!activeSession || !activeThread) return
+    try {
+      const qs = selectedModel
+        ? `?model=${encodeURIComponent(selectedModel)}`
+        : ''
+      const r = await authFetch(
+        `/api/sessions/${activeSession}/threads/${activeThread}/context${qs}`,
+      )
+      if (!r.ok) return
+      const data = await r.json()
+      setContextData(data)
+      setContextSummary({
+        total: Number(data?.total_tokens) || 0,
+        limit: Number(data?.context_limit) || 0,
+        percent: Number(data?.percent_used) || 0,
+      })
+    } catch {
+      // best-effort
+    }
+    if (activeSession && activeThread) loadHistory(activeSession, activeThread)
   }
 
   // Cheap passive refresh — fetches just the summary block of the context
@@ -2157,53 +2195,20 @@ export default function AppPage() {
           </button>
         </div>
 
-        {/* MCP inventory entry — sits above the user profile so it's
-            findable without diving into the user menu. Toggles the MCP
-            panel in the main pane (in place of chat). */}
-        <div className="px-3 pt-1">
-          <button
-            onClick={() =>
-              setMcpsOpen((v) => {
-                const next = !v
-                if (next) {
-                  setDemoOpen(false)
-                  setContextProfilesOpen(false)
-                }
-                return next
-              })
-            }
-            aria-pressed={mcpsOpen}
-            className={`w-full flex items-center gap-3 px-2 py-2 rounded-md transition ${
-              mcpsOpen
-                ? 'bg-soft/[0.08] text-fog-50'
-                : 'hover:bg-soft/[0.04] text-fog-200'
-            }`}
-          >
-            <span className="w-7 h-7 rounded-md bg-soft/10 text-accent flex items-center justify-center">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
-                <path d="M3.27 6.96L12 12.01l8.73-5.05M12 22.08V12" opacity="0.6" />
-              </svg>
-            </span>
-            <span className="text-sm flex-1 text-left">MCP Inventory</span>
-          </button>
-        </div>
-
-        {/* LLM Providers entry — sits below MCP Inventory. Navigates to the
-            standalone /app/providers route rather than swapping a panel
-            in place. */}
+        {/* Settings entry — hub linking to Providers, MCP, and Context
+            Profiles. Navigates to the standalone /app/settings route. */}
         <div className="px-3 pt-1">
           <Link
-            href="/app/providers"
+            href="/app/settings"
             className="w-full flex items-center gap-3 px-2 py-2 rounded-md transition hover:bg-soft/[0.04] text-fog-200"
           >
             <span className="w-7 h-7 rounded-md bg-soft/10 text-accent flex items-center justify-center">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 12c0 4.97-4.03 9-9 9s-9-4.03-9-9 4.03-9 9-9 9 4.03 9 9z" />
-                <path d="M3 12h18M12 3a14.7 14.7 0 0 1 0 18M12 3a14.7 14.7 0 0 0 0 18" opacity="0.55" />
+                <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" opacity="0.85" />
               </svg>
             </span>
-            <span className="text-sm flex-1 text-left">LLM Providers</span>
+            <span className="text-sm flex-1 text-left">Settings</span>
           </Link>
         </div>
 
@@ -2403,17 +2408,38 @@ export default function AppPage() {
                     }
                   }}
                   className="bg-transparent text-xs text-fog-50 outline-none max-w-[14rem] truncate"
-                  title="Chat model (OpenRouter free tier)"
+                  title="Chat model"
                 >
-                  {models.map((m) => (
-                    <option
-                      key={m.id}
-                      value={m.id}
-                      className="bg-ink-200 text-fog-50"
-                    >
-                      {m.name.replace(/\s*\(free\)\s*$/i, '')}
-                    </option>
-                  ))}
+                  {(() => {
+                    type M = { id: string; name: string; vision?: boolean }
+                    const clean = (n: string) => n.replace(/\s*\(free\)\s*$/i, '')
+                    const opt = (m: M) => (
+                      <option key={m.id} value={m.id} className="bg-ink-200 text-fog-50">
+                        {clean(m.name)}{m.vision ? '  👁' : ''}
+                      </option>
+                    )
+                    const primary = PRIMARY_MODEL_IDS
+                      .map((id) => models.find((m) => m.id === id))
+                      .filter(Boolean) as M[]
+                    const rest = models.filter((m) => !PRIMARY_MODEL_IDS.includes(m.id))
+                    const visionRest = rest.filter((m) => m.vision)
+                    const textRest = rest.filter((m) => !m.vision)
+                    return (
+                      <>
+                        {primary.length > 0 && (
+                          <optgroup label="Primary">{primary.map(opt)}</optgroup>
+                        )}
+                        {visionRest.length > 0 && (
+                          <optgroup label="Vision (👁 — needed for Visual method)">
+                            {visionRest.map(opt)}
+                          </optgroup>
+                        )}
+                        {textRest.length > 0 && (
+                          <optgroup label="Text-only">{textRest.map(opt)}</optgroup>
+                        )}
+                      </>
+                    )
+                  })()}
                 </select>
               </div>
             ) : (
@@ -2465,6 +2491,7 @@ export default function AppPage() {
             <TaskView
               messages={displayMessages}
               sessionId={activeSession}
+              threadId={activeThread}
               sending={sending && replayIdx == null}
               pendingApproval={replayIdx == null ? pendingApproval : null}
               resolvingApproval={resolvingApproval}
@@ -2517,6 +2544,7 @@ export default function AppPage() {
                         key={i}
                         msg={m}
                         sessionId={activeSession}
+                        threadId={activeThread}
                         toolArgs={args}
                       />
                     ))
@@ -2846,21 +2874,36 @@ export default function AppPage() {
           data={contextData}
           loading={contextLoading}
           error={contextError}
+          sessionId={activeSession}
+          threadId={activeThread}
           onClose={() => setContextOpen(false)}
           onRefresh={openContextViewer}
-          onDelete={(id) =>
+          onSoftRefresh={softRefreshContext}
+          onDelete={(id) => {
+            // Ask once per browser; after the user acknowledges, delete
+            // straight away on subsequent clicks (better UX for bulk cleanup).
+            const skip =
+              typeof window !== 'undefined' &&
+              localStorage.getItem('acm_skip_msg_delete_confirm') === '1'
+            if (skip) {
+              deleteContextMessage(id)
+              return
+            }
             setConfirmDialog({
               title: 'Remove from context?',
               message:
-                'This message will be deleted from the conversation and from the model\'s memory of this thread. This cannot be undone.',
+                "This message will be deleted from the conversation and from the model's memory of this thread. This can't be undone. You won't be asked again for message deletions in this browser.",
               confirmLabel: 'Remove',
               danger: true,
               onConfirm: () => {
                 setConfirmDialog(null)
+                if (typeof window !== 'undefined') {
+                  localStorage.setItem('acm_skip_msg_delete_confirm', '1')
+                }
                 deleteContextMessage(id)
               },
             })
-          }
+          }}
         />
       )}
 
@@ -2983,10 +3026,12 @@ function TypingIndicator({ label = 'thinking' }: { label?: string }) {
 function MessageBlock({
   msg,
   sessionId,
+  threadId,
   toolArgs,
 }: {
   msg: Message
   sessionId: string | null
+  threadId: string | null
   toolArgs?: Record<string, any>
 }) {
   if (msg.role === 'user') {
@@ -3000,7 +3045,12 @@ function MessageBlock({
   }
   if (msg.role === 'tool') {
     return (
-      <ToolMessageCard msg={msg} sessionId={sessionId} args={toolArgs} />
+      <ToolMessageCard
+        msg={msg}
+        sessionId={sessionId}
+        threadId={threadId}
+        args={toolArgs}
+      />
     )
   }
   return (
@@ -3097,6 +3147,7 @@ function ApprovalCard({
 function TaskView({
   messages,
   sessionId,
+  threadId,
   sending,
   pendingApproval,
   resolvingApproval,
@@ -3109,6 +3160,7 @@ function TaskView({
 }: {
   messages: Message[]
   sessionId: string | null
+  threadId: string | null
   sending: boolean
   pendingApproval: PendingApproval | null
   resolvingApproval: boolean
@@ -3171,6 +3223,7 @@ function TaskView({
                 key={i}
                 msg={m}
                 sessionId={sessionId}
+                threadId={threadId}
                 toolArgs={argsByIdx[i]}
               />
             ) : (
@@ -3214,6 +3267,7 @@ function TaskView({
               key={i}
               msg={m}
               sessionId={sessionId}
+              threadId={threadId}
               toolArgs={argsByIdx[i]}
             />
           ))}
@@ -3550,15 +3604,32 @@ function ModeToggle({
 function ToolMessageCard({
   msg,
   sessionId,
+  threadId,
   args,
 }: {
   msg: Message
   sessionId: string | null
+  threadId: string | null
   args?: Record<string, any>
 }) {
   const name = msg.tool_name ?? ''
   const content = msg.content ?? ''
   const isError = content.startsWith('Error')
+
+  // Visual method: the output was rasterised into page image(s) and the
+  // transcript only kept an `[image]` marker. Show a viewer that fetches
+  // the real PNGs from the checkpoint on click.
+  if (!isError && content.includes('[image]')) {
+    return (
+      <VisualImagesEventRow
+        sessionId={sessionId}
+        threadId={threadId}
+        messageId={msg.id}
+        toolName={name}
+        content={content}
+      />
+    )
+  }
 
   if (name === 'run_shell')
     return <ShellEventRow content={content} cmdArg={args?.cmd} />
@@ -3589,6 +3660,113 @@ function ToolMessageCard({
   )
 }
 
+/** Visual-method tool result: the output was converted into one or more
+ *  page images. Click to fetch + view them (lazily, from the checkpoint). */
+function VisualImagesEventRow({
+  sessionId,
+  threadId,
+  messageId,
+  toolName,
+  content,
+}: {
+  sessionId: string | null
+  threadId: string | null
+  messageId?: number
+  toolName: string
+  content: string
+}) {
+  const [open, setOpen] = useState(false)
+  const [images, setImages] = useState<string[] | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  // Best-effort page count from the flattened markers, for the badge.
+  const pageHint = (() => {
+    const m = content.match(/\[page \d+\/(\d+)\]/)
+    if (m) return parseInt(m[1], 10)
+    return (content.match(/\[image\]/g) || []).length || 1
+  })()
+
+  // REFERENCES text the model can cite — strip the image/page markers.
+  const refs = content
+    .replace(/\[page \d+\/\d+\]/g, '')
+    .replace(/\[image\]/g, '')
+    .trim()
+
+  async function toggle() {
+    const next = !open
+    setOpen(next)
+    if (next && images === null && !loading) {
+      if (!sessionId || !threadId || !messageId) {
+        setError('Cannot load images for this message.')
+        return
+      }
+      setLoading(true)
+      setError(null)
+      try {
+        const r = await authFetch(
+          `/api/sessions/${sessionId}/threads/${threadId}/messages/${messageId}/images`,
+        )
+        if (!r.ok) throw new Error(`Failed to load (HTTP ${r.status})`)
+        const data = await r.json()
+        const list: string[] = Array.isArray(data?.images) ? data.images : []
+        setImages(list)
+        if (list.length === 0) {
+          setError(
+            'No images available — they may have been removed from the conversation context.',
+          )
+        }
+      } catch (e: any) {
+        setError(e?.message ?? 'Failed to load images')
+      } finally {
+        setLoading(false)
+      }
+    }
+  }
+
+  return (
+    <EventRow
+      icon={<ToolIcon />}
+      verb={toolName || 'tool'}
+      target="→ image"
+      verbColor="text-fog-200"
+      badge={
+        <span className="text-[10px] uppercase tracking-wider text-violet-300 bg-violet-500/10 rounded px-1.5 py-0.5">
+          visual · {pageHint} page{pageHint === 1 ? '' : 's'}
+        </span>
+      }
+      onToggle={toggle}
+      open={open}
+    >
+      {open && (
+        <div className="space-y-2">
+          {refs && (
+            <pre className="text-[11px] text-fog-400 whitespace-pre-wrap max-h-32 overflow-auto bg-ink-200/50 rounded p-2 border border-line">
+              {refs}
+            </pre>
+          )}
+          {loading && (
+            <div className="text-[12px] text-fog-500">Loading images…</div>
+          )}
+          {error && <div className="text-[12px] text-rose-300">{error}</div>}
+          {images?.map((src, i) => (
+            <div
+              key={i}
+              className="border border-line rounded overflow-hidden bg-white"
+            >
+              <div className="text-[10px] text-fog-500 px-2 py-1 bg-ink-200/60 border-b border-line">
+                page {i + 1}/{images.length}
+              </div>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={src} alt={`page ${i + 1}`} className="w-full block" />
+            </div>
+          ))}
+        </div>
+      )}
+    </EventRow>
+  )
+}
+
 /** Compact one-row event in the activity timeline.
  *  Left: status indicator (green dot when done, spinner when in-flight, red ×
  *  on error). Middle: bold verb + target + small subtext. Right: optional
@@ -3603,6 +3781,8 @@ function EventRow({
   subtext,
   action,
   children,
+  onToggle,
+  open,
 }: {
   status?: 'done' | 'running' | 'error'
   icon?: React.ReactNode
@@ -3613,7 +3793,33 @@ function EventRow({
   subtext?: React.ReactNode
   action?: React.ReactNode
   children?: React.ReactNode
+  // When provided, the whole header (verb + target + subtext) becomes a single
+  // clickable control that calls onToggle; a chevron reflects `open`.
+  onToggle?: () => void
+  open?: boolean
 }) {
+  const header = (
+    <div className="flex items-center gap-2 flex-wrap">
+      {icon && <span className="text-fog-500">{icon}</span>}
+      <span className={`font-medium ${verbColor}`}>{verb}</span>
+      {target && (
+        <code className="font-mono text-fog-50 text-[13px] truncate">
+          {target}
+        </code>
+      )}
+      {badge}
+      {onToggle ? (
+        <span className="ml-auto text-fog-500 group-hover:text-fog-300 text-[11px]">
+          {open ? '▾' : '▸'}
+        </span>
+      ) : (
+        action && <span className="ml-auto">{action}</span>
+      )}
+    </div>
+  )
+  const sub = subtext && (
+    <div className="text-[11px] text-fog-500 mt-0.5">{subtext}</div>
+  )
   return (
     <div className="flex gap-3 text-[13px] group animate-float-up">
       {/* Status indicator + connecting line */}
@@ -3621,19 +3827,20 @@ function EventRow({
         <StatusDot status={status} />
       </div>
       <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 flex-wrap">
-          {icon && <span className="text-fog-500">{icon}</span>}
-          <span className={`font-medium ${verbColor}`}>{verb}</span>
-          {target && (
-            <code className="font-mono text-fog-50 text-[13px] truncate">
-              {target}
-            </code>
-          )}
-          {badge}
-          {action && <span className="ml-auto">{action}</span>}
-        </div>
-        {subtext && (
-          <div className="text-[11px] text-fog-500 mt-0.5">{subtext}</div>
+        {onToggle ? (
+          <button
+            type="button"
+            onClick={onToggle}
+            className="w-full text-left -mx-1 px-1 py-0.5 rounded cursor-pointer hover:bg-soft/[0.05]"
+          >
+            {header}
+            {sub}
+          </button>
+        ) : (
+          <>
+            {header}
+            {sub}
+          </>
         )}
         {children && <div className="mt-2">{children}</div>}
       </div>
@@ -3704,16 +3911,8 @@ function ShellEventRow({
       verb="Run"
       target={cmd}
       subtext={subtext}
-      action={
-        hasOutput && (
-          <button
-            onClick={() => setOpen((v) => !v)}
-            className="text-[11px] text-fog-400 hover:text-fog-50"
-          >
-            {open ? 'Hide output' : 'Show output'}
-          </button>
-        )
-      }
+      onToggle={hasOutput ? () => setOpen((v) => !v) : undefined}
+      open={open}
     >
       {open && hasOutput && (
         <div className="rounded border border-line bg-ink-100/60 px-3 py-2 font-mono text-[12px] max-h-72 overflow-y-auto whitespace-pre-wrap">
@@ -3744,10 +3943,19 @@ function WriteFileEventRow({
   const [diff, setDiff] = useState<string | null>(null)
   const [diffLoading, setDiffLoading] = useState(false)
   const [diffError, setDiffError] = useState<string | null>(null)
+  // Fallback "view file" state for writes that weren't committed (no sha → no
+  // diff). We fetch the file's current content from storage on demand.
+  const [fileOpen, setFileOpen] = useState(false)
+  const [fileBody, setFileBody] = useState<string | null>(null)
+  const [fileLoading, setFileLoading] = useState(false)
+  const [fileError, setFileError] = useState<string | null>(null)
 
   if (isError) return <ToolErrorRow verb="Edit" content={content} />
 
-  const sizeMatch = content.match(/^Wrote (\d+) bytes to (.+?)\./)
+  // Capture the full path up to the *terminal* period (the one before a space
+  // or end of string), not the first dot — otherwise "foo.txt." truncates to
+  // "foo" and the filename loses its extension.
+  const sizeMatch = content.match(/^Wrote (\d+) bytes to (.+?)\.(?:\s|$)/)
   const commitMatch = content.match(
     /committed as Agent: (created|updated) (.+?) \(([a-f0-9]+)\)/,
   )
@@ -3787,6 +3995,57 @@ function WriteFileEventRow({
       setDiffError(e?.message ?? 'network error')
     } finally {
       setDiffLoading(false)
+    }
+  }
+
+  // Loads a red/green diff for files with no git commit (chat-session S3
+  // files). Prefers the stored unified diff of the last write; if none exists
+  // (e.g. a brand-new file), falls back to showing the current content as an
+  // all-green "added" diff. Either way the result is rendered via SplitDiffBlock.
+  async function toggleFile() {
+    if (fileOpen) {
+      setFileOpen(false)
+      return
+    }
+    setFileOpen(true)
+    if (fileBody !== null || !sessionId || !filename) return
+    setFileLoading(true)
+    setFileError(null)
+    try {
+      const dr = await authFetch(
+        `/api/sessions/${sessionId}/files/${encodeURIComponent(filename)}/diff`,
+      )
+      if (dr.ok) {
+        const body = await dr.json()
+        if (body?.diff) {
+          setFileBody(body.diff)
+          return
+        }
+      }
+      // No recorded diff — show current content as all additions (green).
+      const r = await authFetch(
+        `/api/sessions/${sessionId}/files/${encodeURIComponent(filename)}`,
+      )
+      if (!r.ok) {
+        let detail = `${r.status} ${r.statusText}`
+        try {
+          const body = await r.json()
+          if (body?.detail) detail = body.detail
+        } catch {}
+        setFileError(detail)
+        return
+      }
+      const body = await r.json()
+      const content =
+        (body?.content ?? '') + (body?.truncated ? '\n[... truncated ...]' : '')
+      const lines = content.split('\n')
+      setFileBody(
+        `@@ -0,0 +1,${lines.length} @@\n` + lines.map((l: string) => '+' + l).join('\n'),
+      )
+    } catch (e: any) {
+      setFileError(e?.message ?? 'network error')
+    } finally {
+      setFileLoading(false)
     }
   }
 
@@ -3838,16 +4097,14 @@ function WriteFileEventRow({
       verb={verbLabel}
       target={filename}
       subtext={subtext}
-      action={
-        sha && sessionId ? (
-          <button
-            onClick={toggleDiff}
-            className="text-[11px] text-fog-400 hover:text-fog-50"
-          >
-            {diffOpen ? 'Hide diff' : diff ? 'Show diff' : 'View diff'}
-          </button>
-        ) : undefined
+      onToggle={
+        sha && sessionId
+          ? toggleDiff
+          : sessionId && filename !== '(unnamed)'
+            ? toggleFile
+            : undefined
       }
+      open={diffOpen || fileOpen}
     >
       {diffOpen && (
         <div>
@@ -3864,6 +4121,21 @@ function WriteFileEventRow({
           )}
         </div>
       )}
+      {fileOpen && (
+        <div>
+          {fileLoading && (
+            <div className="text-[12px] text-fog-400 px-1">Loading file…</div>
+          )}
+          {fileError && (
+            <div className="text-[12px] text-rose-300 px-1">
+              Failed to load file: {fileError}
+            </div>
+          )}
+          {fileBody !== null && !fileLoading && !fileError && (
+            <SplitDiffBlock diff={fileBody} />
+          )}
+        </div>
+      )}
     </EventRow>
   )
 }
@@ -3875,15 +4147,31 @@ function WriteFileEventRow({
  *  green). Pure-context lines appear on both sides; sequences of pure
  *  deletes get paired with the corresponding adds when possible. */
 function SplitDiffBlock({ diff }: { diff: string }) {
-  type Row = { left: string | null; right: string | null; kind: 'context' | 'change' }
+  type Row = {
+    left: string | null
+    right: string | null
+    leftNo: number | null
+    rightNo: number | null
+    kind: 'context' | 'change' | 'hunk'
+  }
   const rows: Row[] = []
 
-  let dels: string[] = []
-  let adds: string[] = []
+  let dels: { text: string; no: number }[] = []
+  let adds: { text: string; no: number }[] = []
+  let oldLine = 0
+  let newLine = 0
   const flush = () => {
     const n = Math.max(dels.length, adds.length)
     for (let i = 0; i < n; i++) {
-      rows.push({ left: dels[i] ?? null, right: adds[i] ?? null, kind: 'change' })
+      const d = dels[i]
+      const a = adds[i]
+      rows.push({
+        left: d ? d.text : null,
+        right: a ? a.text : null,
+        leftNo: d ? d.no : null,
+        rightNo: a ? a.no : null,
+        kind: 'change',
+      })
     }
     dels = []
     adds = []
@@ -3892,7 +4180,12 @@ function SplitDiffBlock({ diff }: { diff: string }) {
   for (const raw of diff.split('\n')) {
     if (raw.startsWith('@@')) {
       flush()
-      rows.push({ left: raw, right: raw, kind: 'context' })
+      const m = raw.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
+      if (m) {
+        oldLine = parseInt(m[1], 10)
+        newLine = parseInt(m[2], 10)
+      }
+      rows.push({ left: raw, right: raw, leftNo: null, rightNo: null, kind: 'hunk' })
       continue
     }
     if (
@@ -3907,53 +4200,66 @@ function SplitDiffBlock({ diff }: { diff: string }) {
       continue
     }
     if (raw.startsWith('+')) {
-      adds.push(raw.slice(1))
+      adds.push({ text: raw.slice(1), no: newLine++ })
     } else if (raw.startsWith('-')) {
-      dels.push(raw.slice(1))
+      dels.push({ text: raw.slice(1), no: oldLine++ })
     } else {
       flush()
-      rows.push({ left: raw.slice(1), right: raw.slice(1), kind: 'context' })
+      rows.push({
+        left: raw.slice(1),
+        right: raw.slice(1),
+        leftNo: oldLine++,
+        rightNo: newLine++,
+        kind: 'context',
+      })
     }
   }
   flush()
 
+  // Diagonal hatch fills the "no line on this side" padding cells.
+  const HATCH: React.CSSProperties = {
+    backgroundImage:
+      'repeating-linear-gradient(45deg, rgba(255,255,255,0.04) 0, rgba(255,255,255,0.04) 1px, transparent 1px, transparent 7px)',
+  }
+  const Cell = (
+    text: string | null,
+    no: number | null,
+    kind: Row['kind'],
+    side: 'left' | 'right',
+  ) => {
+    const empty = text == null
+    const changed = kind === 'change' && !empty
+    const hunk = kind === 'hunk'
+    const bg = changed ? (side === 'left' ? 'bg-rose-500/20' : 'bg-emerald-500/20') : ''
+    // Keep the code text bright/legible regardless of the line colour; only the
+    // background and the +/- sign carry the red/green meaning.
+    const textColor = hunk ? 'text-sky-300' : changed ? 'text-fog-50' : 'text-fog-200'
+    const signColor = side === 'left' ? 'text-rose-300' : 'text-emerald-300'
+    const sign = changed ? (side === 'left' ? '-' : '+') : ''
+    return (
+      <div className={`flex items-start ${bg}`} style={empty ? HATCH : undefined}>
+        <span className="select-none shrink-0 w-9 pr-2 text-right text-fog-500 tabular-nums">
+          {no ?? ''}
+        </span>
+        <span className={`select-none shrink-0 w-3 text-center ${signColor}`}>{sign}</span>
+        <span className={`pr-3 whitespace-pre overflow-x-auto ${textColor}`}>
+          {empty ? '' : text || ' '}
+        </span>
+      </div>
+    )
+  }
+
   return (
     <div className="rounded border border-line bg-ink-100 overflow-hidden">
-      <div className="grid grid-cols-2 divide-x divide-line font-mono text-[12px] max-h-80 overflow-y-auto">
+      <div className="grid grid-cols-2 divide-x divide-line font-mono text-[12px] leading-[1.55] max-h-80 overflow-y-auto">
         <div>
           {rows.map((r, i) => (
-            <div
-              key={i}
-              className={`px-2 py-0.5 whitespace-pre overflow-x-auto ${
-                r.left == null
-                  ? ''
-                  : r.kind === 'change' && r.left
-                    ? 'bg-rose-500/[0.08] text-rose-300'
-                    : r.left.startsWith('@@')
-                      ? 'text-sky-300'
-                      : 'text-fog-400'
-              }`}
-            >
-              {r.left == null ? ' ' : r.left || ' '}
-            </div>
+            <div key={i}>{Cell(r.left, r.leftNo, r.kind, 'left')}</div>
           ))}
         </div>
         <div>
           {rows.map((r, i) => (
-            <div
-              key={i}
-              className={`px-2 py-0.5 whitespace-pre overflow-x-auto ${
-                r.right == null
-                  ? ''
-                  : r.kind === 'change' && r.right
-                    ? 'bg-emerald-500/[0.08] text-emerald-300'
-                    : r.right.startsWith('@@')
-                      ? 'text-sky-300'
-                      : 'text-fog-400'
-              }`}
-            >
-              {r.right == null ? ' ' : r.right || ' '}
-            </div>
+            <div key={i}>{Cell(r.right, r.rightNo, r.kind, 'right')}</div>
           ))}
         </div>
       </div>
@@ -3976,6 +4282,7 @@ function ReadFileEventRow({
   isError: boolean
   filenameArg?: string
 }) {
+  const [open, setOpen] = useState(false)
   if (isError) return <ToolErrorRow verb="Read" content={content} />
   const bytes = new Blob([content]).size
   const lines = content.split('\n').length
@@ -3990,7 +4297,15 @@ function ReadFileEventRow({
           <span className="text-fog-500"> · {bytes} bytes</span>
         </span>
       }
-    />
+      onToggle={content ? () => setOpen((v) => !v) : undefined}
+      open={open}
+    >
+      {open && content && (
+        <pre className="rounded border border-line bg-ink-100/60 px-3 py-2 font-mono text-[12px] text-fog-200 max-h-96 overflow-auto whitespace-pre-wrap">
+          {content}
+        </pre>
+      )}
+    </EventRow>
   )
 }
 
@@ -5376,14 +5691,20 @@ function ContextViewer({
   error,
   onClose,
   onRefresh,
+  onSoftRefresh,
   onDelete,
+  sessionId,
+  threadId,
 }: {
   data: any
   loading: boolean
   error: string | null
   onClose: () => void
   onRefresh: () => void
+  onSoftRefresh: () => void
   onDelete: (messageId: number) => void
+  sessionId: string | null
+  threadId: string | null
 }) {
   const [systemOpen, setSystemOpen] = useState(false)
   const [rawMode, setRawMode] = useState(false)
@@ -5513,6 +5834,23 @@ function ContextViewer({
                     style={{ width: `${Math.min(100, pct)}%` }}
                   />
                 </div>
+                {/* Image-recall caching — prompt tokens served from the
+                    provider cache so far. Only shown when caching is active
+                    (the cache / cache+evict techniques on a cache-capable
+                    provider report cache_read_tokens > 0). */}
+                {(Number(data.cache_read_tokens) || 0) > 0 && (
+                  <div className="mt-2 flex items-baseline justify-between text-[12px] bg-sky-500/8 border border-sky-500/25 rounded-md px-3 py-1.5">
+                    <span className="text-fog-400 uppercase tracking-widest text-[10px]">
+                      ⚡ Prompt cache
+                    </span>
+                    <span className="font-mono text-sky-300">
+                      {Number(data.cache_read_tokens).toLocaleString()} tokens reused
+                      {data.total_tokens
+                        ? ` · ${((Number(data.cache_read_tokens) / data.total_tokens) * 100).toFixed(0)}%`
+                        : ''}
+                    </span>
+                  </div>
+                )}
               </section>
 
               {/* Per-turn token trajectory (PR #0) */}
@@ -5526,6 +5864,15 @@ function ContextViewer({
               <AppliedEditsSection
                 edits={data.applied_edits || []}
                 fmtTokenCount={fmtTokenCount}
+              />
+
+              {/* Task-aware relevance cleanup — suggest & remove finished /
+                  unrelated episodes. Suggest-only; refreshes context on apply. */}
+              <RelevanceCleanupSection
+                sessionId={sessionId}
+                threadId={threadId}
+                model={data.model}
+                onApplied={onSoftRefresh}
               />
 
               {/* System prompt */}
@@ -5546,23 +5893,32 @@ function ContextViewer({
                 )}
               </section>
 
-              {/* Messages */}
+              {/* Messages — grouped by user turn. Top level shows the user
+                  prompt + the turn's token total; expand to see and remove the
+                  assistant/tool messages it produced. */}
               <section>
-                <div className="text-[11px] uppercase tracking-widest text-fog-500 mb-2">
-                  Messages · {data.messages.length}
-                </div>
-                {data.messages.length === 0 && (
-                  <p className="text-fog-500 text-xs">No messages yet.</p>
-                )}
-                <div className="space-y-1.5">
-                  {data.messages.map((m: any, i: number) => (
-                    <ContextMessageRow
-                      key={m.id ?? i}
-                      msg={m}
-                      onDelete={onDelete}
-                    />
-                  ))}
-                </div>
+                {(() => {
+                  const turns = groupTurns(data.messages || [])
+                  return (
+                    <>
+                      <div className="text-[11px] uppercase tracking-widest text-fog-500 mb-2">
+                        Conversation · {turns.length} turn{turns.length === 1 ? '' : 's'}
+                      </div>
+                      {turns.length === 0 && (
+                        <p className="text-fog-500 text-xs">No messages yet.</p>
+                      )}
+                      <div className="space-y-1.5">
+                        {turns.map((g, i) => (
+                          <MessageTurnGroup
+                            key={g.user?.id ?? `turn-${i}`}
+                            group={g}
+                            onDelete={onDelete}
+                          />
+                        ))}
+                      </div>
+                    </>
+                  )
+                })()}
               </section>
 
               {/* Files */}
@@ -5610,6 +5966,7 @@ type TrajectoryPoint = {
   output_tokens: number
   turn_tokens: number
   cumulative_tokens: number
+  cache_read_tokens?: number
   messages: number
 }
 
@@ -5626,6 +5983,7 @@ const EDIT_TYPE_LABEL: Record<string, { label: string; icon: string }> = {
   tool_result_trimming: { label: 'Tool-result trimming', icon: '↺' },
   summarization: { label: 'Summarisation', icon: '📝' },
   sliding_window: { label: 'Sliding window', icon: '✂️' },
+  image_eviction: { label: 'Image eviction', icon: '🖼️' },
   subagent_call: { label: 'Sub-agent dispatch', icon: '🧠' },
   memory_write: { label: 'Memory write', icon: '💾' },
   memory_read: { label: 'Memory read', icon: '🗂️' },
@@ -5711,7 +6069,7 @@ function TrajectorySection({
                   className="fill-emerald-400"
                 />
                 <title>
-                  {`Turn ${p.t.turn} · +${p.t.turn_tokens} tok (cum ${p.t.cumulative_tokens})`}
+                  {`Turn ${p.t.turn} · +${p.t.turn_tokens} tok (cum ${p.t.cumulative_tokens})${(p.t.cache_read_tokens ?? 0) > 0 ? ` · ⚡${p.t.cache_read_tokens} cached` : ''}`}
                 </title>
               </g>
             ))}
@@ -5737,12 +6095,20 @@ function AppliedEditsSection({
   edits: AppliedEdit[]
   fmtTokenCount: (n: number) => string
 }) {
+  // Collapsed by default — expand to inspect what fired this thread.
+  const [open, setOpen] = useState(false)
   return (
     <section>
-      <div className="text-[11px] uppercase tracking-widest text-fog-500 mb-2">
-        Applied context edits · {edits.length}
-      </div>
-      {edits.length === 0 ? (
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-1.5 text-[11px] uppercase tracking-widest text-fog-500 mb-2 hover:text-fog-300"
+        title={open ? 'Collapse' : 'Expand'}
+      >
+        <span className="shrink-0">{open ? '▾' : '▸'}</span>
+        <span>Applied context edits · {edits.length}</span>
+      </button>
+      {!open ? null : edits.length === 0 ? (
         <div className="text-[12px] text-fog-500 bg-ink-300 border border-line rounded-md p-3">
           Nothing has been trimmed, summarised, or delegated yet. When a
           context-management strategy fires (e.g. tool-result trimming
@@ -5786,6 +6152,90 @@ function AppliedEditsSection({
         </div>
       )}
     </section>
+  )
+}
+
+// A conversation turn: the user prompt plus the assistant/tool messages it
+// produced. Messages before the first user prompt fall into a leading group.
+type Turn = { user: any | null; children: any[] }
+
+function groupTurns(messages: any[]): Turn[] {
+  const groups: Turn[] = []
+  let cur: Turn | null = null
+  for (const m of messages) {
+    if (m.role === 'user') {
+      if (cur) groups.push(cur)
+      cur = { user: m, children: [] }
+    } else {
+      if (!cur) cur = { user: null, children: [] }
+      cur.children.push(m)
+    }
+  }
+  if (cur) groups.push(cur)
+  return groups
+}
+
+// Each message's OWN size (not the per-call total, which includes all prior
+// history). Assistant turns use their completion tokens; everything else is
+// estimated from content length.
+function ownTokens(m: any): number {
+  if (!m) return 0
+  if (m.role === 'assistant' && Number(m.output_tokens) > 0) {
+    return Number(m.output_tokens)
+  }
+  return Math.ceil((String(m.content || '').length) / 4)
+}
+
+function turnTokens(g: Turn): number {
+  return ownTokens(g.user) + g.children.reduce((acc, m) => acc + ownTokens(m), 0)
+}
+
+function MessageTurnGroup({
+  group,
+  onDelete,
+}: {
+  group: Turn
+  onDelete?: (messageId: number) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const preview = String(group.user?.content || '')
+    .slice(0, 90)
+    .replace(/\n/g, ' ')
+  const childCount = group.children.length
+  const total = turnTokens(group)
+  return (
+    <div className="rounded-md border border-line bg-ink-300/40">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-soft/[0.03]"
+      >
+        <span className="text-fog-500 text-[11px] shrink-0">
+          {open ? '▾' : '▸'}
+        </span>
+        <span className="text-[10px] uppercase tracking-wider font-mono text-blue-300 shrink-0">
+          {group.user ? 'user' : 'context'}
+        </span>
+        <span className="text-fog-200 text-[12px] truncate flex-1">
+          {preview || (group.user ? '(empty)' : 'leading messages')}
+        </span>
+        <span className="text-fog-500 text-[10px] shrink-0">
+          {childCount} msg
+        </span>
+        <span className="text-fog-400 text-[11px] shrink-0 tabular-nums">
+          {total.toLocaleString()} tok
+        </span>
+      </button>
+      {open && (
+        <div className="px-2 pb-2 space-y-1">
+          {group.user && (
+            <ContextMessageRow msg={group.user} onDelete={onDelete} />
+          )}
+          {group.children.map((m: any, i: number) => (
+            <ContextMessageRow key={m.id ?? i} msg={m} onDelete={onDelete} />
+          ))}
+        </div>
+      )}
+    </div>
   )
 }
 

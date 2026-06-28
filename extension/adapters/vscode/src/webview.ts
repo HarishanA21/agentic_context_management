@@ -73,6 +73,23 @@ async function dispatch(client: AcmClient, method: string, params: any): Promise
       return client.dropMessage(p.fp, p.conv || '');
     case 'restoreMessage':
       return client.restoreMessage(p.fp, p.conv || '');
+    case 'dropMany':
+      return client.dropMany(p.fps || [], p.conv || '');
+    case 'relevanceSuggest':
+      return client.relevanceSuggest(p.conv || '');
+    case 'relevanceFeedback':
+      return client.relevanceFeedback(p.payload || {});
+    case 'relevanceSummarize':
+      return client.relevanceSummarize({
+        member_fps: p.member_fps || p.fps || [],
+        conv: p.conv || '',
+        title: p.title,
+        model: p.model,
+      });
+    case 'messageImages':
+      return client.messageImages(p.fp, p.conv || '');
+    case 'messageText':
+      return client.messageText(p.fp, p.conv || '');
     default:
       throw new Error('unknown rpc method: ' + method);
   }

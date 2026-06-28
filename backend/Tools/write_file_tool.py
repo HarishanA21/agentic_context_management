@@ -149,8 +149,18 @@ def write_project_file(
             out += f" ({commit_summary})"
         return out
 
+    bucket = get_bucket()
+    # Grab the previous content (if any) BEFORE overwriting, so we can store a
+    # diff the UI can render red/green — chat-session files have no git commit.
     try:
-        get_bucket().upload(
+        old_text = bucket.download(file_key(user_id, session_id, name)).decode(
+            "utf-8", errors="replace"
+        )
+    except Exception:
+        old_text = None
+
+    try:
+        bucket.upload(
             path=file_key(user_id, session_id, name),
             file=payload,
             file_options={
@@ -161,4 +171,36 @@ def write_project_file(
     except Exception as e:
         return f"Error writing file: {e}"
 
+    _store_s3_diff(bucket, user_id, session_id, name, old_text, content)
     return f"Wrote {len(payload)} bytes to {name}."
+
+
+def _store_s3_diff(bucket, user_id, session_id, name, old_text, new_text) -> None:
+    """Best-effort: store a unified diff of this write as a hidden ``.acmdiff.``
+    sidecar so the UI can show a red/green diff for S3 (chat-session) files,
+    which have no git commit to diff against. Never raises."""
+    try:
+        import difflib
+
+        old_lines = old_text.splitlines() if old_text is not None else []
+        diff_lines = list(
+            difflib.unified_diff(
+                old_lines,
+                new_text.splitlines(),
+                fromfile=name,
+                tofile=name,
+                lineterm="",
+            )
+        )
+        if not diff_lines:
+            return
+        bucket.upload(
+            path=file_key(user_id, session_id, f".acmdiff.{name}"),
+            file=("\n".join(diff_lines)).encode("utf-8"),
+            file_options={
+                "content-type": "text/plain; charset=utf-8",
+                "upsert": "true",
+            },
+        )
+    except Exception as e:  # diff is a nicety; the write already succeeded
+        print(f"[write_file] diff store failed for {name}: {e}", flush=True)

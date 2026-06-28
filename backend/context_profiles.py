@@ -78,6 +78,147 @@ class SlidingWindowCfg(BaseModel):
     keep_recent: int = Field(default=12, ge=2, le=200)
 
 
+# Valid engines for relevance pruning. "judge" = LLM-as-judge only (ships now);
+# "encoder" = local ONNX cross-encoder only (Phase 2); "ensemble" = both, with
+# the arbitration policy reconciling disagreements.
+RELEVANCE_MODES = {"judge", "encoder", "ensemble"}
+RELEVANCE_ARBITRATION = {"safest", "judge_wins", "agreement_only"}
+
+
+class RelevancePruningCfg(BaseModel):
+    """Task-aware removal *suggestions* (see ``backend/relevance.py``).
+
+    Unlike the mechanical techniques, this one splits the thread into episodes,
+    works out the current task, and proposes which finished/unrelated episodes
+    to remove. It is **suggest-only** by default (``auto_apply=False``): the
+    user confirms before anything is dropped, and every choice is logged to the
+    feedback file so the judge and encoder can be improved later.
+    """
+
+    enabled: bool = False
+    mode: str = "judge"
+    keep_recent: int = Field(default=3, ge=0, le=50)  # episodes always kept
+    drop_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
+    summarize_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    arbitration: str = "safest"
+    judge_model: Optional[str] = None  # dedicated cheap model for the audit
+    encoder_path: Optional[str] = None  # local ONNX model (Phase 2)
+    auto_apply: bool = False  # always suggest-only by default
+    feedback_logging: bool = True
+
+    @field_validator("mode")
+    @classmethod
+    def _mode_must_be_valid(cls, v: str) -> str:
+        norm = (v or "judge").strip().lower()
+        if norm not in RELEVANCE_MODES:
+            raise ValueError(f"mode must be one of {sorted(RELEVANCE_MODES)}")
+        return norm
+
+    @field_validator("arbitration")
+    @classmethod
+    def _arb_must_be_valid(cls, v: str) -> str:
+        norm = (v or "safest").strip().lower()
+        if norm not in RELEVANCE_ARBITRATION:
+            raise ValueError(
+                f"arbitration must be one of {sorted(RELEVANCE_ARBITRATION)}"
+            )
+        return norm
+
+
+# Valid modes for the image-recall technique. These are MUTUALLY EXCLUSIVE
+# (the user picks at most one), which is exactly why this is a single enum
+# field rather than three independent toggles — the schema makes "can't
+# select two at a time" unrepresentable.
+#   off         — neither caching nor eviction (raw image method as today)
+#   cache       — prompt caching only: cheaper/faster, output identical
+#   evict       — image eviction only: keep last K images as pixels, replace
+#                 older ones with their REFERENCES + a digest (accuracy win)
+#   cache_evict — both layers combined (recommended for long visual sessions)
+IMAGE_RECALL_MODES = {"off", "cache", "evict", "cache_evict"}
+
+
+class ImageRecallCfg(BaseModel):
+    """The three new mutually-exclusive image context-management techniques.
+
+    Pairs with the existing visual-compression pipeline (``visual_tool``):
+    once a tool output has been rasterised to a PNG, this block decides how
+    that image is treated as the conversation grows.
+
+    ``keep_recent_images`` (K) only applies to the eviction paths
+    (``evict`` / ``cache_evict``): the K most-recent image-bearing tool
+    results stay as real pixels; anything older is collapsed to its text
+    REFERENCES block + a one-line digest so the model stops re-attending to
+    a pile of stale images (the multi-image accuracy problem).
+    """
+
+    mode: str = "off"
+    keep_recent_images: int = Field(default=3, ge=1, le=20)
+    # Caching knobs (apply to cache / cache_evict). TTL maps to Anthropic's
+    # ephemeral cache_control ttl; "5m" default, "1h" for long sessions.
+    cache_ttl: str = Field(default="5m")
+    # Only re-cache the settled prefix every N user turns so eviction
+    # rewrites don't thrash the cache (see the cost/accuracy trade-off).
+    evict_batch_turns: int = Field(default=1, ge=1, le=50)
+
+    @field_validator("mode")
+    @classmethod
+    def _mode_must_be_valid(cls, v: str) -> str:
+        norm = (v or "off").strip().lower()
+        if norm not in IMAGE_RECALL_MODES:
+            raise ValueError(
+                f"mode must be one of {sorted(IMAGE_RECALL_MODES)}"
+            )
+        return norm
+
+    @field_validator("cache_ttl")
+    @classmethod
+    def _ttl_must_be_valid(cls, v: str) -> str:
+        norm = (v or "5m").strip().lower()
+        if norm not in {"5m", "1h"}:
+            raise ValueError("cache_ttl must be '5m' or '1h'")
+        return norm
+
+    # Convenience predicates used by the orchestrator / middleware.
+    @property
+    def caching_enabled(self) -> bool:
+        return self.mode in {"cache", "cache_evict"}
+
+    @property
+    def eviction_enabled(self) -> bool:
+        return self.mode in {"evict", "cache_evict"}
+
+
+VISUAL_METHOD_MODES = {"templated", "auxiliary"}
+
+
+class VisualMethodCfg(BaseModel):
+    """Rasterise large tool outputs into a formatted image the model reads,
+    instead of raw text — trades text tokens for a (cheaper, for big outputs)
+    image. Requires a vision-capable chat model.
+
+    ``mode``:
+      * ``templated``  — hand-written layouts where they exist, else fall back
+        to an auxiliary LLM that writes a formatter once and caches it.
+      * ``auxiliary``  — always have a small LLM generate the formatter.
+    Only outputs above ``threshold_tokens`` are rasterised; smaller ones stay
+    as text (an image would cost more).
+    """
+
+    enabled: bool = False
+    mode: str = "templated"
+    threshold_tokens: int = Field(default=500, ge=50, le=100_000)
+    only_tools: List[str] = Field(default_factory=list)
+    exclude_tools: List[str] = Field(default_factory=list)
+
+    @field_validator("mode")
+    @classmethod
+    def _mode_must_be_valid(cls, v: str) -> str:
+        norm = (v or "templated").strip().lower()
+        if norm not in VISUAL_METHOD_MODES:
+            raise ValueError(f"mode must be one of {sorted(VISUAL_METHOD_MODES)}")
+        return norm
+
+
 class ContextManagementBlock(BaseModel):
     tool_result_trimming: ToolResultTrimmingCfg = Field(default_factory=ToolResultTrimmingCfg)
     summarization: SummarizationCfg = Field(default_factory=SummarizationCfg)
@@ -85,6 +226,9 @@ class ContextManagementBlock(BaseModel):
     subagent: SubagentCfg = Field(default_factory=SubagentCfg)
     jit_tools: JitToolsCfg = Field(default_factory=JitToolsCfg)
     sliding_window: SlidingWindowCfg = Field(default_factory=SlidingWindowCfg)
+    image_recall: ImageRecallCfg = Field(default_factory=ImageRecallCfg)
+    relevance_pruning: RelevancePruningCfg = Field(default_factory=RelevancePruningCfg)
+    visual_method: VisualMethodCfg = Field(default_factory=VisualMethodCfg)
 
 
 class Profile(BaseModel):
@@ -157,6 +301,47 @@ BUILTIN_PRESETS: List[Dict[str, Any]] = [
             ),
         ).model_dump(),
     },
+    {
+        "name": "visual_recall",
+        "is_default": False,
+        "body": Profile(
+            tool_surface="tool_calling",
+            context_management=ContextManagementBlock(
+                # Combined image-recall: keep the last 3 images as pixels,
+                # digest older ones, and prompt-cache the settled prefix.
+                image_recall=ImageRecallCfg(
+                    mode="cache_evict", keep_recent_images=3
+                ),
+                tool_result_trimming=ToolResultTrimmingCfg(enabled=True),
+            ),
+        ).model_dump(),
+    },
+    {
+        "name": "auto_suggest",
+        "is_default": False,
+        "body": Profile(
+            tool_surface="tool_calling",
+            context_management=ContextManagementBlock(
+                # Task-aware removal suggestions via LLM-as-judge. Suggest-only:
+                # nothing is dropped without the user confirming.
+                relevance_pruning=RelevancePruningCfg(enabled=True, mode="judge"),
+            ),
+        ).model_dump(),
+    },
+    {
+        "name": "visual_method",
+        "is_default": False,
+        "body": Profile(
+            tool_surface="tool_calling",
+            context_management=ContextManagementBlock(
+                # Rasterise large tool outputs into a formatted image the model
+                # reads instead of text. Needs a vision-capable chat model.
+                visual_method=VisualMethodCfg(
+                    enabled=True, mode="templated", threshold_tokens=500
+                ),
+            ),
+        ).model_dump(),
+    },
 ]
 
 # One-line UI descriptions; ships in the GET /context/profiles payload.
@@ -166,6 +351,9 @@ PRESET_SUMMARY: Dict[str, str] = {
     "long_chat": "Tool calling + tool-result trimming + summarisation. Best for long debugging / Q&A sessions.",
     "power_research": "Code Mode + trimming + summarisation + memory + sub-agents. Best for deep research.",
     "cheap_long": "Tool calling + trimming + sliding window. Cheap fallback for tiny-context models.",
+    "visual_recall": "Image-recall: keep the last 3 tool images as pixels, digest older ones, and prompt-cache the settled prefix. Best for long, image-heavy tool sessions.",
+    "auto_suggest": "Task-aware cleanup: an LLM auditor splits the chat into episodes and suggests which finished/unrelated ones to remove. Suggest-only — you confirm each removal.",
+    "visual_method": "Rasterise large tool outputs into a formatted image the model reads instead of text — saves tokens on big/noisy outputs. Requires a vision-capable model.",
 }
 
 DEFAULT_PRESET_NAME = "minimal"

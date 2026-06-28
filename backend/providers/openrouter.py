@@ -17,7 +17,11 @@ from langchain_openai import ChatOpenAI
 from providers.base import CredentialField, LLMProvider, ProviderTestError
 
 
-_DEFAULT_MAX_TOKENS = int(os.getenv("CHAT_MAX_TOKENS", "1500"))
+# No output cap by default — a hard ceiling clips large tool-call arguments
+# (e.g. writing a big file) and reasoning models mid-thought. Set
+# CHAT_MAX_TOKENS to bring back a ceiling. Mirrors api._build_model.
+_max_env = os.getenv("CHAT_MAX_TOKENS", "").strip()
+_DEFAULT_MAX_TOKENS = int(_max_env) if _max_env else None
 _DEFAULT_TEMPERATURE = float(os.getenv("CHAT_TEMPERATURE", "0.3"))
 _OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
