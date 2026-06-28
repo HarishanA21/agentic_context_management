@@ -2557,60 +2557,62 @@ export default function AppPage() {
                 }}
               />
             )}
-            {providers.length > 0 ? (
-              <div className="chip flex items-center gap-2 pr-1" title="LLM provider for this session">
+            {(providers.length > 0 || models.length > 0) ? (
+              <div className="chip flex items-center gap-2 pr-1" title="Select LLM provider or model">
                 <span className="dot bg-emerald-400" />
                 <select
-                  value={
-                    (activeSession && sessionProviders[activeSession]) || ''
-                  }
+                  value={(() => {
+                    // If session has a provider override, show that
+                    if (activeSession && sessionProviders[activeSession]) {
+                      return `provider:${sessionProviders[activeSession]}`
+                    }
+                    // Otherwise show selected OpenRouter model
+                    return selectedModel ? `model:${selectedModel}` : ''
+                  })()}
                   onChange={(e) => {
-                    const v = e.target.value
-                    if (!activeSession) return
-                    setSessionProvider(activeSession, v || null)
-                  }}
-                  disabled={!activeSession}
-                  className="bg-transparent text-xs text-fog-50 outline-none max-w-[18rem] truncate disabled:opacity-50"
-                >
-                  <option value="" className="bg-ink-200 text-fog-50">
-                    {(() => {
-                      const def = providers.find((p) => p.is_default)
-                      return def
-                        ? `Default · ${def.label} · ${def.model_id}`
-                        : 'Default (env fallback)'
-                    })()}
-                  </option>
-                  {providers.map((p) => (
-                    <option
-                      key={p.id}
-                      value={p.id}
-                      className="bg-ink-200 text-fog-50"
-                    >
-                      {p.label} · {p.model_id}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            ) : models.length > 0 ? (
-              <div className="chip flex items-center gap-2 pr-1">
-                <span className="dot bg-emerald-400" />
-                <select
-                  value={selectedModel}
-                  onChange={(e) => {
-                    const v = e.target.value
-                    setSelectedModel(v)
-                    if (typeof window !== 'undefined') {
-                      localStorage.setItem('selected_model', v)
+                    const raw = e.target.value
+                    if (raw.startsWith('provider:')) {
+                      const pid = raw.slice('provider:'.length)
+                      if (!activeSession) return
+                      setSessionProvider(activeSession, pid || null)
+                    } else if (raw.startsWith('model:')) {
+                      const mid = raw.slice('model:'.length)
+                      // Clear any session provider override so model is used
+                      if (activeSession && sessionProviders[activeSession]) {
+                        setSessionProvider(activeSession, null)
+                      }
+                      setSelectedModel(mid)
+                      if (typeof window !== 'undefined') {
+                        localStorage.setItem('selected_model', mid)
+                      }
                     }
                   }}
-                  className="bg-transparent text-xs text-fog-50 outline-none max-w-[14rem] truncate"
+                  disabled={!activeSession && providers.length > 0}
+                  className="bg-transparent text-xs text-fog-50 outline-none max-w-[22rem] truncate disabled:opacity-50"
                   title="Chat model"
                 >
+                  {/* ── Your configured providers at the top ── */}
+                  {providers.length > 0 && (
+                    <optgroup label="Your Providers">
+                      {providers.map((p) => (
+                        <option
+                          key={`provider:${p.id}`}
+                          value={`provider:${p.id}`}
+                          className="bg-ink-200 text-fog-50"
+                        >
+                          {p.is_default ? '★ ' : ''}{p.label} · {p.model_id}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                  {/* ── OpenRouter models below, grouped Primary / Vision / Text-only.
+                       Values are `model:`-prefixed so they round-trip through the
+                       shared onChange handler (which also handles `provider:`). ── */}
                   {(() => {
                     type M = { id: string; name: string; vision?: boolean }
                     const clean = (n: string) => n.replace(/\s*\(free\)\s*$/i, '')
                     const opt = (m: M) => (
-                      <option key={m.id} value={m.id} className="bg-ink-200 text-fog-50">
+                      <option key={`model:${m.id}`} value={`model:${m.id}`} className="bg-ink-200 text-fog-50">
                         {clean(m.name)}{m.vision ? '  👁' : ''}
                       </option>
                     )
