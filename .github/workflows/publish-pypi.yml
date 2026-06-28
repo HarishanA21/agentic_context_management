@@ -1,0 +1,53 @@
+name: Publish PyPI package
+
+# Builds + publishes the acm-context-management distribution (acm-gateway +
+# acm-mcp) to PyPI. The vendored engine is refreshed from backend first so the
+# wheel is self-contained.
+#
+# Trigger: push a tag like `pypi-v0.1.0`. Or run manually.
+#
+# Auth: uses PyPI Trusted Publishing (OIDC) — configure this repo + workflow as
+# a trusted publisher on PyPI, no token needed. Alternatively set UV_PUBLISH_TOKEN.
+
+on:
+  push:
+    tags:
+      - "pypi-v*"
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for PyPI Trusted Publishing (OIDC)
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extension
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync vendored engine from backend
+        run: python scripts/sync_engine.py
+
+      - name: Fail if vendored engine drifted from backend
+        run: |
+          if ! git diff --quiet -- acm_engine/_vendor; then
+            echo "::error::acm_engine/_vendor is stale — run scripts/sync_engine.py and commit."
+            git --no-pager diff --stat -- acm_engine/_vendor
+            exit 1
+          fi
+
+      - name: Build
+        run: uv build
+
+      - name: Check wheel is self-contained
+        run: |
+          python -m zipfile -l dist/*.whl | grep -q "_vendor/context_profiles.py" \
+            && echo "vendored engine present" || (echo "::error::vendored engine missing from wheel" && exit 1)
+
+      - name: Publish to PyPI
+        run: uv publish

@@ -28,6 +28,14 @@ e2b             # backend=e2b: managed Firecracker microVMs
 # GitHub integration
 PyGithub
 
+# Multi-provider LLM adapters (Bedrock + Google; OpenAI/Anthropic/Azure
+# already covered by langchain-openai and langchain-anthropic above)
+langchain-aws
+langchain-google-genai
+
+# Tests
+pytest
+
 # MCP inventory — adapter for stdio + SSE servers, plus the raw Python
 # SDK for streamable_http connections.
 langchain-mcp-adapters>=0.1
@@ -35,4 +43,10 @@ mcp>=1.0
 
 # Secret-blob encryption for stored MCP API tokens / env-var values.
 cryptography
+
+# Hybrid Visual-Textual Tool Ingestion — rasterise large tool outputs
+# into 2-column 1024 px PNGs (research paper 21_ENG_009) so vision-
+# capable LLMs can read them with far fewer tokens. Used by the
+# Strategy Demo's "Visual Compression Bench" tab.
+Pillow
 

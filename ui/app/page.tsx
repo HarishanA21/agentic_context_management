@@ -423,7 +423,7 @@ function FAQ() {
 const faq = [
   {
     q: 'Which models can I use?',
-    a: 'Anything OpenRouter supports. The default is z-ai/glm-4.5-air:free, but you can swap by setting the model in your backend config.',
+    a: 'Anything OpenRouter supports. The default is google/gemini-3.1-flash-lite (with minimax/minimax-m3 and stepfun/step-3.7-flash also one click away), but you can swap by setting the model in your backend config.',
   },
   {
     q: 'Where is my data stored?',

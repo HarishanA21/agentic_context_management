@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy to .vscode/mcp.json in your workspace to register the ACM MCP server in VSCode (1.99+). This is independent of the extension below — it gives the IDE's agent the remember/recall/compact/set_profile tools even without installing the extension. Antigravity and Windsurf read an equivalent MCP config in their own settings.",
+  "servers": {
+    "acm": {
+      "command": "acm-mcp"
+    }
+  }
+}

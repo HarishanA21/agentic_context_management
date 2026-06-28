@@ -164,3 +164,49 @@ CREATE INDEX IF NOT EXISTS idx_mcp_servers_user
     ON mcp_servers(user_id);
 CREATE INDEX IF NOT EXISTS idx_mcp_servers_user_enabled
     ON mcp_servers(user_id) WHERE enabled;
+
+
+-- ── LLM providers ───────────────────────────────────────────────────────
+-- Per-user multi-provider configs (OpenAI, Anthropic, Bedrock, etc.).
+-- Credentials are Fernet-encrypted JSON in `credentials_blob`. At most one
+-- row per user can have `is_default = true` (enforced in app code).
+
+CREATE TABLE IF NOT EXISTS llm_providers (
+    id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id            uuid NOT NULL,
+    slug               text NOT NULL,        -- 'openai' | 'anthropic' | 'openrouter' | ...
+    label              text NOT NULL,        -- user-set nickname ("My OpenAI key")
+    model_id           text NOT NULL,        -- e.g. 'gpt-4o-mini'
+    -- Fernet-encrypted JSON dict of credentials (api_key, region, etc.).
+    -- Never returned by the API — endpoints redact to has_credentials: bool.
+    credentials_blob   text NOT NULL,
+    is_default         boolean NOT NULL DEFAULT false,
+    last_error         text,
+    last_tested_at     timestamptz,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    updated_at         timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (user_id, label)
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_providers_user
+    ON llm_providers(user_id);
+CREATE INDEX IF NOT EXISTS idx_llm_providers_user_default
+    ON llm_providers(user_id) WHERE is_default;
+
+
+-- ── Per-session preferred provider ──────────────────────────────────────
+-- Phase F: a session can override the user-level default provider. NULL
+-- means "use the user's default" (falls through to is_default in
+-- llm_providers). FK uses ON DELETE SET NULL so deleting the provider
+-- silently reverts affected sessions to the user default.
+ALTER TABLE sessions
+    ADD COLUMN IF NOT EXISTS preferred_provider_id uuid
+        REFERENCES llm_providers(id) ON DELETE SET NULL;
+
+
+-- Phase G follow-up: per-provider temperature and max_tokens overrides.
+-- NULL means "use the adapter's built-in default" (currently env-driven).
+ALTER TABLE llm_providers
+    ADD COLUMN IF NOT EXISTS temperature double precision;
+ALTER TABLE llm_providers
+    ADD COLUMN IF NOT EXISTS max_tokens integer;

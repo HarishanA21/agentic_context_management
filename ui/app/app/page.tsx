@@ -8,6 +8,19 @@ import remarkGfm from 'remark-gfm'
 import { supabase, authFetch, authToken } from '@/lib/supabase'
 import { useTheme } from '@/lib/theme'
 import { MCPInventoryPanel } from '@/components/mcp-inventory'
+import { StrategyDemoPanel } from '@/components/strategy-demo'
+import { ContextProfilesPanel } from '@/components/context-profiles'
+import { RelevanceCleanupSection } from '@/components/relevance-cleanup'
+
+// Models surfaced at the top of every model picker (chat + demo). Kept in
+// sync with the backend's _PROMOTED_PAID_MODELS / _PINNED_MODELS so the
+// requested primary models are always one click away rather than buried in
+// the alphabetical free-tier list.
+const PRIMARY_MODEL_IDS = [
+  'google/gemini-3.1-flash-lite',
+  'minimax/minimax-m3',
+  'stepfun/step-3.7-flash',
+]
 
 /* ─────────────────────────── types ─────────────────────────── */
 
@@ -231,6 +244,12 @@ export default function AppPage() {
   // MCP inventory takes over the main pane when open — exclusive with the
   // chat view; clicking any session/project/chat row closes it.
   const [mcpsOpen, setMcpsOpen] = useState(false)
+  // Strategy comparison demo — runs both context-management strategies
+  // in parallel and shows tokens / latency / tool-call counts side by
+  // side. Same exclusivity model as MCPs.
+  const [demoOpen, setDemoOpen] = useState(false)
+  // PR #8: context-profile manager panel. Opens in-place like MCPs/Demo.
+  const [contextProfilesOpen, setContextProfilesOpen] = useState(false)
   const [projectModalOpen, setProjectModalOpen] = useState(false)
 
   // Per-row "⋯" menu — keyed by `${kind}:${id}` so chats and threads don't collide
@@ -309,9 +328,44 @@ export default function AppPage() {
   const [uploading, setUploading] = useState(false)
   // Model picker
   const [models, setModels] = useState<
-    { id: string; name: string; context_length: number }[]
+    { id: string; name: string; context_length: number; vision?: boolean }[]
   >([])
   const [selectedModel, setSelectedModel] = useState<string>('')
+  // Phase F: user's configured LLM providers + per-session preference.
+  // When `providers.length > 0`, the chat-header picker switches from
+  // OpenRouter free-model list to a provider list and sets the session's
+  // preferred_provider_id on change.
+  const [providers, setProviders] = useState<
+    { id: string; slug: string; label: string; model_id: string; is_default: boolean }[]
+  >([])
+  // Map of session_id → preferred_provider_id (null = "use user default").
+  const [sessionProviders, setSessionProviders] = useState<
+    Record<string, string | null>
+  >({})
+  // Context-management strategy picker. Loaded from /context/strategies
+  // on mount; choice persists in localStorage. Sent on every /chat and
+  // /chat/resume so the backend can rebuild the agent if it differs
+  // from the default — see _get_agent_for_request.
+  const [strategies, setStrategies] = useState<
+    { id: string; label: string; summary: string }[]
+  >([])
+  const [defaultStrategy, setDefaultStrategy] = useState<string>('tool_calling')
+  const [selectedStrategy, setSelectedStrategy] = useState<string>('')
+  // PR #8: context-management profile picker (richer than the strategy
+  // string — bundles tool surface + per-technique toggles). When a
+  // profile id is set we send it as context_profile_id on /chat; the
+  // backend's resolve_profile then prefers it over context_strategy.
+  const [profiles, setProfiles] = useState<
+    {
+      id: string
+      name: string
+      built_in: boolean
+      summary: string | null
+      is_default: boolean
+      body: any
+    }[]
+  >([])
+  const [selectedProfileId, setSelectedProfileId] = useState<string>('')
   const composerMenuRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const photoInputRef = useRef<HTMLInputElement>(null)
@@ -336,6 +390,9 @@ export default function AppPage() {
       loadSessions()
       loadGithubStatus()
       loadModels()
+      loadStrategies()
+      loadProfiles()
+      loadProviders()
     })
     const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
       if (!session) router.replace('/login')
@@ -826,7 +883,58 @@ export default function AppPage() {
   async function loadSessions() {
     const r = await authFetch('/api/sessions')
     if (!r.ok) return
-    setSessions(await r.json())
+    const list: any[] = await r.json()
+    setSessions(list)
+    // Cache each session's preferred_provider_id so the chat-header picker
+    // can highlight the right entry without an extra fetch.
+    setSessionProviders((prev) => {
+      const next: Record<string, string | null> = { ...prev }
+      for (const s of list) {
+        next[s.id] = s.preferred_provider_id ?? null
+      }
+      return next
+    })
+  }
+  async function loadProviders() {
+    try {
+      const r = await authFetch('/api/providers')
+      if (!r.ok) return
+      const list = await r.json()
+      setProviders(Array.isArray(list) ? list : [])
+    } catch {
+      // ignore — chat falls back to env path
+    }
+  }
+  async function setSessionProvider(sid: string, providerId: string | null) {
+    // Optimistic update so the picker reacts instantly.
+    setSessionProviders((prev) => ({ ...prev, [sid]: providerId }))
+    try {
+      const body = JSON.stringify({
+        // Backend treats "" as "clear override"; UUID as "set".
+        preferred_provider_id: providerId ?? '',
+      })
+      const r = await authFetch(`/api/sessions/${sid}`, {
+        method: 'PATCH',
+        body,
+      })
+      if (!r.ok) {
+        // Roll back on failure.
+        const reloaded = await authFetch('/api/sessions')
+        if (reloaded.ok) {
+          const list: any[] = await reloaded.json()
+          setSessions(list)
+          setSessionProviders((prev) => {
+            const next = { ...prev }
+            for (const s of list) {
+              next[s.id] = s.preferred_provider_id ?? null
+            }
+            return next
+          })
+        }
+      }
+    } catch {
+      // Best effort — if the PATCH failed transiently, next loadSessions fixes it.
+    }
   }
   async function loadModels() {
     try {
@@ -847,6 +955,51 @@ export default function AppPage() {
       setSelectedModel(initial)
     } catch {
       // Network/auth error — picker will just be empty; chat still works on backend default.
+    }
+  }
+  async function loadStrategies() {
+    try {
+      const r = await authFetch('/api/context/strategies')
+      if (!r.ok) return
+      const data = await r.json()
+      const list = Array.isArray(data?.strategies) ? data.strategies : []
+      setStrategies(list)
+      const fallback = data?.default || list[0]?.id || 'tool_calling'
+      setDefaultStrategy(fallback)
+      const saved =
+        typeof window !== 'undefined'
+          ? localStorage.getItem('selected_strategy') || ''
+          : ''
+      const initial =
+        (saved && list.some((s: any) => s.id === saved) && saved) || fallback
+      setSelectedStrategy(initial)
+    } catch {
+      // Non-critical — backend's DEFAULT_CONTEXT_STRATEGY wins if we can't reach this.
+    }
+  }
+  async function loadProfiles() {
+    try {
+      const r = await authFetch('/api/context/profiles')
+      if (!r.ok) return
+      const data = await r.json()
+      const list = Array.isArray(data?.profiles) ? data.profiles : []
+      setProfiles(list)
+      // Pick initial: user default → saved localStorage choice → built-in `minimal`.
+      const saved =
+        typeof window !== 'undefined'
+          ? localStorage.getItem('selected_profile_id') || ''
+          : ''
+      const userDefault = list.find((p: any) => p.user_id && p.is_default)
+      const minimal = list.find((p: any) => p.built_in && p.name === 'minimal')
+      const initial =
+        (saved && list.some((p: any) => p.id === saved) && saved) ||
+        userDefault?.id ||
+        minimal?.id ||
+        list[0]?.id ||
+        ''
+      setSelectedProfileId(initial)
+    } catch {
+      // Non-critical — backend will fall back to the built-in `minimal`.
     }
   }
   async function loadGithubStatus() {
@@ -915,6 +1068,33 @@ export default function AppPage() {
     } finally {
       setContextLoading(false)
     }
+  }
+
+  // Soft refresh — re-fetch the context drawer data WITHOUT nulling it first,
+  // so children (e.g. the Relevance cleanup list) don't unmount and lose their
+  // local state. Used after a relevance Remove so the remaining suggestions
+  // stay on screen instead of forcing a re-Analyze.
+  async function softRefreshContext() {
+    if (!activeSession || !activeThread) return
+    try {
+      const qs = selectedModel
+        ? `?model=${encodeURIComponent(selectedModel)}`
+        : ''
+      const r = await authFetch(
+        `/api/sessions/${activeSession}/threads/${activeThread}/context${qs}`,
+      )
+      if (!r.ok) return
+      const data = await r.json()
+      setContextData(data)
+      setContextSummary({
+        total: Number(data?.total_tokens) || 0,
+        limit: Number(data?.context_limit) || 0,
+        percent: Number(data?.percent_used) || 0,
+      })
+    } catch {
+      // best-effort
+    }
+    if (activeSession && activeThread) loadHistory(activeSession, activeThread)
   }
 
   // Cheap passive refresh — fetches just the summary block of the context
@@ -1024,6 +1204,8 @@ export default function AppPage() {
           approved,
           reason,
           model: selectedModel || undefined,
+          context_strategy: selectedStrategy || undefined,
+          context_profile_id: selectedProfileId || undefined,
         }),
       })
       if (!r.ok) {
@@ -1268,6 +1450,8 @@ export default function AppPage() {
 
   async function selectThread(sid: string, tid: string) {
     setMcpsOpen(false)
+    setDemoOpen(false)
+    setContextProfilesOpen(false)
     setActiveSession(sid)
     setActiveThread(tid)
     setMessages([])
@@ -1292,6 +1476,8 @@ export default function AppPage() {
   // see the project's files, threads, and metadata before diving in.
   async function selectProject(sid: string) {
     setMcpsOpen(false)
+    setDemoOpen(false)
+    setContextProfilesOpen(false)
     setActiveSession(sid)
     setActiveThread(null)
     setMessages([])
@@ -1394,6 +1580,8 @@ export default function AppPage() {
         message: msg,
         attached_files: attachedFiles,
         model: selectedModel || undefined,
+        context_strategy: selectedStrategy || undefined,
+        context_profile_id: selectedProfileId || undefined,
       }),
     })
       .then(async (r) => {
@@ -1944,27 +2132,84 @@ export default function AppPage() {
           </div>
         </div>
 
-        {/* MCP inventory entry — sits above the user profile so it's
-            findable without diving into the user menu. Toggles the MCP
-            panel in the main pane (in place of chat). */}
+        {/* PR #8: context profiles entry — bundles tool surface +
+            context-management toggles. Sits above Strategy Demo so
+            users land on it before running comparisons. */}
         <div className="px-3 pt-2">
           <button
-            onClick={() => setMcpsOpen((v) => !v)}
-            aria-pressed={mcpsOpen}
+            onClick={() =>
+              setContextProfilesOpen((v) => {
+                const next = !v
+                if (next) {
+                  setDemoOpen(false)
+                  setMcpsOpen(false)
+                }
+                return next
+              })
+            }
+            aria-pressed={contextProfilesOpen}
             className={`w-full flex items-center gap-3 px-2 py-2 rounded-md transition ${
-              mcpsOpen
+              contextProfilesOpen
                 ? 'bg-soft/[0.08] text-fog-50'
                 : 'hover:bg-soft/[0.04] text-fog-200'
             }`}
           >
             <span className="w-7 h-7 rounded-md bg-soft/10 text-accent flex items-center justify-center">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
-                <path d="M3.27 6.96L12 12.01l8.73-5.05M12 22.08V12" opacity="0.6" />
+                <path d="M4 6h12M4 10h16M4 14h10M4 18h14" />
               </svg>
             </span>
-            <span className="text-sm flex-1 text-left">MCP Inventory</span>
+            <span className="text-sm flex-1 text-left">Context Profiles</span>
           </button>
+        </div>
+
+        {/* Strategy demo entry — runs both context-management strategies
+            in parallel for the same prompt and shows token / latency /
+            tool-call comparison. Sits above MCP Inventory. */}
+        <div className="px-3 pt-1">
+          <button
+            onClick={() =>
+              setDemoOpen((v) => {
+                const next = !v
+                if (next) {
+                  setMcpsOpen(false)
+                  setContextProfilesOpen(false)
+                }
+                return next
+              })
+            }
+            aria-pressed={demoOpen}
+            className={`w-full flex items-center gap-3 px-2 py-2 rounded-md transition ${
+              demoOpen
+                ? 'bg-soft/[0.08] text-fog-50'
+                : 'hover:bg-soft/[0.04] text-fog-200'
+            }`}
+          >
+            <span className="w-7 h-7 rounded-md bg-soft/10 text-accent flex items-center justify-center">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M9 3v18M15 3v18M3 9h18M3 15h18" opacity="0.55" />
+                <path d="M3 3h18v18H3z" />
+              </svg>
+            </span>
+            <span className="text-sm flex-1 text-left">Strategy Demo</span>
+          </button>
+        </div>
+
+        {/* Settings entry — hub linking to Providers, MCP, and Context
+            Profiles. Navigates to the standalone /app/settings route. */}
+        <div className="px-3 pt-1">
+          <Link
+            href="/app/settings"
+            className="w-full flex items-center gap-3 px-2 py-2 rounded-md transition hover:bg-soft/[0.04] text-fog-200"
+          >
+            <span className="w-7 h-7 rounded-md bg-soft/10 text-accent flex items-center justify-center">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" opacity="0.85" />
+              </svg>
+            </span>
+            <span className="text-sm flex-1 text-left">Settings</span>
+          </Link>
         </div>
 
         {/* User menu */}
@@ -2012,7 +2257,20 @@ export default function AppPage() {
 
       {/* ────── Main ────── */}
       <main className="flex-1 flex flex-col min-w-0">
-        {mcpsOpen ? (
+        {contextProfilesOpen ? (
+          <ContextProfilesPanel
+            onPickProfile={(id) => {
+              setSelectedProfileId(id)
+              if (typeof window !== 'undefined') {
+                localStorage.setItem('selected_profile_id', id)
+              }
+              setContextProfilesOpen(false)
+            }}
+            onListChanged={() => loadProfiles()}
+          />
+        ) : demoOpen ? (
+          <StrategyDemoPanel />
+        ) : mcpsOpen ? (
           <MCPInventoryPanel embedded />
         ) : (
         <>
@@ -2075,7 +2333,69 @@ export default function AppPage() {
                 onChange={(m) => updateSessionMode(activeSessionObj.id, m)}
               />
             )}
-            {models.length > 0 ? (
+            {profiles.length > 0 ? (
+              <ProfilePicker
+                value={selectedProfileId}
+                profiles={profiles}
+                onChange={(id) => {
+                  setSelectedProfileId(id)
+                  if (typeof window !== 'undefined') {
+                    localStorage.setItem('selected_profile_id', id)
+                  }
+                }}
+                onOpenManager={() => {
+                  setMcpsOpen(false)
+                  setDemoOpen(false)
+                  setContextProfilesOpen(true)
+                }}
+              />
+            ) : (
+              <StrategyToggle
+                value={selectedStrategy || defaultStrategy}
+                strategies={strategies}
+                onChange={(id) => {
+                  setSelectedStrategy(id)
+                  if (typeof window !== 'undefined') {
+                    localStorage.setItem('selected_strategy', id)
+                  }
+                }}
+              />
+            )}
+            {providers.length > 0 ? (
+              <div className="chip flex items-center gap-2 pr-1" title="LLM provider for this session">
+                <span className="dot bg-emerald-400" />
+                <select
+                  value={
+                    (activeSession && sessionProviders[activeSession]) || ''
+                  }
+                  onChange={(e) => {
+                    const v = e.target.value
+                    if (!activeSession) return
+                    setSessionProvider(activeSession, v || null)
+                  }}
+                  disabled={!activeSession}
+                  className="bg-transparent text-xs text-fog-50 outline-none max-w-[18rem] truncate disabled:opacity-50"
+                >
+                  <option value="" className="bg-ink-200 text-fog-50">
+                    {(() => {
+                      const def = providers.find((p) => p.is_default)
+                      return def
+                        ? `Default · ${def.label} · ${def.model_id}`
+                        : 'Default (env fallback)'
+                    })()}
+                  </option>
+                  {providers.map((p) => (
+                    <option
+                      key={p.id}
+                      value={p.id}
+                      className="bg-ink-200 text-fog-50"
+                    >
+                      {p.label} · {p.model_id}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : models.length > 0 ? (
               <div className="chip flex items-center gap-2 pr-1">
                 <span className="dot bg-emerald-400" />
                 <select
@@ -2088,17 +2408,38 @@ export default function AppPage() {
                     }
                   }}
                   className="bg-transparent text-xs text-fog-50 outline-none max-w-[14rem] truncate"
-                  title="Chat model (OpenRouter free tier)"
+                  title="Chat model"
                 >
-                  {models.map((m) => (
-                    <option
-                      key={m.id}
-                      value={m.id}
-                      className="bg-ink-200 text-fog-50"
-                    >
-                      {m.name.replace(/\s*\(free\)\s*$/i, '')}
-                    </option>
-                  ))}
+                  {(() => {
+                    type M = { id: string; name: string; vision?: boolean }
+                    const clean = (n: string) => n.replace(/\s*\(free\)\s*$/i, '')
+                    const opt = (m: M) => (
+                      <option key={m.id} value={m.id} className="bg-ink-200 text-fog-50">
+                        {clean(m.name)}{m.vision ? '  👁' : ''}
+                      </option>
+                    )
+                    const primary = PRIMARY_MODEL_IDS
+                      .map((id) => models.find((m) => m.id === id))
+                      .filter(Boolean) as M[]
+                    const rest = models.filter((m) => !PRIMARY_MODEL_IDS.includes(m.id))
+                    const visionRest = rest.filter((m) => m.vision)
+                    const textRest = rest.filter((m) => !m.vision)
+                    return (
+                      <>
+                        {primary.length > 0 && (
+                          <optgroup label="Primary">{primary.map(opt)}</optgroup>
+                        )}
+                        {visionRest.length > 0 && (
+                          <optgroup label="Vision (👁 — needed for Visual method)">
+                            {visionRest.map(opt)}
+                          </optgroup>
+                        )}
+                        {textRest.length > 0 && (
+                          <optgroup label="Text-only">{textRest.map(opt)}</optgroup>
+                        )}
+                      </>
+                    )
+                  })()}
                 </select>
               </div>
             ) : (
@@ -2150,6 +2491,7 @@ export default function AppPage() {
             <TaskView
               messages={displayMessages}
               sessionId={activeSession}
+              threadId={activeThread}
               sending={sending && replayIdx == null}
               pendingApproval={replayIdx == null ? pendingApproval : null}
               resolvingApproval={resolvingApproval}
@@ -2202,6 +2544,7 @@ export default function AppPage() {
                         key={i}
                         msg={m}
                         sessionId={activeSession}
+                        threadId={activeThread}
                         toolArgs={args}
                       />
                     ))
@@ -2531,21 +2874,36 @@ export default function AppPage() {
           data={contextData}
           loading={contextLoading}
           error={contextError}
+          sessionId={activeSession}
+          threadId={activeThread}
           onClose={() => setContextOpen(false)}
           onRefresh={openContextViewer}
-          onDelete={(id) =>
+          onSoftRefresh={softRefreshContext}
+          onDelete={(id) => {
+            // Ask once per browser; after the user acknowledges, delete
+            // straight away on subsequent clicks (better UX for bulk cleanup).
+            const skip =
+              typeof window !== 'undefined' &&
+              localStorage.getItem('acm_skip_msg_delete_confirm') === '1'
+            if (skip) {
+              deleteContextMessage(id)
+              return
+            }
             setConfirmDialog({
               title: 'Remove from context?',
               message:
-                'This message will be deleted from the conversation and from the model\'s memory of this thread. This cannot be undone.',
+                "This message will be deleted from the conversation and from the model's memory of this thread. This can't be undone. You won't be asked again for message deletions in this browser.",
               confirmLabel: 'Remove',
               danger: true,
               onConfirm: () => {
                 setConfirmDialog(null)
+                if (typeof window !== 'undefined') {
+                  localStorage.setItem('acm_skip_msg_delete_confirm', '1')
+                }
                 deleteContextMessage(id)
               },
             })
-          }
+          }}
         />
       )}
 
@@ -2668,10 +3026,12 @@ function TypingIndicator({ label = 'thinking' }: { label?: string }) {
 function MessageBlock({
   msg,
   sessionId,
+  threadId,
   toolArgs,
 }: {
   msg: Message
   sessionId: string | null
+  threadId: string | null
   toolArgs?: Record<string, any>
 }) {
   if (msg.role === 'user') {
@@ -2685,7 +3045,12 @@ function MessageBlock({
   }
   if (msg.role === 'tool') {
     return (
-      <ToolMessageCard msg={msg} sessionId={sessionId} args={toolArgs} />
+      <ToolMessageCard
+        msg={msg}
+        sessionId={sessionId}
+        threadId={threadId}
+        args={toolArgs}
+      />
     )
   }
   return (
@@ -2782,6 +3147,7 @@ function ApprovalCard({
 function TaskView({
   messages,
   sessionId,
+  threadId,
   sending,
   pendingApproval,
   resolvingApproval,
@@ -2794,6 +3160,7 @@ function TaskView({
 }: {
   messages: Message[]
   sessionId: string | null
+  threadId: string | null
   sending: boolean
   pendingApproval: PendingApproval | null
   resolvingApproval: boolean
@@ -2856,6 +3223,7 @@ function TaskView({
                 key={i}
                 msg={m}
                 sessionId={sessionId}
+                threadId={threadId}
                 toolArgs={argsByIdx[i]}
               />
             ) : (
@@ -2899,6 +3267,7 @@ function TaskView({
               key={i}
               msg={m}
               sessionId={sessionId}
+              threadId={threadId}
               toolArgs={argsByIdx[i]}
             />
           ))}
@@ -3089,6 +3458,114 @@ function ViewToggle({
 
 /* ─────────────────────────── mode toggle (Auto / Confirm) ────────────────── */
 
+/* PR #8: profile picker — dropdown over the user's saved + built-in
+ * context-management profiles. Replaces StrategyToggle in the header.
+ * Each entry is one bundle of (tool surface + technique toggles); the
+ * tooltip shows which techniques are on so the user can scan at a
+ * glance. */
+function ProfilePicker({
+  value,
+  profiles,
+  onChange,
+  onOpenManager,
+}: {
+  value: string
+  profiles: {
+    id: string
+    name: string
+    built_in: boolean
+    summary: string | null
+    is_default: boolean
+    body: any
+  }[]
+  onChange: (id: string) => void
+  onOpenManager: () => void
+}) {
+  const current = profiles.find((p) => p.id === value)
+  function describe(p: any): string {
+    const cm = p.body?.context_management ?? {}
+    const on: string[] = []
+    if (cm.tool_result_trimming?.enabled) on.push('trim')
+    if (cm.summarization?.enabled) on.push('summarise')
+    if (cm.memory?.enabled) on.push('memory')
+    if (cm.subagent?.enabled) on.push('subagent')
+    if (cm.sliding_window?.enabled) on.push('sliding')
+    return on.length ? `${p.body?.tool_surface} · ${on.join(' · ')}` : p.body?.tool_surface
+  }
+  return (
+    <div
+      className="chip flex items-center gap-2 pr-1"
+      title={
+        current
+          ? `${current.name}: ${current.summary ?? describe(current)}`
+          : 'Context-management profile (bundle of tool surface + edit toggles)'
+      }
+    >
+      <span className="dot bg-emerald-400" />
+      <select
+        value={value}
+        onChange={(e) => {
+          if (e.target.value === '__manage__') {
+            onOpenManager()
+            return
+          }
+          onChange(e.target.value)
+        }}
+        className="bg-transparent text-xs text-fog-50 outline-none max-w-[16rem] truncate"
+      >
+        {profiles.map((p) => (
+          <option key={p.id} value={p.id} className="bg-ink-200 text-fog-50">
+            {p.name}{p.is_default ? ' ★' : ''}
+          </option>
+        ))}
+        <option disabled className="bg-ink-200 text-fog-500">──────────</option>
+        <option value="__manage__" className="bg-ink-200 text-fog-50">
+          Manage profiles…
+        </option>
+      </select>
+    </div>
+  )
+}
+
+function StrategyToggle({
+  value,
+  onChange,
+  strategies,
+}: {
+  value: string
+  onChange: (id: string) => void
+  strategies: { id: string; label: string; summary: string }[]
+}) {
+  // Hide entirely when the backend reports fewer than two options —
+  // there's nothing to toggle.
+  if (strategies.length < 2) return null
+  const current = strategies.find((s) => s.id === value)
+  return (
+    <div
+      className="flex items-center rounded-full border border-line bg-ink-200 p-0.5 text-[11px]"
+      title={
+        current
+          ? `${current.label}: ${current.summary}`
+          : 'Context-management strategy'
+      }
+    >
+      {strategies.map((s) => (
+        <button
+          key={s.id}
+          onClick={() => value !== s.id && onChange(s.id)}
+          className={`px-2.5 py-1 rounded-full transition ${
+            value === s.id
+              ? 'bg-soft/[0.10] text-fog-50'
+              : 'text-fog-400 hover:text-fog-50'
+          }`}
+        >
+          {s.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 function ModeToggle({
   mode,
   onChange,
@@ -3127,15 +3604,32 @@ function ModeToggle({
 function ToolMessageCard({
   msg,
   sessionId,
+  threadId,
   args,
 }: {
   msg: Message
   sessionId: string | null
+  threadId: string | null
   args?: Record<string, any>
 }) {
   const name = msg.tool_name ?? ''
   const content = msg.content ?? ''
   const isError = content.startsWith('Error')
+
+  // Visual method: the output was rasterised into page image(s) and the
+  // transcript only kept an `[image]` marker. Show a viewer that fetches
+  // the real PNGs from the checkpoint on click.
+  if (!isError && content.includes('[image]')) {
+    return (
+      <VisualImagesEventRow
+        sessionId={sessionId}
+        threadId={threadId}
+        messageId={msg.id}
+        toolName={name}
+        content={content}
+      />
+    )
+  }
 
   if (name === 'run_shell')
     return <ShellEventRow content={content} cmdArg={args?.cmd} />
@@ -3166,6 +3660,113 @@ function ToolMessageCard({
   )
 }
 
+/** Visual-method tool result: the output was converted into one or more
+ *  page images. Click to fetch + view them (lazily, from the checkpoint). */
+function VisualImagesEventRow({
+  sessionId,
+  threadId,
+  messageId,
+  toolName,
+  content,
+}: {
+  sessionId: string | null
+  threadId: string | null
+  messageId?: number
+  toolName: string
+  content: string
+}) {
+  const [open, setOpen] = useState(false)
+  const [images, setImages] = useState<string[] | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  // Best-effort page count from the flattened markers, for the badge.
+  const pageHint = (() => {
+    const m = content.match(/\[page \d+\/(\d+)\]/)
+    if (m) return parseInt(m[1], 10)
+    return (content.match(/\[image\]/g) || []).length || 1
+  })()
+
+  // REFERENCES text the model can cite — strip the image/page markers.
+  const refs = content
+    .replace(/\[page \d+\/\d+\]/g, '')
+    .replace(/\[image\]/g, '')
+    .trim()
+
+  async function toggle() {
+    const next = !open
+    setOpen(next)
+    if (next && images === null && !loading) {
+      if (!sessionId || !threadId || !messageId) {
+        setError('Cannot load images for this message.')
+        return
+      }
+      setLoading(true)
+      setError(null)
+      try {
+        const r = await authFetch(
+          `/api/sessions/${sessionId}/threads/${threadId}/messages/${messageId}/images`,
+        )
+        if (!r.ok) throw new Error(`Failed to load (HTTP ${r.status})`)
+        const data = await r.json()
+        const list: string[] = Array.isArray(data?.images) ? data.images : []
+        setImages(list)
+        if (list.length === 0) {
+          setError(
+            'No images available — they may have been removed from the conversation context.',
+          )
+        }
+      } catch (e: any) {
+        setError(e?.message ?? 'Failed to load images')
+      } finally {
+        setLoading(false)
+      }
+    }
+  }
+
+  return (
+    <EventRow
+      icon={<ToolIcon />}
+      verb={toolName || 'tool'}
+      target="→ image"
+      verbColor="text-fog-200"
+      badge={
+        <span className="text-[10px] uppercase tracking-wider text-violet-300 bg-violet-500/10 rounded px-1.5 py-0.5">
+          visual · {pageHint} page{pageHint === 1 ? '' : 's'}
+        </span>
+      }
+      onToggle={toggle}
+      open={open}
+    >
+      {open && (
+        <div className="space-y-2">
+          {refs && (
+            <pre className="text-[11px] text-fog-400 whitespace-pre-wrap max-h-32 overflow-auto bg-ink-200/50 rounded p-2 border border-line">
+              {refs}
+            </pre>
+          )}
+          {loading && (
+            <div className="text-[12px] text-fog-500">Loading images…</div>
+          )}
+          {error && <div className="text-[12px] text-rose-300">{error}</div>}
+          {images?.map((src, i) => (
+            <div
+              key={i}
+              className="border border-line rounded overflow-hidden bg-white"
+            >
+              <div className="text-[10px] text-fog-500 px-2 py-1 bg-ink-200/60 border-b border-line">
+                page {i + 1}/{images.length}
+              </div>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={src} alt={`page ${i + 1}`} className="w-full block" />
+            </div>
+          ))}
+        </div>
+      )}
+    </EventRow>
+  )
+}
+
 /** Compact one-row event in the activity timeline.
  *  Left: status indicator (green dot when done, spinner when in-flight, red ×
  *  on error). Middle: bold verb + target + small subtext. Right: optional
@@ -3180,6 +3781,8 @@ function EventRow({
   subtext,
   action,
   children,
+  onToggle,
+  open,
 }: {
   status?: 'done' | 'running' | 'error'
   icon?: React.ReactNode
@@ -3190,7 +3793,33 @@ function EventRow({
   subtext?: React.ReactNode
   action?: React.ReactNode
   children?: React.ReactNode
+  // When provided, the whole header (verb + target + subtext) becomes a single
+  // clickable control that calls onToggle; a chevron reflects `open`.
+  onToggle?: () => void
+  open?: boolean
 }) {
+  const header = (
+    <div className="flex items-center gap-2 flex-wrap">
+      {icon && <span className="text-fog-500">{icon}</span>}
+      <span className={`font-medium ${verbColor}`}>{verb}</span>
+      {target && (
+        <code className="font-mono text-fog-50 text-[13px] truncate">
+          {target}
+        </code>
+      )}
+      {badge}
+      {onToggle ? (
+        <span className="ml-auto text-fog-500 group-hover:text-fog-300 text-[11px]">
+          {open ? '▾' : '▸'}
+        </span>
+      ) : (
+        action && <span className="ml-auto">{action}</span>
+      )}
+    </div>
+  )
+  const sub = subtext && (
+    <div className="text-[11px] text-fog-500 mt-0.5">{subtext}</div>
+  )
   return (
     <div className="flex gap-3 text-[13px] group animate-float-up">
       {/* Status indicator + connecting line */}
@@ -3198,19 +3827,20 @@ function EventRow({
         <StatusDot status={status} />
       </div>
       <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 flex-wrap">
-          {icon && <span className="text-fog-500">{icon}</span>}
-          <span className={`font-medium ${verbColor}`}>{verb}</span>
-          {target && (
-            <code className="font-mono text-fog-50 text-[13px] truncate">
-              {target}
-            </code>
-          )}
-          {badge}
-          {action && <span className="ml-auto">{action}</span>}
-        </div>
-        {subtext && (
-          <div className="text-[11px] text-fog-500 mt-0.5">{subtext}</div>
+        {onToggle ? (
+          <button
+            type="button"
+            onClick={onToggle}
+            className="w-full text-left -mx-1 px-1 py-0.5 rounded cursor-pointer hover:bg-soft/[0.05]"
+          >
+            {header}
+            {sub}
+          </button>
+        ) : (
+          <>
+            {header}
+            {sub}
+          </>
         )}
         {children && <div className="mt-2">{children}</div>}
       </div>
@@ -3281,16 +3911,8 @@ function ShellEventRow({
       verb="Run"
       target={cmd}
       subtext={subtext}
-      action={
-        hasOutput && (
-          <button
-            onClick={() => setOpen((v) => !v)}
-            className="text-[11px] text-fog-400 hover:text-fog-50"
-          >
-            {open ? 'Hide output' : 'Show output'}
-          </button>
-        )
-      }
+      onToggle={hasOutput ? () => setOpen((v) => !v) : undefined}
+      open={open}
     >
       {open && hasOutput && (
         <div className="rounded border border-line bg-ink-100/60 px-3 py-2 font-mono text-[12px] max-h-72 overflow-y-auto whitespace-pre-wrap">
@@ -3321,10 +3943,19 @@ function WriteFileEventRow({
   const [diff, setDiff] = useState<string | null>(null)
   const [diffLoading, setDiffLoading] = useState(false)
   const [diffError, setDiffError] = useState<string | null>(null)
+  // Fallback "view file" state for writes that weren't committed (no sha → no
+  // diff). We fetch the file's current content from storage on demand.
+  const [fileOpen, setFileOpen] = useState(false)
+  const [fileBody, setFileBody] = useState<string | null>(null)
+  const [fileLoading, setFileLoading] = useState(false)
+  const [fileError, setFileError] = useState<string | null>(null)
 
   if (isError) return <ToolErrorRow verb="Edit" content={content} />
 
-  const sizeMatch = content.match(/^Wrote (\d+) bytes to (.+?)\./)
+  // Capture the full path up to the *terminal* period (the one before a space
+  // or end of string), not the first dot — otherwise "foo.txt." truncates to
+  // "foo" and the filename loses its extension.
+  const sizeMatch = content.match(/^Wrote (\d+) bytes to (.+?)\.(?:\s|$)/)
   const commitMatch = content.match(
     /committed as Agent: (created|updated) (.+?) \(([a-f0-9]+)\)/,
   )
@@ -3364,6 +3995,57 @@ function WriteFileEventRow({
       setDiffError(e?.message ?? 'network error')
     } finally {
       setDiffLoading(false)
+    }
+  }
+
+  // Loads a red/green diff for files with no git commit (chat-session S3
+  // files). Prefers the stored unified diff of the last write; if none exists
+  // (e.g. a brand-new file), falls back to showing the current content as an
+  // all-green "added" diff. Either way the result is rendered via SplitDiffBlock.
+  async function toggleFile() {
+    if (fileOpen) {
+      setFileOpen(false)
+      return
+    }
+    setFileOpen(true)
+    if (fileBody !== null || !sessionId || !filename) return
+    setFileLoading(true)
+    setFileError(null)
+    try {
+      const dr = await authFetch(
+        `/api/sessions/${sessionId}/files/${encodeURIComponent(filename)}/diff`,
+      )
+      if (dr.ok) {
+        const body = await dr.json()
+        if (body?.diff) {
+          setFileBody(body.diff)
+          return
+        }
+      }
+      // No recorded diff — show current content as all additions (green).
+      const r = await authFetch(
+        `/api/sessions/${sessionId}/files/${encodeURIComponent(filename)}`,
+      )
+      if (!r.ok) {
+        let detail = `${r.status} ${r.statusText}`
+        try {
+          const body = await r.json()
+          if (body?.detail) detail = body.detail
+        } catch {}
+        setFileError(detail)
+        return
+      }
+      const body = await r.json()
+      const content =
+        (body?.content ?? '') + (body?.truncated ? '\n[... truncated ...]' : '')
+      const lines = content.split('\n')
+      setFileBody(
+        `@@ -0,0 +1,${lines.length} @@\n` + lines.map((l: string) => '+' + l).join('\n'),
+      )
+    } catch (e: any) {
+      setFileError(e?.message ?? 'network error')
+    } finally {
+      setFileLoading(false)
     }
   }
 
@@ -3415,16 +4097,14 @@ function WriteFileEventRow({
       verb={verbLabel}
       target={filename}
       subtext={subtext}
-      action={
-        sha && sessionId ? (
-          <button
-            onClick={toggleDiff}
-            className="text-[11px] text-fog-400 hover:text-fog-50"
-          >
-            {diffOpen ? 'Hide diff' : diff ? 'Show diff' : 'View diff'}
-          </button>
-        ) : undefined
+      onToggle={
+        sha && sessionId
+          ? toggleDiff
+          : sessionId && filename !== '(unnamed)'
+            ? toggleFile
+            : undefined
       }
+      open={diffOpen || fileOpen}
     >
       {diffOpen && (
         <div>
@@ -3441,6 +4121,21 @@ function WriteFileEventRow({
           )}
         </div>
       )}
+      {fileOpen && (
+        <div>
+          {fileLoading && (
+            <div className="text-[12px] text-fog-400 px-1">Loading file…</div>
+          )}
+          {fileError && (
+            <div className="text-[12px] text-rose-300 px-1">
+              Failed to load file: {fileError}
+            </div>
+          )}
+          {fileBody !== null && !fileLoading && !fileError && (
+            <SplitDiffBlock diff={fileBody} />
+          )}
+        </div>
+      )}
     </EventRow>
   )
 }
@@ -3452,15 +4147,31 @@ function WriteFileEventRow({
  *  green). Pure-context lines appear on both sides; sequences of pure
  *  deletes get paired with the corresponding adds when possible. */
 function SplitDiffBlock({ diff }: { diff: string }) {
-  type Row = { left: string | null; right: string | null; kind: 'context' | 'change' }
+  type Row = {
+    left: string | null
+    right: string | null
+    leftNo: number | null
+    rightNo: number | null
+    kind: 'context' | 'change' | 'hunk'
+  }
   const rows: Row[] = []
 
-  let dels: string[] = []
-  let adds: string[] = []
+  let dels: { text: string; no: number }[] = []
+  let adds: { text: string; no: number }[] = []
+  let oldLine = 0
+  let newLine = 0
   const flush = () => {
     const n = Math.max(dels.length, adds.length)
     for (let i = 0; i < n; i++) {
-      rows.push({ left: dels[i] ?? null, right: adds[i] ?? null, kind: 'change' })
+      const d = dels[i]
+      const a = adds[i]
+      rows.push({
+        left: d ? d.text : null,
+        right: a ? a.text : null,
+        leftNo: d ? d.no : null,
+        rightNo: a ? a.no : null,
+        kind: 'change',
+      })
     }
     dels = []
     adds = []
@@ -3469,7 +4180,12 @@ function SplitDiffBlock({ diff }: { diff: string }) {
   for (const raw of diff.split('\n')) {
     if (raw.startsWith('@@')) {
       flush()
-      rows.push({ left: raw, right: raw, kind: 'context' })
+      const m = raw.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
+      if (m) {
+        oldLine = parseInt(m[1], 10)
+        newLine = parseInt(m[2], 10)
+      }
+      rows.push({ left: raw, right: raw, leftNo: null, rightNo: null, kind: 'hunk' })
       continue
     }
     if (
@@ -3484,53 +4200,66 @@ function SplitDiffBlock({ diff }: { diff: string }) {
       continue
     }
     if (raw.startsWith('+')) {
-      adds.push(raw.slice(1))
+      adds.push({ text: raw.slice(1), no: newLine++ })
     } else if (raw.startsWith('-')) {
-      dels.push(raw.slice(1))
+      dels.push({ text: raw.slice(1), no: oldLine++ })
     } else {
       flush()
-      rows.push({ left: raw.slice(1), right: raw.slice(1), kind: 'context' })
+      rows.push({
+        left: raw.slice(1),
+        right: raw.slice(1),
+        leftNo: oldLine++,
+        rightNo: newLine++,
+        kind: 'context',
+      })
     }
   }
   flush()
 
+  // Diagonal hatch fills the "no line on this side" padding cells.
+  const HATCH: React.CSSProperties = {
+    backgroundImage:
+      'repeating-linear-gradient(45deg, rgba(255,255,255,0.04) 0, rgba(255,255,255,0.04) 1px, transparent 1px, transparent 7px)',
+  }
+  const Cell = (
+    text: string | null,
+    no: number | null,
+    kind: Row['kind'],
+    side: 'left' | 'right',
+  ) => {
+    const empty = text == null
+    const changed = kind === 'change' && !empty
+    const hunk = kind === 'hunk'
+    const bg = changed ? (side === 'left' ? 'bg-rose-500/20' : 'bg-emerald-500/20') : ''
+    // Keep the code text bright/legible regardless of the line colour; only the
+    // background and the +/- sign carry the red/green meaning.
+    const textColor = hunk ? 'text-sky-300' : changed ? 'text-fog-50' : 'text-fog-200'
+    const signColor = side === 'left' ? 'text-rose-300' : 'text-emerald-300'
+    const sign = changed ? (side === 'left' ? '-' : '+') : ''
+    return (
+      <div className={`flex items-start ${bg}`} style={empty ? HATCH : undefined}>
+        <span className="select-none shrink-0 w-9 pr-2 text-right text-fog-500 tabular-nums">
+          {no ?? ''}
+        </span>
+        <span className={`select-none shrink-0 w-3 text-center ${signColor}`}>{sign}</span>
+        <span className={`pr-3 whitespace-pre overflow-x-auto ${textColor}`}>
+          {empty ? '' : text || ' '}
+        </span>
+      </div>
+    )
+  }
+
   return (
     <div className="rounded border border-line bg-ink-100 overflow-hidden">
-      <div className="grid grid-cols-2 divide-x divide-line font-mono text-[12px] max-h-80 overflow-y-auto">
+      <div className="grid grid-cols-2 divide-x divide-line font-mono text-[12px] leading-[1.55] max-h-80 overflow-y-auto">
         <div>
           {rows.map((r, i) => (
-            <div
-              key={i}
-              className={`px-2 py-0.5 whitespace-pre overflow-x-auto ${
-                r.left == null
-                  ? ''
-                  : r.kind === 'change' && r.left
-                    ? 'bg-rose-500/[0.08] text-rose-300'
-                    : r.left.startsWith('@@')
-                      ? 'text-sky-300'
-                      : 'text-fog-400'
-              }`}
-            >
-              {r.left == null ? ' ' : r.left || ' '}
-            </div>
+            <div key={i}>{Cell(r.left, r.leftNo, r.kind, 'left')}</div>
           ))}
         </div>
         <div>
           {rows.map((r, i) => (
-            <div
-              key={i}
-              className={`px-2 py-0.5 whitespace-pre overflow-x-auto ${
-                r.right == null
-                  ? ''
-                  : r.kind === 'change' && r.right
-                    ? 'bg-emerald-500/[0.08] text-emerald-300'
-                    : r.right.startsWith('@@')
-                      ? 'text-sky-300'
-                      : 'text-fog-400'
-              }`}
-            >
-              {r.right == null ? ' ' : r.right || ' '}
-            </div>
+            <div key={i}>{Cell(r.right, r.rightNo, r.kind, 'right')}</div>
           ))}
         </div>
       </div>
@@ -3553,6 +4282,7 @@ function ReadFileEventRow({
   isError: boolean
   filenameArg?: string
 }) {
+  const [open, setOpen] = useState(false)
   if (isError) return <ToolErrorRow verb="Read" content={content} />
   const bytes = new Blob([content]).size
   const lines = content.split('\n').length
@@ -3567,7 +4297,15 @@ function ReadFileEventRow({
           <span className="text-fog-500"> · {bytes} bytes</span>
         </span>
       }
-    />
+      onToggle={content ? () => setOpen((v) => !v) : undefined}
+      open={open}
+    >
+      {open && content && (
+        <pre className="rounded border border-line bg-ink-100/60 px-3 py-2 font-mono text-[12px] text-fog-200 max-h-96 overflow-auto whitespace-pre-wrap">
+          {content}
+        </pre>
+      )}
+    </EventRow>
   )
 }
 
@@ -4953,14 +5691,20 @@ function ContextViewer({
   error,
   onClose,
   onRefresh,
+  onSoftRefresh,
   onDelete,
+  sessionId,
+  threadId,
 }: {
   data: any
   loading: boolean
   error: string | null
   onClose: () => void
   onRefresh: () => void
+  onSoftRefresh: () => void
   onDelete: (messageId: number) => void
+  sessionId: string | null
+  threadId: string | null
 }) {
   const [systemOpen, setSystemOpen] = useState(false)
   const [rawMode, setRawMode] = useState(false)
@@ -5090,7 +5834,46 @@ function ContextViewer({
                     style={{ width: `${Math.min(100, pct)}%` }}
                   />
                 </div>
+                {/* Image-recall caching — prompt tokens served from the
+                    provider cache so far. Only shown when caching is active
+                    (the cache / cache+evict techniques on a cache-capable
+                    provider report cache_read_tokens > 0). */}
+                {(Number(data.cache_read_tokens) || 0) > 0 && (
+                  <div className="mt-2 flex items-baseline justify-between text-[12px] bg-sky-500/8 border border-sky-500/25 rounded-md px-3 py-1.5">
+                    <span className="text-fog-400 uppercase tracking-widest text-[10px]">
+                      ⚡ Prompt cache
+                    </span>
+                    <span className="font-mono text-sky-300">
+                      {Number(data.cache_read_tokens).toLocaleString()} tokens reused
+                      {data.total_tokens
+                        ? ` · ${((Number(data.cache_read_tokens) / data.total_tokens) * 100).toFixed(0)}%`
+                        : ''}
+                    </span>
+                  </div>
+                )}
               </section>
+
+              {/* Per-turn token trajectory (PR #0) */}
+              <TrajectorySection
+                trajectory={data.trajectory || []}
+                fmtTokenCount={fmtTokenCount}
+              />
+
+              {/* Applied context edits (PR #0) — empty until a
+                  context-management strategy actually fires. */}
+              <AppliedEditsSection
+                edits={data.applied_edits || []}
+                fmtTokenCount={fmtTokenCount}
+              />
+
+              {/* Task-aware relevance cleanup — suggest & remove finished /
+                  unrelated episodes. Suggest-only; refreshes context on apply. */}
+              <RelevanceCleanupSection
+                sessionId={sessionId}
+                threadId={threadId}
+                model={data.model}
+                onApplied={onSoftRefresh}
+              />
 
               {/* System prompt */}
               <section>
@@ -5110,23 +5893,32 @@ function ContextViewer({
                 )}
               </section>
 
-              {/* Messages */}
+              {/* Messages — grouped by user turn. Top level shows the user
+                  prompt + the turn's token total; expand to see and remove the
+                  assistant/tool messages it produced. */}
               <section>
-                <div className="text-[11px] uppercase tracking-widest text-fog-500 mb-2">
-                  Messages · {data.messages.length}
-                </div>
-                {data.messages.length === 0 && (
-                  <p className="text-fog-500 text-xs">No messages yet.</p>
-                )}
-                <div className="space-y-1.5">
-                  {data.messages.map((m: any, i: number) => (
-                    <ContextMessageRow
-                      key={m.id ?? i}
-                      msg={m}
-                      onDelete={onDelete}
-                    />
-                  ))}
-                </div>
+                {(() => {
+                  const turns = groupTurns(data.messages || [])
+                  return (
+                    <>
+                      <div className="text-[11px] uppercase tracking-widest text-fog-500 mb-2">
+                        Conversation · {turns.length} turn{turns.length === 1 ? '' : 's'}
+                      </div>
+                      {turns.length === 0 && (
+                        <p className="text-fog-500 text-xs">No messages yet.</p>
+                      )}
+                      <div className="space-y-1.5">
+                        {turns.map((g, i) => (
+                          <MessageTurnGroup
+                            key={g.user?.id ?? `turn-${i}`}
+                            group={g}
+                            onDelete={onDelete}
+                          />
+                        ))}
+                      </div>
+                    </>
+                  )
+                })()}
               </section>
 
               {/* Files */}
@@ -5154,6 +5946,295 @@ function ContextViewer({
           )}
         </div>
       </aside>
+    </div>
+  )
+}
+
+/* ────────── PR #0: trajectory sparkline + applied-edits list ──────────
+ *
+ * Both panels read straight off the `/context` payload — no extra
+ * round trip. They stay visible (with an empty-state hint) when no
+ * data is present yet, so a user opening the panel before any
+ * context-management strategy has fired still sees where these views
+ * live. Future strategy PRs (B1/B2/B6/B4) populate them by calling
+ * `_record_context_event(...)` on the backend.
+ */
+
+type TrajectoryPoint = {
+  turn: number
+  input_tokens: number
+  output_tokens: number
+  turn_tokens: number
+  cumulative_tokens: number
+  cache_read_tokens?: number
+  messages: number
+}
+
+type AppliedEdit = {
+  id: number
+  turn: number
+  type: string
+  freed_tokens: number
+  details: any
+  at: string | null
+}
+
+const EDIT_TYPE_LABEL: Record<string, { label: string; icon: string }> = {
+  tool_result_trimming: { label: 'Tool-result trimming', icon: '↺' },
+  summarization: { label: 'Summarisation', icon: '📝' },
+  sliding_window: { label: 'Sliding window', icon: '✂️' },
+  image_eviction: { label: 'Image eviction', icon: '🖼️' },
+  subagent_call: { label: 'Sub-agent dispatch', icon: '🧠' },
+  memory_write: { label: 'Memory write', icon: '💾' },
+  memory_read: { label: 'Memory read', icon: '🗂️' },
+}
+
+function TrajectorySection({
+  trajectory,
+  fmtTokenCount,
+}: {
+  trajectory: TrajectoryPoint[]
+  fmtTokenCount: (n: number) => string
+}) {
+  // Geometry. Width grows linearly with the turn count so very long
+  // conversations still get a useful sparkline; height stays fixed.
+  const W = Math.max(220, trajectory.length * 24)
+  const H = 60
+  const PAD = 4
+
+  const max = Math.max(1, ...trajectory.map((t) => t.cumulative_tokens))
+  const points = trajectory.map((t, i) => {
+    const x =
+      trajectory.length === 1
+        ? W / 2
+        : PAD + (i * (W - PAD * 2)) / (trajectory.length - 1)
+    const y = H - PAD - ((H - PAD * 2) * t.cumulative_tokens) / max
+    return { x, y, t }
+  })
+  const path = points
+    .map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`)
+    .join(' ')
+  const areaPath =
+    points.length > 0
+      ? `${path} L ${points[points.length - 1].x.toFixed(1)} ${H - PAD} L ${
+          points[0].x.toFixed(1)
+        } ${H - PAD} Z`
+      : ''
+
+  const lastTurn = trajectory[trajectory.length - 1]
+  const firstTurn = trajectory[0]
+
+  return (
+    <section>
+      <div className="flex items-baseline justify-between mb-2">
+        <span className="text-[11px] uppercase tracking-widest text-fog-500">
+          Per-turn trajectory · {trajectory.length} turn
+          {trajectory.length === 1 ? '' : 's'}
+        </span>
+        {lastTurn && (
+          <span className="text-[11px] text-fog-400">
+            peak {fmtTokenCount(lastTurn.cumulative_tokens)}
+          </span>
+        )}
+      </div>
+      {trajectory.length === 0 ? (
+        <div className="text-[12px] text-fog-500 bg-ink-300 border border-line rounded-md p-3">
+          No turns yet — send a message to start the trajectory.
+        </div>
+      ) : (
+        <div className="bg-ink-300 border border-line rounded-md p-2 overflow-x-auto">
+          <svg
+            width={W}
+            height={H}
+            viewBox={`0 0 ${W} ${H}`}
+            className="block"
+            preserveAspectRatio="none"
+          >
+            {areaPath && (
+              <path d={areaPath} fill="currentColor" className="text-emerald-500/15" />
+            )}
+            <path
+              d={path}
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              className="text-emerald-400"
+            />
+            {points.map((p, i) => (
+              <g key={i}>
+                <circle
+                  cx={p.x}
+                  cy={p.y}
+                  r={2.5}
+                  className="fill-emerald-400"
+                />
+                <title>
+                  {`Turn ${p.t.turn} · +${p.t.turn_tokens} tok (cum ${p.t.cumulative_tokens})${(p.t.cache_read_tokens ?? 0) > 0 ? ` · ⚡${p.t.cache_read_tokens} cached` : ''}`}
+                </title>
+              </g>
+            ))}
+          </svg>
+          <div className="flex justify-between text-[10px] text-fog-500 px-1 mt-1">
+            <span>
+              turn {firstTurn?.turn} · {fmtTokenCount(firstTurn?.turn_tokens ?? 0)}
+            </span>
+            <span>
+              turn {lastTurn?.turn} · +{fmtTokenCount(lastTurn?.turn_tokens ?? 0)} this turn
+            </span>
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
+
+function AppliedEditsSection({
+  edits,
+  fmtTokenCount,
+}: {
+  edits: AppliedEdit[]
+  fmtTokenCount: (n: number) => string
+}) {
+  // Collapsed by default — expand to inspect what fired this thread.
+  const [open, setOpen] = useState(false)
+  return (
+    <section>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-1.5 text-[11px] uppercase tracking-widest text-fog-500 mb-2 hover:text-fog-300"
+        title={open ? 'Collapse' : 'Expand'}
+      >
+        <span className="shrink-0">{open ? '▾' : '▸'}</span>
+        <span>Applied context edits · {edits.length}</span>
+      </button>
+      {!open ? null : edits.length === 0 ? (
+        <div className="text-[12px] text-fog-500 bg-ink-300 border border-line rounded-md p-3">
+          Nothing has been trimmed, summarised, or delegated yet. When a
+          context-management strategy fires (e.g. tool-result trimming
+          or summarisation), the action shows up here.
+        </div>
+      ) : (
+        <div className="space-y-1.5">
+          {edits.map((e) => {
+            const meta = EDIT_TYPE_LABEL[e.type] || { label: e.type, icon: '•' }
+            const detail =
+              typeof e.details === 'string'
+                ? e.details
+                : e.details && typeof e.details === 'object'
+                  ? (e.details.note ||
+                      e.details.summary ||
+                      Object.keys(e.details).join(', '))
+                  : null
+            return (
+              <div
+                key={e.id}
+                className="text-[12px] bg-ink-300 border border-line rounded-md px-3 py-2"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-fog-100">
+                    <span className="mr-1.5">{meta.icon}</span>
+                    {meta.label}
+                  </span>
+                  <span className="text-fog-500 text-[10px] uppercase tracking-widest">
+                    turn {e.turn}
+                  </span>
+                </div>
+                <div className="text-fog-400 text-[11px] mt-0.5">
+                  {e.freed_tokens > 0
+                    ? `freed ${fmtTokenCount(e.freed_tokens)} tokens`
+                    : 'no tokens freed'}
+                  {detail ? ` · ${String(detail).slice(0, 80)}` : ''}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </section>
+  )
+}
+
+// A conversation turn: the user prompt plus the assistant/tool messages it
+// produced. Messages before the first user prompt fall into a leading group.
+type Turn = { user: any | null; children: any[] }
+
+function groupTurns(messages: any[]): Turn[] {
+  const groups: Turn[] = []
+  let cur: Turn | null = null
+  for (const m of messages) {
+    if (m.role === 'user') {
+      if (cur) groups.push(cur)
+      cur = { user: m, children: [] }
+    } else {
+      if (!cur) cur = { user: null, children: [] }
+      cur.children.push(m)
+    }
+  }
+  if (cur) groups.push(cur)
+  return groups
+}
+
+// Each message's OWN size (not the per-call total, which includes all prior
+// history). Assistant turns use their completion tokens; everything else is
+// estimated from content length.
+function ownTokens(m: any): number {
+  if (!m) return 0
+  if (m.role === 'assistant' && Number(m.output_tokens) > 0) {
+    return Number(m.output_tokens)
+  }
+  return Math.ceil((String(m.content || '').length) / 4)
+}
+
+function turnTokens(g: Turn): number {
+  return ownTokens(g.user) + g.children.reduce((acc, m) => acc + ownTokens(m), 0)
+}
+
+function MessageTurnGroup({
+  group,
+  onDelete,
+}: {
+  group: Turn
+  onDelete?: (messageId: number) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const preview = String(group.user?.content || '')
+    .slice(0, 90)
+    .replace(/\n/g, ' ')
+  const childCount = group.children.length
+  const total = turnTokens(group)
+  return (
+    <div className="rounded-md border border-line bg-ink-300/40">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-soft/[0.03]"
+      >
+        <span className="text-fog-500 text-[11px] shrink-0">
+          {open ? '▾' : '▸'}
+        </span>
+        <span className="text-[10px] uppercase tracking-wider font-mono text-blue-300 shrink-0">
+          {group.user ? 'user' : 'context'}
+        </span>
+        <span className="text-fog-200 text-[12px] truncate flex-1">
+          {preview || (group.user ? '(empty)' : 'leading messages')}
+        </span>
+        <span className="text-fog-500 text-[10px] shrink-0">
+          {childCount} msg
+        </span>
+        <span className="text-fog-400 text-[11px] shrink-0 tabular-nums">
+          {total.toLocaleString()} tok
+        </span>
+      </button>
+      {open && (
+        <div className="px-2 pb-2 space-y-1">
+          {group.user && (
+            <ContextMessageRow msg={group.user} onDelete={onDelete} />
+          )}
+          {group.children.map((m: any, i: number) => (
+            <ContextMessageRow key={m.id ?? i} msg={m} onDelete={onDelete} />
+          ))}
+        </div>
+      )}
     </div>
   )
 }

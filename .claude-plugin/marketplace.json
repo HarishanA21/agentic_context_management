@@ -1,0 +1,17 @@
+{
+  "name": "acm-marketplace",
+  "owner": {
+    "name": "ACM",
+    "url": "https://github.com/HarishanA21/agentic_context_management"
+  },
+  "plugins": [
+    {
+      "name": "acm-context-management",
+      "source": "./extension/adapters/claude-code",
+      "description": "Context-management techniques (tool-result trimming, summarisation, image-recall, memory) for Claude Code via hooks + MCP. Pairs with acm-gateway for full-parity context editing.",
+      "version": "0.1.0",
+      "category": "context-management",
+      "keywords": ["context", "memory", "summarisation", "mcp", "hooks"]
+    }
+  ]
+}

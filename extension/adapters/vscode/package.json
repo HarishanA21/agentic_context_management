@@ -1,0 +1,172 @@
+{
+  "name": "acm-context-management",
+  "displayName": "ACM — Context Management",
+  "description": "Bring the ACM context-management techniques (trimming, summarisation, image-recall, memory) into VSCode via the gateway, Language Model Tools, and a settings panel.",
+  "version": "0.2.0",
+  "publisher": "acm",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HarishanA21/agentic_context_management.git",
+    "directory": "extension/adapters/vscode"
+  },
+  "homepage": "https://github.com/HarishanA21/agentic_context_management",
+  "bugs": {
+    "url": "https://github.com/HarishanA21/agentic_context_management/issues"
+  },
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "AI",
+    "Machine Learning",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "acm.openSettings",
+        "title": "ACM: Open Context-Management Settings"
+      },
+      {
+        "command": "acm.showStatus",
+        "title": "ACM: Show Gateway Status"
+      },
+      {
+        "command": "acm.recall",
+        "title": "ACM: Recall Memory"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "acm",
+          "title": "ACM",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "acm": [
+        {
+          "id": "acm.sidebar",
+          "name": "Context Management",
+          "type": "webview"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "ACM Context Management",
+      "properties": {
+        "acm.gatewayUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8807",
+          "description": "Base URL of the local acm-gateway."
+        },
+        "acm.memoryScope": {
+          "type": "string",
+          "default": "user",
+          "enum": ["user", "thread"],
+          "description": "Default scope for ACM memory tools."
+        }
+      }
+    },
+    "chatParticipants": [
+      {
+        "id": "acm.agent",
+        "name": "acm",
+        "fullName": "ACM",
+        "description": "Context-management helper — status, recall, compaction.",
+        "isSticky": true
+      }
+    ],
+    "languageModelTools": [
+      {
+        "name": "acm_remember",
+        "displayName": "ACM: Remember",
+        "modelDescription": "Persist a fact to local ACM memory so future turns/sessions can recall it. Use for decisions, file paths, open tasks worth carrying forward.",
+        "toolReferenceName": "acmRemember",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(save)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "text": { "type": "string", "description": "The fact to remember." },
+            "scope": { "type": "string", "enum": ["user", "thread"], "description": "Memory scope." }
+          },
+          "required": ["text"]
+        }
+      },
+      {
+        "name": "acm_recall",
+        "displayName": "ACM: Recall",
+        "modelDescription": "Recall facts previously stored in ACM memory, optionally filtered by a query.",
+        "toolReferenceName": "acmRecall",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(book)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": { "type": "string", "description": "Optional substring filter." },
+            "scope": { "type": "string", "enum": ["user", "thread"] }
+          }
+        }
+      },
+      {
+        "name": "acm_compact",
+        "displayName": "ACM: Compact",
+        "modelDescription": "Summarise a long transcript into a short carry-over note using the ACM summariser via the gateway.",
+        "toolReferenceName": "acmCompact",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(fold)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "text": { "type": "string", "description": "The transcript to compact." }
+          },
+          "required": ["text"]
+        }
+      },
+      {
+        "name": "acm_set_profile",
+        "displayName": "ACM: Set Profile",
+        "modelDescription": "Switch the active context-management preset (minimal, long_chat, power_research, cheap_long, visual_recall).",
+        "toolReferenceName": "acmSetProfile",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(settings-gear)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string", "description": "Preset name." }
+          },
+          "required": ["name"]
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "build:host": "tsc -p ./",
+    "build:ui": "node esbuild.mjs",
+    "compile": "npm run build:host && npm run build:ui",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --no-dependencies",
+    "publish:vsce": "vsce publish --no-dependencies",
+    "publish:ovsx": "ovsx publish --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "@types/vscode": "^1.95.0",
+    "esbuild": "^0.23.0",
+    "react": "^18",
+    "react-dom": "^18",
+    "typescript": "^5.5.0"
+  }
+}

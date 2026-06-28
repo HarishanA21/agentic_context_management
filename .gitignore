@@ -25,3 +25,38 @@ uv.lock
 # Uploaded user files (per-session storage)
 uploads/
 .claude
+
+
+current.md
+note.txt
+hello.txt
+
+# macOS junk
+.DS_Store
+
+# Stray binaries / scratch artifacts
+*.pdf
+
+# Generated visual-method rasterizer output (debug dumps)
+backend/visual_images/
+*__read_project_file.png
+
+# TS incremental build cache
+ui/tsconfig.tsbuildinfo
+
+# Planning docs — kept locally, not pushed
+documents/
+Future.md
+PROJECT.md
+
+# Generated extension docs/plans — kept locally, not pushed
+/EXTENSION_PLAN.md
+/extension/PACKAGING.md
+/extension/PRIVATE_DEPLOY.md
+/extension/README.md
+/extension/TESTING.md
+/extension/adapters/claude-code/README.md
+/extension/adapters/cursor/README.md
+/extension/adapters/vscode/README.md
+/extension/adapters/vscode/CHANGELOG.md
+/extension/adapters/vscode/UI_PLAN.md

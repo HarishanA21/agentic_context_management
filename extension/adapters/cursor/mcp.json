@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy to .cursor/mcp.json in your project (or ~/.cursor/mcp.json globally). Registers the ACM tool buttons. For full-parity context editing, also set a custom OpenAI base URL of http://127.0.0.1:8807/v1 in Cursor > Settings > Models > Override OpenAI Base URL.",
+  "mcpServers": {
+    "acm": {
+      "command": "acm-mcp"
+    }
+  }
+}

@@ -17,7 +17,13 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from jwt import PyJWKClient
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.postgres import PostgresSaver
 
@@ -100,7 +106,60 @@ def _verify_session(conn, user_id: str, session_id: str):
     ).fetchone():
         raise HTTPException(404, "Session not found")
 
-DEFAULT_MODEL = os.getenv("CHAT_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+DEFAULT_MODEL = os.getenv("CHAT_MODEL", "google/gemini-3.1-flash-lite")
+
+# ── Context-management strategy ────────────────────────────────────────────
+# Selects how the agent's tool surface is presented to the LLM each turn.
+# New strategies plug in as additional branches in `_get_agent_for_request`.
+#   tool_calling   — classic ReAct: every tool is its own LangChain tool,
+#                    agent calls one per round. Current default.
+#   ts_code_mode   — catalog + describe_tools + execute_typescript. The
+#                    agent picks tool names from a compact catalog, fetches
+#                    full TS interfaces on demand, and runs one TS program
+#                    per turn in a Deno isolate. See TS_CODE_MODE_PLAN.md.
+_VALID_CONTEXT_STRATEGIES = {"tool_calling", "ts_code_mode"}
+DEFAULT_CONTEXT_STRATEGY = (
+    os.getenv("DEFAULT_CONTEXT_STRATEGY", "tool_calling").strip() or "tool_calling"
+)
+if DEFAULT_CONTEXT_STRATEGY not in _VALID_CONTEXT_STRATEGIES:
+    print(
+        f"[startup] WARNING: DEFAULT_CONTEXT_STRATEGY={DEFAULT_CONTEXT_STRATEGY!r} "
+        f"not in {sorted(_VALID_CONTEXT_STRATEGIES)}; falling back to tool_calling.",
+        flush=True,
+    )
+    DEFAULT_CONTEXT_STRATEGY = "tool_calling"
+
+
+def _normalise_strategy(value: Optional[str]) -> str:
+    v = (value or "").strip().lower()
+    return v if v in _VALID_CONTEXT_STRATEGIES else DEFAULT_CONTEXT_STRATEGY
+
+
+# Path to the Deno binary used by `ts_code_mode`. Only resolved when the
+# strategy is actually used, so the rest of the backend doesn't care
+# whether Deno is installed.
+DENO_BIN = os.getenv("DENO_BIN", "deno").strip() or "deno"
+
+
+def _deno_health_check() -> Optional[str]:
+    """Return Deno version string if the binary is callable, else None.
+    Run once at startup and logged — does NOT crash the backend, because
+    most paths don't need Deno. Only ts_code_mode will fail loudly if
+    Deno is missing at request time.
+    """
+    import subprocess  # local import: only used at startup
+    try:
+        out = subprocess.run(
+            [DENO_BIN, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode == 0:
+            return (out.stdout or "").splitlines()[0].strip() or "deno (version unknown)"
+        return None
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
 
 
 def _build_model(model_name: str) -> ChatOpenAI:
@@ -144,6 +203,104 @@ _agent_cache: Dict[str, Any] = {}
 _agent_cache_lock = Lock()
 # Cap so the cache can't grow unbounded as users × MCP fingerprints multiply.
 _AGENT_CACHE_MAX = 64
+
+
+def _resolve_chat_model(
+    model_name_hint: Optional[str],
+    user_id: str,
+    session_id: Optional[str] = None,
+):
+    """Pick the LangChain chat model for this user's next /chat turn.
+
+    Order:
+      1. The session's `preferred_provider_id` if set (Phase F per-session
+         picker).
+      2. The user's default provider (`is_default = true`).
+      3. Env-var path: `_build_model(model_name_hint)` — legacy OpenRouter
+         setup, used when the user has no providers configured.
+
+    Returns `(chat_model, cache_key_str)`. The cache key prefix differs
+    between the three branches so they never collide.
+    """
+    try:
+        with app.state.pool.connection() as conn:
+            # 1) session-specific override
+            if session_id:
+                row = conn.execute(
+                    """
+                    SELECT lp.id, lp.slug, lp.model_id, lp.credentials_blob,
+                           lp.updated_at, lp.temperature, lp.max_tokens
+                      FROM sessions s
+                      JOIN llm_providers lp ON lp.id = s.preferred_provider_id
+                     WHERE s.id = %s AND s.user_id = %s
+                     LIMIT 1
+                    """,
+                    (session_id, user_id),
+                ).fetchone()
+                if row:
+                    (
+                        pid,
+                        slug,
+                        model_id,
+                        blob,
+                        updated_at,
+                        temperature,
+                        max_tokens,
+                    ) = row
+                    from providers.base import decrypt_credentials
+                    from providers.registry import (
+                        _build_for_user,
+                        _env_fallback_model,
+                    )
+
+                    creds = decrypt_credentials(blob or "")
+                    if creds:
+                        chat_model = _build_for_user(
+                            slug,
+                            model_id,
+                            creds,
+                            updated_at,
+                            temperature,
+                            max_tokens,
+                        )
+                        return (
+                            chat_model,
+                            f"prov::{slug}::{model_id}::{updated_at}::sess",
+                        )
+                    # creds missing — fall through to user default
+                    print(
+                        f"[providers] session {session_id} preferred provider "
+                        f"{pid} has empty credentials; using user default",
+                        flush=True,
+                    )
+
+            # 2) user default
+            row = conn.execute(
+                """
+                SELECT slug, model_id, updated_at
+                  FROM llm_providers
+                 WHERE user_id = %s AND is_default = true
+                 LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            if row:
+                from providers.registry import resolve_active_model
+
+                slug, model_id, updated_at = row
+                chat_model = resolve_active_model(conn, user_id)
+                key = f"prov::{slug}::{model_id}::{updated_at}"
+                return chat_model, key
+    except Exception as e:
+        print(
+            f"[providers] resolve_active_model failed for {user_id}; "
+            f"falling back to env path: {e!r}",
+            flush=True,
+        )
+
+    # 3) env fallback
+    name = (model_name_hint or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    return _build_model(name), f"env::{name}"
 
 
 def _unwrap_exc(e: BaseException) -> BaseException:
@@ -233,37 +390,330 @@ async def _collect_mcp_tools_async(user_id: str):
         return []
 
 
-def _get_agent_for_request(model_name: Optional[str], user_id: str):
+# ─── vision-capability detection (for the visual method) ────────────────
+#
+# The visual method rasterises tool output into a PNG the model reads
+# instead of text. If the active model can't accept image input, sending
+# those blocks hard-fails the turn ("No endpoints found that support image
+# input"). We detect support up front and fall back to plain text instead.
+
+# Model-id substrings that are reliably vision-capable across providers.
+# Used as a fallback when OpenRouter's metadata isn't available (e.g. a
+# native Anthropic/OpenAI/Google provider, not OpenRouter).
+_VISION_HINTS = (
+    "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-5", "o1", "o3", "o4-mini",
+    "gemini", "claude-3", "claude-4", "claude-opus", "claude-sonnet",
+    "claude-haiku", "llama-3.2", "llama-4", "pixtral", "qwen-vl",
+    "qwen2-vl", "qwen2.5-vl", "qwen3-vl", "llava", "internvl",
+    "grok-2-vision", "grok-4", "mistral-small-3", "phi-3-vision",
+    "phi-4-multimodal", "molmo", "vision", "vl-",
+)
+
+_vision_cache: Dict[str, Any] = {"mods": None, "ts": 0.0}
+_vision_lock = Lock()
+
+
+def _openrouter_modalities() -> Dict[str, set]:
+    """Map of OpenRouter ``model_id -> set(input modalities)``, cached ~1h.
+
+    OpenRouter's public /models listing carries
+    ``architecture.input_modalities`` (e.g. ``["text", "image"]``) — the
+    authoritative answer to "can this model read images". Returns ``{}``
+    if the listing can't be fetched, in which case callers fall back to
+    the substring heuristic.
+    """
+    now = time.time()
+    with _vision_lock:
+        mods = _vision_cache["mods"]
+        if mods is not None and (now - _vision_cache["ts"]) < 3600:
+            return mods
+    out: Dict[str, set] = {}
+    try:
+        import requests
+
+        r = requests.get("https://openrouter.ai/api/v1/models", timeout=5)
+        r.raise_for_status()
+        for m in r.json().get("data", []):
+            mid = (m.get("id") or "").lower()
+            if not mid:
+                continue
+            arch = m.get("architecture") or {}
+            ms = arch.get("input_modalities")
+            if not ms:
+                # Older shape: "modality": "text+image->text".
+                raw = arch.get("modality") or ""
+                ms = raw.split("->")[0].split("+") if raw else []
+            out[mid] = {str(x).lower() for x in ms}
+    except Exception as e:
+        print(
+            f"[visual_method] OpenRouter modality lookup failed: {e!r} "
+            "— using name heuristic",
+            flush=True,
+        )
+    with _vision_lock:
+        _vision_cache["mods"] = out
+        _vision_cache["ts"] = now
+    return out
+
+
+def _model_id_of(chat_model) -> str:
+    """Best-effort model identifier off a LangChain chat model object."""
+    for attr in ("model_name", "model", "model_id"):
+        v = getattr(chat_model, attr, None)
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+
+def _model_supports_vision(model_id: str) -> bool:
+    """True if ``model_id`` accepts image input.
+
+    Prefers OpenRouter's metadata (exact, covers the long tail); falls
+    back to a substring heuristic for native providers or when the
+    listing is unavailable. Unknown models default to *not* vision so the
+    visual method degrades to text rather than hard-failing the turn.
+    """
+    mid = (model_id or "").strip().lower()
+    if not mid:
+        return False
+    mods = _openrouter_modalities()
+    if mods:
+        for key in (mid, mid.split(":")[0]):  # tolerate ":free" etc. suffixes
+            if key in mods:
+                return "image" in mods[key]
+    return any(h in mid for h in _VISION_HINTS)
+
+
+def _note_visual_method_skip(
+    profile, model_hint, user_id, session_id, thread_id
+) -> None:
+    """If the profile enables the visual method but the active model can't
+    read images, record a single context_event so the UI explains why no
+    rasterised tool outputs appear (rather than the feature silently doing
+    nothing). Deduped per thread; best-effort, never raises."""
+    try:
+        vm = getattr(
+            getattr(profile, "context_management", None), "visual_method", None
+        )
+        if not (vm is not None and getattr(vm, "enabled", False)):
+            return
+        chat_model, _ = _resolve_chat_model(model_hint, user_id, session_id)
+        mid = _model_id_of(chat_model)
+        if _model_supports_vision(mid):
+            return
+        with app.state.pool.connection() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM context_events WHERE user_id=%s AND session_id=%s "
+                "AND thread_id=%s AND edit_type=%s LIMIT 1",
+                (user_id, session_id, thread_id, "visual_method_skipped"),
+            ).fetchone()
+            if exists:
+                return
+            _record_context_event(
+                conn,
+                user_id=user_id,
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_index=0,
+                edit_type="visual_method_skipped",
+                details={
+                    "model": mid,
+                    "note": (
+                        f"Visual method is on, but '{mid}' can't read images, "
+                        "so tool outputs stayed as text. Switch to a "
+                        "vision-capable model (e.g. google/gemini-2.5-flash) "
+                        "to enable image compression."
+                    ),
+                },
+            )
+    except Exception as e:
+        print(f"[visual_method] skip-notice failed: {e!r}", flush=True)
+
+
+def _get_agent_for_request(
+    model_name: Optional[str],
+    user_id: str,
+    strategy: Optional[str] = None,
+    session_id: Optional[str] = None,
+    profile: Optional["Profile"] = None,  # type: ignore[name-defined]
+):
     """Sync wrapper around the async tool discovery, so /chat (which is
     a sync FastAPI handler) can call us without flipping to async.
 
-    Returns an agent whose tool list = built-ins + the user's enabled MCP
-    tools. Cache key is `(model, user, tool-name fingerprint)` so
-    toggling an MCP rebuilds on the next request without churning the
-    cache for unrelated users.
+    Profile-driven branching (PR #1 onwards):
+      * ``profile.tool_surface`` decides the tool list + system prompt
+        (``tool_calling`` vs ``ts_code_mode``).
+      * Later PRs read ``profile.context_management.{trimming,
+        summarisation, memory, subagent, jit_tools, sliding_window}``
+        to wire in those techniques. PR #1 leaves them as no-ops.
+
+    Back-compat: callers that haven't migrated still pass a string
+    ``strategy``; we wrap it into a synthetic profile. New callers
+    pass a fully-resolved Profile via ``profile=``.
+
+    Cache key includes the profile's fingerprint so changing any
+    technique toggle rebuilds the agent on the next request.
     """
-    name = (model_name or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    # Resolve to a Profile object regardless of how the caller invoked us.
+    if profile is None:
+        from context_profiles import Profile as _Profile  # lazy import
+
+        # Legacy string path: build a synthetic profile from the strategy
+        # name. ``minimal``/``code_mode`` are the only two outcomes here.
+        surface = _normalise_strategy(strategy)
+        profile = _Profile(tool_surface=surface)
+    surface = profile.tool_surface
+    profile_fp = profile.fingerprint()
+
+    # Choose the LLM. Order: session.preferred_provider_id (Phase F),
+    # then user default, then env fallback.
+    chat_model, model_key = _resolve_chat_model(model_name, user_id, session_id)
 
     mcp_tools = asyncio.run(_collect_mcp_tools_async(user_id))
+    real_tools = list(all_tools) + list(mcp_tools)
 
-    if not mcp_tools:
-        return _get_agent(name)
+    # JIT tools (technique B5): the find/head/tail/grep retrieval primitives are
+    # opt-in. Attach them to the real tool surface only when the profile enables
+    # the toggle, so the technique can be A/B-tested. Added to `real_tools`
+    # (before the surface branch) so both tool_calling and ts_code_mode — and
+    # any sub-agent that inherits real_tools — pick them up.
+    jit_cfg = getattr(getattr(profile, "context_management", None), "jit_tools", None)
+    if jit_cfg is not None and getattr(jit_cfg, "enabled", False):
+        from Tools import jit_retrieval_tools
 
-    fingerprint = ",".join(sorted(t.name for t in mcp_tools))
-    key = f"{name}::{user_id}::{fingerprint}"
+        real_tools = real_tools + list(jit_retrieval_tools)
+
+    real_fingerprint = ",".join(sorted(t.name for t in real_tools))
+
+    if surface == "ts_code_mode":
+        # Local imports to keep the import graph clean: tool_calling
+        # turns don't pay the cost of loading ts_code_mode at all.
+        from Tools.describe_tools_tool import make_describe_tools_tool
+        from Tools.execute_typescript_tool import make_execute_typescript_tool
+        from ts_code_mode import ts_code_mode_system_prompt
+
+        agent_tools = [
+            make_describe_tools_tool(real_tools),
+            make_execute_typescript_tool(real_tools),
+        ]
+        system_prompt = ts_code_mode_system_prompt(real_tools)
+    else:
+        agent_tools = real_tools
+        system_prompt = SYSTEM_PROMPT
+
+    # PR #4: memory tool. Added to the agent's toolbox when the profile
+    # enables it. The tool reads its scope (thread vs user) from this
+    # config block at call time — so the agent cache key only depends on
+    # `scope`, not on the live thread_id. system_prompt rider nudges the
+    # model to view memory at turn start.
+    mem_cfg = getattr(getattr(profile, "context_management", None), "memory", None)
+    if mem_cfg is not None and getattr(mem_cfg, "enabled", False):
+        from Tools.memory_tool import MEMORY_PROMPT_RIDER, make_memory_tool
+
+        agent_tools = list(agent_tools) + [make_memory_tool(scope=mem_cfg.scope)]
+        if getattr(mem_cfg, "auto_view_at_start", True):
+            system_prompt = system_prompt + MEMORY_PROMPT_RIDER
+
+    # PR #7: sub-agent delegation tool. Bound to the parent's chat_model
+    # and tool surface so the subagent stays apples-to-apples. The tool
+    # itself stays lightweight; the heavy lifting is in subagent.py.
+    sub_cfg = getattr(getattr(profile, "context_management", None), "subagent", None)
+    if sub_cfg is not None and getattr(sub_cfg, "enabled", False):
+        from Tools.delegate_tool import make_delegate_tool
+
+        agent_tools = list(agent_tools) + [
+            make_delegate_tool(
+                real_tools=real_tools,
+                tool_surface=surface,
+                chat_model=chat_model,
+                base_system_prompt=SYSTEM_PROMPT,
+                token_budget=sub_cfg.token_budget,
+                max_depth=sub_cfg.max_depth,
+            )
+        ]
+
+    # Visual method: rasterise large tool outputs into a formatted image the
+    # model reads instead of raw text. Wraps the tool list so every tool's
+    # return above the threshold flows through the compressor. Requires a
+    # vision-capable chat model. Runs last so it wraps memory/subagent tools too.
+    vm_cfg = getattr(getattr(profile, "context_management", None), "visual_method", None)
+    if vm_cfg is not None and getattr(vm_cfg, "enabled", False):
+        # The visual method emits image content blocks. A model that can't
+        # accept image input hard-fails the turn ("No endpoints found that
+        # support image input"), so only wrap when the active model is
+        # vision-capable — otherwise fall back to plain text.
+        model_id = _model_id_of(chat_model)
+        if not _model_supports_vision(model_id):
+            print(
+                f"[visual_method] model {model_id!r} has no image input — "
+                "skipping visual compression, using plain text",
+                flush=True,
+            )
+        else:
+            try:
+                from visual_tool.wrap_tools import wrap_tools_with_compression  # lazy
+
+                agent_tools = wrap_tools_with_compression(
+                    agent_tools,
+                    mode=vm_cfg.mode,
+                    threshold_tokens=vm_cfg.threshold_tokens,
+                    only_tools=vm_cfg.only_tools or None,
+                    exclude_tools=vm_cfg.exclude_tools or None,
+                )
+            except Exception as e:
+                print(f"[visual_method] wrap failed: {e!r} — using plain tools", flush=True)
+
+    # Cache key includes the profile fingerprint (covers tool_surface +
+    # every technique toggle). Two profiles with identical bodies share
+    # an agent; flipping any toggle invalidates without disturbing
+    # unrelated users' cached agents.
+    import hashlib
+
+    profile_hash = hashlib.sha1(profile_fp.encode()).hexdigest()[:12]
+    key = f"{model_key}::{user_id}::{profile_hash}::{real_fingerprint}"
     with _agent_cache_lock:
         if key in _agent_cache:
             return _agent_cache[key]
         if len(_agent_cache) >= _AGENT_CACHE_MAX:
             _agent_cache.pop(next(iter(_agent_cache)), None)
+        # Recover tool calls that Gemini-family models leak as text
+        # (``default_api.tool(...)``) so the agent still executes them.
+        # Safe no-op for models that return structured tool calls.
+        from tool_call_recovery import LeakedToolCallMiddleware
+
         agent = create_agent(
-            model=_build_model(name),
-            tools=list(all_tools) + list(mcp_tools),
-            system_prompt=SYSTEM_PROMPT,
+            model=chat_model,
+            tools=agent_tools,
+            system_prompt=system_prompt,
             checkpointer=app.state.saver,
+            middleware=_image_recall_middleware(profile)
+            + [LeakedToolCallMiddleware()],
         )
         _agent_cache[key] = agent
         return agent
+
+
+def _image_recall_middleware(profile) -> list:
+    """Middleware list for the image-recall techniques. Attaches the unified
+    ImageRecallMiddleware whenever the profile's mode is not ``off``. The
+    middleware applies caching (cache breakpoints) and/or within-loop image
+    eviction per the mode. The *persistent* between-turns eviction (with its
+    UI event marker) still runs in context_editing.apply_context_edits; the
+    middleware's eviction is the per-call view and is idempotent with it.
+    """
+    ir = getattr(getattr(profile, "context_management", None), "image_recall", None)
+    mode = getattr(ir, "mode", "off") if ir is not None else "off"
+    if not ir or mode == "off":
+        return []
+    from cache_layout import ImageRecallMiddleware  # lazy
+
+    return [
+        ImageRecallMiddleware(
+            mode=mode,
+            keep_recent_images=getattr(ir, "keep_recent_images", 3),
+            ttl=getattr(ir, "cache_ttl", "5m"),
+        )
+    ]
 
 
 # ── OpenRouter model catalog (cached) ───────────────────────────────────────
@@ -272,31 +722,118 @@ _models_lock = Lock()
 _MODELS_TTL_SECONDS = 600  # 10 minutes
 
 
+# Paid OpenRouter models we explicitly promote into the model picker.
+# Kept tiny — anything in here gets billed when selected, so only list
+# models the user has explicitly opted into. The Visual Compression
+# Bench tab of the Strategy Demo recommends gemini-2.5-flash and the
+# bench numbers in VISUAL_COMPRESSION_BENCH.md cite it, so it needs to
+# be selectable from the dropdown.
+_PROMOTED_PAID_MODELS: set[str] = {
+    "google/gemini-2.5-flash",   # Visual Compression Bench default
+    "inclusionai/ring-2.6-1t",   # Manually promoted — large context model
+    # Primary models for chat / demo / projects (requested set).
+    "minimax/minimax-m3",
+    "stepfun/step-3.7-flash",
+    "google/gemini-3.1-flash-lite",
+}
+
+# Models pinned manually so they always appear in the picker regardless of
+# whether OpenRouter's catalog returns them. Merged after the live fetch;
+# any model already returned by the catalog keeps the catalog's metadata.
+_PINNED_MODELS: List[Dict[str, Any]] = [
+    {
+        "id": "inclusionai/ring-2.6-1t",
+        "name": "Ring 2.6 1T",
+        "context_length": 32768,
+        "description": "Ring 2.6 1T — via OpenRouter.",
+        "vision": False,
+    },
+    # Primary models for chat / demo / projects. Pinned so they always show
+    # in the picker even if OpenRouter's live catalog hasn't surfaced them
+    # yet; the catalog's metadata (incl. real context_length) wins when it
+    # does return them. context_length here is a best-effort fallback.
+    {
+        "id": "google/gemini-3.1-flash-lite",
+        "name": "Gemini 3.1 Flash Lite",
+        "context_length": 1048576,
+        "description": "Google Gemini 3.1 Flash Lite — fast, cheap, large context. Default chat/demo model.",
+        "vision": True,
+    },
+    {
+        "id": "google/gemini-2.5-flash",
+        "name": "Gemini 2.5 Flash",
+        "context_length": 1048576,
+        "description": "Google Gemini 2.5 Flash — vision-capable; required for the Visual method.",
+        "vision": True,
+    },
+    {
+        "id": "minimax/minimax-m3",
+        "name": "MiniMax M3",
+        "context_length": 1000000,
+        "description": "MiniMax M3 — large-context reasoning model via OpenRouter.",
+        "vision": False,
+    },
+    {
+        "id": "stepfun/step-3.7-flash",
+        "name": "StepFun Step 3.7 Flash",
+        "context_length": 128000,
+        "description": "StepFun Step 3.7 Flash — fast general-purpose model via OpenRouter.",
+        "vision": False,
+    },
+]
+
+
 def _fetch_free_models() -> List[Dict[str, Any]]:
-    """Pull the OpenRouter catalog and keep only `:free` models. Cached."""
+    """Pull the OpenRouter catalog and keep `:free` models + a small
+    allow-list of paid models we want promoted (see
+    ``_PROMOTED_PAID_MODELS``). Cached for ``_MODELS_TTL_SECONDS``."""
     now = time.time()
     with _models_lock:
         if _models_cache["items"] and (now - _models_cache["at"]) < _MODELS_TTL_SECONDS:
             return _models_cache["items"]
+    data: List[Dict[str, Any]] = []
     try:
         r = requests.get("https://openrouter.ai/api/v1/models", timeout=10)
         r.raise_for_status()
         data = r.json().get("data", [])
     except Exception as e:
+        # Don't bail to a bare cache — we still want the pinned primary
+        # models to show even when OpenRouter is unreachable. Fall through
+        # with no catalog data and let the pinned-merge below guarantee the
+        # primary models are present.
         print(f"[/models] OpenRouter fetch failed: {e!r}", flush=True)
-        # Fall back to whatever we cached previously (possibly stale, possibly empty).
-        return _models_cache["items"]
+        data = []
     items = []
+    seen_ids: set[str] = set()
     for m in data:
         mid = m.get("id") or ""
-        if not mid.endswith(":free"):
+        if not mid.endswith(":free") and mid not in _PROMOTED_PAID_MODELS:
             continue
+        # Vision capability straight from the catalog's architecture block,
+        # so the picker can flag which models accept images (the Visual
+        # method needs one). Falls back to the name heuristic if absent.
+        arch = m.get("architecture") or {}
+        mods = arch.get("input_modalities")
+        if not mods:
+            raw = arch.get("modality") or ""
+            mods = raw.split("->")[0].split("+") if raw else []
+        vision = "image" in {str(x).lower() for x in mods} or _model_supports_vision(mid)
         items.append({
             "id": mid,
             "name": m.get("name") or mid,
             "context_length": m.get("context_length") or 0,
             "description": (m.get("description") or "")[:200],
+            "vision": vision,
         })
+        seen_ids.add(mid)
+    # Merge pinned models that the catalog didn't return — guarantees the
+    # primary models are always selectable, online or not.
+    for pinned in _PINNED_MODELS:
+        if pinned["id"] not in seen_ids:
+            entry = dict(pinned)
+            entry.setdefault("vision", _model_supports_vision(entry["id"]))
+            items.append(entry)
+            seen_ids.add(entry["id"])
     items.sort(key=lambda m: m["name"].lower())
     with _models_lock:
         _models_cache["items"] = items
@@ -329,6 +866,15 @@ class ChatRequest(BaseModel):
     message: str
     attached_files: List[str] = []
     model: Optional[str] = None
+    # Legacy: "tool_calling" / "ts_code_mode" — maps to a built-in
+    # preset of the matching tool_surface. Superseded by context_profile_id
+    # / context_profile but kept so old clients keep working.
+    context_strategy: Optional[str] = None
+    # Preferred (PR #1+): a saved profile id, or a one-off profile body.
+    # Resolution order: body > id > legacy strategy > session profile
+    # > user default > built-in `minimal`. See context_profiles.resolve_profile.
+    context_profile_id: Optional[str] = None
+    context_profile: Optional[Dict[str, Any]] = None
 
 
 class TitleRequest(BaseModel):
@@ -411,6 +957,7 @@ async def lifespan(app: FastAPI):
             "ADD COLUMN IF NOT EXISTS input_tokens    integer NOT NULL DEFAULT 0, "
             "ADD COLUMN IF NOT EXISTS output_tokens   integer NOT NULL DEFAULT 0, "
             "ADD COLUMN IF NOT EXISTS thinking_tokens integer NOT NULL DEFAULT 0, "
+            "ADD COLUMN IF NOT EXISTS cache_read_tokens integer NOT NULL DEFAULT 0, "
             "ADD COLUMN IF NOT EXISTS langgraph_id    text"
         )
         conn.execute(
@@ -421,6 +968,118 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE sessions "
             "ADD COLUMN IF NOT EXISTS mode text NOT NULL DEFAULT 'auto'"
         )
+        # Phase F — per-user multi-provider configs and per-session
+        # override. Matches db/init.sql; gated by IF NOT EXISTS so it's
+        # a no-op when the DB was bootstrapped fresh from the SQL file.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_providers (
+                id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id            uuid NOT NULL,
+                slug               text NOT NULL,
+                label              text NOT NULL,
+                model_id           text NOT NULL,
+                credentials_blob   text NOT NULL,
+                is_default         boolean NOT NULL DEFAULT false,
+                last_error         text,
+                last_tested_at     timestamptz,
+                created_at         timestamptz NOT NULL DEFAULT now(),
+                updated_at         timestamptz NOT NULL DEFAULT now(),
+                UNIQUE (user_id, label)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_providers_user "
+            "ON llm_providers(user_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_providers_user_default "
+            "ON llm_providers(user_id) WHERE is_default"
+        )
+        # Phase G — provider-level temperature + max_tokens overrides.
+        conn.execute(
+            "ALTER TABLE llm_providers "
+            "ADD COLUMN IF NOT EXISTS temperature double precision, "
+            "ADD COLUMN IF NOT EXISTS max_tokens integer"
+        )
+        # Per-session preferred provider; FK with ON DELETE SET NULL so
+        # deleting a provider silently reverts affected sessions to the
+        # user-level default.
+        conn.execute(
+            "ALTER TABLE sessions "
+            "ADD COLUMN IF NOT EXISTS preferred_provider_id uuid "
+            "REFERENCES llm_providers(id) ON DELETE SET NULL"
+        )
+        # Context-management observability: append-only log of every
+        # context edit a strategy applies (trimming, summarisation,
+        # sliding-window, sub-agent dispatch, …). Plain bigserial id
+        # so the API can ORDER BY id ASC and the UI gets stable order
+        # even when several edits land in the same millisecond.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS context_events (
+                id            bigserial PRIMARY KEY,
+                user_id       uuid NOT NULL,
+                session_id    uuid NOT NULL,
+                thread_id     uuid NOT NULL,
+                turn_index    integer NOT NULL,
+                edit_type     text NOT NULL,
+                freed_tokens  integer NOT NULL DEFAULT 0,
+                details_json  jsonb,
+                created_at    timestamptz NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_context_events_thread "
+            "ON context_events(session_id, thread_id, id)"
+        )
+        # Context-management profiles — bundles tool_surface + per-
+        # technique toggles. Built-in presets have user_id IS NULL;
+        # user-saved profiles carry the owner's id. See
+        # backend/context_profiles.py for the schema + seed routine.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS context_profiles (
+                id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id      uuid,
+                name         text NOT NULL,
+                body         jsonb NOT NULL,
+                is_default   boolean NOT NULL DEFAULT false,
+                created_at   timestamptz NOT NULL DEFAULT now(),
+                updated_at   timestamptz NOT NULL DEFAULT now()
+            )
+            """
+        )
+        # Partial unique indexes — separate namespaces for built-ins
+        # (user_id NULL) and user-owned. Postgres treats each NULL
+        # as distinct so a plain UNIQUE (user_id, name) won't enforce
+        # built-in name uniqueness.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uniq_context_profiles_global_name "
+            "ON context_profiles(name) WHERE user_id IS NULL"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uniq_context_profiles_user_name "
+            "ON context_profiles(user_id, name) WHERE user_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_context_profiles_user "
+            "ON context_profiles(user_id)"
+        )
+        conn.execute(
+            "ALTER TABLE sessions "
+            "ADD COLUMN IF NOT EXISTS context_profile_id uuid "
+            "REFERENCES context_profiles(id) ON DELETE SET NULL"
+        )
+
+        # Seed the built-in context-management presets (minimal,
+        # code_mode, long_chat, power_research, cheap_long). Idempotent:
+        # the seeder updates existing built-in rows so adding a field
+        # to a preset auto-deploys.
+        from context_profiles import seed_builtin_presets  # lazy import
+        seed_builtin_presets(conn)
 
     app.state.saver = saver
     app.state.pool = pool
@@ -429,6 +1088,20 @@ async def lifespan(app: FastAPI):
     # doesn't pay the create_agent cost. Other models are built lazily by
     # _get_agent on first use.
     _get_agent(DEFAULT_MODEL)
+
+    # Deno availability is informational at startup — only ts_code_mode
+    # turns will actually need it, and they fail loudly with a clear
+    # message if it's missing. Most setups don't use ts_code_mode.
+    deno_ver = _deno_health_check()
+    if deno_ver:
+        print(f"[startup] Deno OK ({deno_ver}) — ts_code_mode available.", flush=True)
+    else:
+        print(
+            f"[startup] Deno not found at {DENO_BIN!r}. "
+            f"ts_code_mode turns will error. Install Deno (`brew install deno`) "
+            f"to enable, or ignore this if you're staying on tool_calling.",
+            flush=True,
+        )
 
     # Workspace garbage collector — destroys expired, pauses idle.
     gc_task = asyncio.create_task(_workspace_gc_loop(app))
@@ -461,6 +1134,15 @@ app.add_middleware(
 # to avoid circular imports inside the router.
 from routes_mcp import router as mcp_router  # noqa: E402
 app.include_router(mcp_router)
+
+from routes_demo import router as demo_router  # noqa: E402
+app.include_router(demo_router)
+
+from routes_providers import router as providers_router  # noqa: E402
+app.include_router(providers_router)
+
+from routes_context_profiles import router as context_profiles_router  # noqa: E402
+app.include_router(context_profiles_router)
 
 
 def get_current_user(authorization: Optional[str] = Header(None)) -> str:
@@ -515,6 +1197,22 @@ def _verify_thread(conn, user_id: str, session_id: str, thread_id: str):
         raise HTTPException(404, "Thread not found")
 
 
+def _tool_content_to_text(content) -> str:
+    """Flatten a (possibly multimodal) tool result to text for the messages
+    table. When the visual method is on, a tool result is a list of blocks
+    (text REFERENCES + a base64 image); we keep the text and replace the image
+    with an ``[image]`` marker so base64 never bloats the DB / transcript. The
+    real image stays in the LangGraph checkpoint, which is what the model reads."""
+    if isinstance(content, str):
+        return content
+    try:
+        from context_editing import _flatten_content_for_text  # lazy
+
+        return _flatten_content_for_text(content)
+    except Exception:
+        return str(content)
+
+
 def _record_message(
     conn,
     session_id: str,
@@ -528,6 +1226,7 @@ def _record_message(
     input_tokens: int = 0,
     output_tokens: int = 0,
     thinking_tokens: int = 0,
+    cache_read_tokens: int = 0,
     langgraph_id: Optional[str] = None,
 ) -> int:
     row = conn.execute(
@@ -535,8 +1234,8 @@ def _record_message(
         INSERT INTO messages
             (session_id, thread_id, user_id, role, content, tool_name,
              tool_calls_json, tokens, input_tokens, output_tokens,
-             thinking_tokens, langgraph_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             thinking_tokens, cache_read_tokens, langgraph_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
@@ -551,6 +1250,7 @@ def _record_message(
             int(input_tokens or 0),
             int(output_tokens or 0),
             int(thinking_tokens or 0),
+            int(cache_read_tokens or 0),
             langgraph_id,
         ),
     ).fetchone()
@@ -628,7 +1328,24 @@ def _ai_token_breakdown(msg) -> Dict[str, int]:
     if not total and (input_ or output):
         total = input_ + output
 
-    return {"total": total, "input": input_, "output": output, "thinking": thinking}
+    # Image-recall caching: how much of `input` was served from the provider
+    # prompt cache (cache_read) vs written into it (cache_write). Zero when
+    # caching is off or the provider doesn't report it.
+    try:
+        from cache_layout import read_cache_tokens  # lazy
+
+        ct = read_cache_tokens(msg)
+    except Exception:
+        ct = {"cache_read": 0, "cache_write": 0}
+
+    return {
+        "total": total,
+        "input": input_,
+        "output": output,
+        "thinking": thinking,
+        "cache_read": ct["cache_read"],
+        "cache_write": ct["cache_write"],
+    }
 
 
 def _record_error_reply(
@@ -658,12 +1375,14 @@ def list_sessions(user_id: str = Depends(get_current_user)):
             """
             SELECT s.id, s.name, s.kind, s.mode, s.created_at,
                    s.github_owner, s.github_repo, s.github_branch,
+                   s.preferred_provider_id,
                    COALESCE(SUM(m.tokens), 0)::int AS tokens
             FROM sessions s
             LEFT JOIN messages m ON m.session_id = s.id
             WHERE s.user_id = %s
             GROUP BY s.id, s.name, s.kind, s.mode, s.created_at,
-                     s.github_owner, s.github_repo, s.github_branch
+                     s.github_owner, s.github_repo, s.github_branch,
+                     s.preferred_provider_id
             ORDER BY s.created_at DESC
             """,
             (user_id,),
@@ -678,14 +1397,23 @@ def list_sessions(user_id: str = Depends(get_current_user)):
             "github_owner": r[5],
             "github_repo": r[6],
             "github_branch": r[7],
-            "tokens": int(r[8] or 0),
+            "preferred_provider_id": str(r[8]) if r[8] else None,
+            "tokens": int(r[9] or 0),
         }
         for r in rows
     ]
 
 
 class UpdateSessionRequest(BaseModel):
-    mode: Optional[str] = None  # 'auto' | 'confirm'
+    mode: Optional[str] = None                     # 'auto' | 'confirm'
+    # Phase F: per-session provider override.
+    #   "<uuid>" — use this specific provider for chats in this session
+    #   ""       — clear the override (falls back to user default)
+    #   None     — leave unchanged
+    preferred_provider_id: Optional[str] = None
+    # PR #1: per-session context-management profile override. Same
+    # tri-state semantics as preferred_provider_id.
+    context_profile_id: Optional[str] = None
 
 
 @app.patch("/sessions/{session_id}")
@@ -694,7 +1422,8 @@ def update_session(
     req: UpdateSessionRequest,
     user_id: str = Depends(get_current_user),
 ):
-    """Partial-update a session. Currently supports `mode` only."""
+    """Partial-update a session. Supports `mode`, `preferred_provider_id`,
+    and `context_profile_id`."""
     if req.mode is not None and req.mode not in {"auto", "confirm"}:
         raise HTTPException(400, "mode must be 'auto' or 'confirm'")
 
@@ -705,7 +1434,50 @@ def update_session(
                 "UPDATE sessions SET mode = %s WHERE id = %s AND user_id = %s",
                 (req.mode, session_id, user_id),
             )
-    return {"ok": True, "mode": req.mode}
+        if req.preferred_provider_id is not None:
+            new_pid: Optional[str]
+            if req.preferred_provider_id == "":
+                new_pid = None  # clear override
+            else:
+                # Verify the provider belongs to this user before assigning.
+                owned = conn.execute(
+                    "SELECT 1 FROM llm_providers "
+                    "WHERE id = %s AND user_id = %s",
+                    (req.preferred_provider_id, user_id),
+                ).fetchone()
+                if not owned:
+                    raise HTTPException(404, "Provider not found.")
+                new_pid = req.preferred_provider_id
+            conn.execute(
+                "UPDATE sessions SET preferred_provider_id = %s "
+                "WHERE id = %s AND user_id = %s",
+                (new_pid, session_id, user_id),
+            )
+        if req.context_profile_id is not None:
+            new_cpid: Optional[str]
+            if req.context_profile_id == "":
+                new_cpid = None  # clear override
+            else:
+                # Profile must be a built-in (user_id NULL) or owned.
+                owned = conn.execute(
+                    "SELECT 1 FROM context_profiles "
+                    "WHERE id = %s AND (user_id = %s OR user_id IS NULL)",
+                    (req.context_profile_id, user_id),
+                ).fetchone()
+                if not owned:
+                    raise HTTPException(404, "Context profile not found.")
+                new_cpid = req.context_profile_id
+            conn.execute(
+                "UPDATE sessions SET context_profile_id = %s "
+                "WHERE id = %s AND user_id = %s",
+                (new_cpid, session_id, user_id),
+            )
+    return {
+        "ok": True,
+        "mode": req.mode,
+        "preferred_provider_id": req.preferred_provider_id,
+        "context_profile_id": req.context_profile_id,
+    }
 
 
 def _resolve_github_link(
@@ -1583,6 +2355,8 @@ def list_files(
         name = it.get("name")
         if not name or name in seen:
             continue
+        if name.startswith(".acmdiff."):
+            continue  # hidden diff sidecar written by write_project_file
         meta = it.get("metadata") or {}
         out.append(
             {
@@ -1686,6 +2460,30 @@ def read_file_content(
         "truncated": truncated,
         "content": content,
     }
+
+
+@app.get("/sessions/{session_id}/files/{filename}/diff")
+def read_file_diff(
+    session_id: str,
+    filename: str,
+    user_id: str = Depends(get_current_user),
+):
+    """Return the unified diff of the most recent write to an S3 (chat-session)
+    file, stored as a hidden ``.acmdiff.`` sidecar by write_project_file. Lets
+    the UI render a red/green diff for files that have no git commit. 404 when
+    no diff was recorded (e.g. the file was uploaded, never agent-written)."""
+    with app.state.pool.connection() as conn:
+        _verify_session(conn, user_id, session_id)
+    name = _safe_filename(filename)
+    try:
+        data = get_bucket().download(
+            file_key(user_id, session_id, f".acmdiff.{name}")
+        )
+    except Exception as e:
+        if is_not_found(e):
+            raise HTTPException(404, "No diff recorded for this file")
+        raise HTTPException(500, f"Download failed: {e}")
+    return {"diff": data.decode("utf-8", errors="replace")}
 
 
 @app.post("/title")
@@ -2079,12 +2877,164 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+# ── Context-management observability ──────────────────────────────────────
+#
+# Two helpers used by the /context endpoint and by future strategies
+# (tool-result trimming, summarisation, sliding window, sub-agent).
+#
+# `_compute_trajectory(message_rows)` turns the raw messages-table rows
+# into a per-turn token series the UI can plot as a sparkline. A "turn"
+# starts on a user message and includes every assistant / tool message
+# that follows until the next user message.
+#
+# `_record_context_event(...)` appends one row to context_events.
+# Strategies call this whenever they edit the in-flight message list
+# so the UI can show the user *which* technique fired and how much it
+# saved.
+
+
+def _compute_trajectory(message_rows: List[tuple]) -> List[Dict[str, Any]]:
+    """Group the SELECT rows of `messages` into per-turn token totals.
+
+    Expected row shape (matches the SELECT in get_context):
+      (id, role, content, tool_name, tool_calls_json,
+       tokens, input_tokens, output_tokens, thinking_tokens, langgraph_id)
+    """
+    turns: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+    for row in message_rows:
+        role = row[1]
+        content = row[2] or ""
+        recorded = int(row[5] or 0)
+        in_tok = int(row[6] or 0)
+        out_tok = int(row[7] or 0)
+        cache_read = int(row[10] or 0) if len(row) > 10 else 0
+        # Prefer the canonical `tokens` column when it's populated; fall
+        # back to the rough estimator when the message predates the
+        # token-recording columns or is a tool message that never had
+        # them written.
+        msg_tok = recorded if recorded > 0 else _estimate_tokens(content)
+        if role == "user":
+            # Push the previous turn, if any, before opening a new one.
+            if current is not None:
+                turns.append(current)
+            current = {
+                "turn": len(turns) + 1,
+                "input_tokens": msg_tok + in_tok,
+                "output_tokens": out_tok,
+                "cache_read_tokens": cache_read,
+                "messages": 1,
+            }
+        elif current is not None:
+            # Assistant or tool message — counts as output for the turn.
+            current["output_tokens"] += msg_tok + out_tok
+            current["cache_read_tokens"] = current.get("cache_read_tokens", 0) + cache_read
+            current["messages"] += 1
+        else:
+            # Edge case: leading non-user messages with no preceding
+            # user. Lump them into a turn-0 bucket so the UI still
+            # plots them rather than silently dropping.
+            current = {
+                "turn": 0,
+                "input_tokens": 0,
+                "output_tokens": msg_tok + out_tok,
+                "messages": 1,
+            }
+    if current is not None:
+        turns.append(current)
+    cumulative = 0
+    for t in turns:
+        t["turn_tokens"] = t["input_tokens"] + t["output_tokens"]
+        cumulative += t["turn_tokens"]
+        t["cumulative_tokens"] = cumulative
+    return turns
+
+
+def _record_context_event(
+    conn,
+    user_id: str,
+    session_id: str,
+    thread_id: str,
+    turn_index: int,
+    edit_type: str,
+    freed_tokens: int = 0,
+    details: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Append one row to `context_events`. Returns the new id.
+
+    `edit_type` is a free-form string. Conventional values shipped by
+    the strategies in CONTEXT_STRATEGIES_PLAN.md:
+      - "tool_result_trimming"
+      - "summarization"
+      - "sliding_window"
+      - "subagent_call"
+      - "memory_write" / "memory_read"
+
+    `details` is JSON-serialised and exposed to the UI verbatim — keep
+    it small and explanatory ("cleared 12 tool results", a summary
+    preview, the subagent's token totals, etc.).
+    """
+    row = conn.execute(
+        """
+        INSERT INTO context_events
+            (user_id, session_id, thread_id, turn_index, edit_type,
+             freed_tokens, details_json)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (
+            user_id,
+            session_id,
+            thread_id,
+            int(turn_index),
+            edit_type,
+            int(freed_tokens or 0),
+            json.dumps(details) if details else None,
+        ),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _list_context_events(
+    conn, user_id: str, session_id: str, thread_id: str
+) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT id, turn_index, edit_type, freed_tokens, details_json, created_at
+          FROM context_events
+         WHERE user_id = %s AND session_id = %s AND thread_id = %s
+         ORDER BY id ASC
+        """,
+        (user_id, session_id, thread_id),
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        details = r[4]
+        if isinstance(details, str):
+            try:
+                details = json.loads(details)
+            except Exception:
+                pass
+        out.append(
+            {
+                "id": int(r[0]),
+                "turn": int(r[1] or 0),
+                "type": r[2],
+                "freed_tokens": int(r[3] or 0),
+                "details": details,
+                "at": r[5].isoformat() if r[5] else None,
+            }
+        )
+    return out
+
+
 # Context window sizes for common models (in tokens). Used to compute %used.
 _MODEL_CONTEXT_LIMITS = {
     "meta-llama/llama-3.3-70b-instruct:free": 131072,
     "z-ai/glm-4.5-air:free": 131072,
     "qwen/qwen-2.5-72b-instruct:free": 131072,
     "google/gemini-2.0-flash-exp:free": 1048576,
+    "google/gemini-2.5-flash": 1048576,
     "openai/gpt-4o-mini": 128000,
     "anthropic/claude-haiku-4-5": 200000,
 }
@@ -2096,6 +3046,35 @@ def list_models(user_id: str = Depends(get_current_user)):
     Cached server-side for 10 minutes."""
     items = _fetch_free_models()
     return {"default": DEFAULT_MODEL, "models": items}
+
+
+@app.get("/context/strategies")
+def list_context_strategies(user_id: str = Depends(get_current_user)):
+    """Available context-management strategies + the current default.
+    Wire-compatible with a future UI selector; for now the strategy can
+    be overridden per request via ChatRequest.context_strategy.
+    """
+    strategies = [
+        {
+            "id": "tool_calling",
+            "label": "Tool Calling",
+            "summary": (
+                "Classic ReAct loop — every tool is a separate "
+                "LangChain tool, the model picks one per round."
+            ),
+        },
+        {
+            "id": "ts_code_mode",
+            "label": "TypeScript Code Mode",
+            "summary": (
+                "Compact catalog in the prompt; describe_tools fetches "
+                "TS interfaces on demand; execute_typescript runs one "
+                "program per turn in a Deno isolate. Saves tokens and "
+                "round-trips on multi-step tasks; needs Deno installed."
+            ),
+        },
+    ]
+    return {"default": DEFAULT_CONTEXT_STRATEGY, "strategies": strategies}
 
 
 @app.get("/sessions/{session_id}/threads/{thread_id}/context")
@@ -2113,16 +3092,22 @@ def get_context(
             """
             SELECT id, role, content, tool_name, tool_calls_json,
                    tokens, input_tokens, output_tokens, thinking_tokens,
-                   langgraph_id
+                   langgraph_id, cache_read_tokens
             FROM messages
             WHERE session_id = %s AND thread_id = %s AND user_id = %s
             ORDER BY id ASC
             """,
             (session_id, thread_id, user_id),
         ).fetchall()
+        applied_edits = _list_context_events(conn, user_id, session_id, thread_id)
+    trajectory = _compute_trajectory(rows)
 
     messages = []
-    total_tokens = 0
+    cache_read_total = 0
+    est_total = 0      # content-based fallback: each message counted ONCE
+    last_input = 0     # most recent model call's prompt size (whole context)
+    last_output = 0
+    last_cache_read = 0  # cache hit on that same most-recent call
     for row in rows:
         (
             row_id,
@@ -2135,20 +3120,40 @@ def get_context(
             output_tok,
             thinking_tok,
             langgraph_id,
+            cache_read_tok,
         ) = row
-        if recorded_tokens and recorded_tokens > 0:
-            tokens = int(recorded_tokens)
+        # Per-message OWN size for the fallback estimate — for an assistant
+        # turn that's its completion (output_tokens), NOT `recorded_tokens`
+        # (which is the whole-call total incl. the entire prior history;
+        # summing those is exactly what blew the meter past the 1M limit).
+        if role == "assistant" and output_tok and int(output_tok) > 0:
+            own = int(output_tok)
         else:
-            tokens = _estimate_tokens(content or "")
-        total_tokens += tokens
+            own = _estimate_tokens(content or "")
+        est_total += own
+        # Rows are ASC by id, so the last row with a real prompt count wins =
+        # the most recent model call's view of the full context.
+        if int(input_tok or 0) > 0:
+            last_input = int(input_tok)
+            last_output = int(output_tok or 0)
+            last_cache_read = int(cache_read_tok or 0)
+        cache_read_total += int(cache_read_tok or 0)
+        # Per-message display value left as recorded (back-compat with the
+        # message list); the meter total below no longer sums these.
+        disp = (
+            int(recorded_tokens)
+            if recorded_tokens and recorded_tokens > 0
+            else own
+        )
         m = {
             "id": int(row_id),
             "role": role,
             "content": content,
-            "tokens": tokens,
+            "tokens": disp,
             "input_tokens": int(input_tok or 0),
             "output_tokens": int(output_tok or 0),
             "thinking_tokens": int(thinking_tok or 0),
+            "cache_read_tokens": int(cache_read_tok or 0),
             "has_langgraph_id": bool(langgraph_id),
         }
         if tool_name:
@@ -2162,7 +3167,17 @@ def get_context(
         messages.append(m)
 
     sys_tokens = _estimate_tokens(SYSTEM_PROMPT)
-    total_tokens += sys_tokens
+
+    # Current context usage. A model call's `input_tokens` already counts the
+    # ENTIRE prompt (system + full history + any images) exactly as the
+    # provider tokenised it, so the truthful "tokens in the window right now"
+    # is the most recent call's input + its output. We must NOT sum the
+    # per-message `tokens` totals — each already includes all prior turns, so
+    # summing multiply-counts the history (that's the >1M-token bug).
+    if last_input > 0:
+        total_tokens = last_input + last_output  # sys already included here
+    else:
+        total_tokens = est_total + sys_tokens  # fresh thread, no usage yet
 
     # Files in the session's bucket folder.
     files: list[dict] = []
@@ -2193,8 +3208,19 @@ def get_context(
         else 0,
         "system_prompt": SYSTEM_PROMPT,
         "system_tokens": sys_tokens,
+        # Image-recall caching: prompt tokens served from cache on the most
+        # recent model call (0 when caching is off / unsupported). This is
+        # the cache hit for the *current* context — summing it across turns
+        # would multiply-count (each turn re-sends + re-caches the history),
+        # which is what produced the impossible ">100%" cache figure.
+        "cache_read_tokens": last_cache_read,
         "messages": messages,
         "files": files,
+        # PR #0 additions — empty until a strategy actually writes
+        # context_events rows, but the keys are stable so the UI can
+        # render the panels with "no edits yet" right away.
+        "trajectory": trajectory,
+        "applied_edits": applied_edits,
     }
 
 
@@ -2257,6 +3283,500 @@ def delete_message(
     return {"ok": True, "removed_from_state": removed_from_state}
 
 
+@app.get("/sessions/{session_id}/threads/{thread_id}/messages/{message_id}/images")
+def get_message_images(
+    session_id: str,
+    thread_id: str,
+    message_id: int,
+    model: Optional[str] = None,
+    user_id: str = Depends(get_current_user),
+):
+    """Return the visual-method page images for one tool-result message.
+
+    The rasterised PNGs live in the LangGraph checkpoint (in the messages
+    table they're flattened to an ``[image]`` marker). We map the display
+    row to its checkpoint message via ``langgraph_id`` and return each page
+    as a data URL the UI can drop straight into an ``<img>``.
+    """
+    with app.state.pool.connection() as conn:
+        _verify_thread(conn, user_id, session_id, thread_id)
+        row = conn.execute(
+            "SELECT langgraph_id, tool_name FROM messages "
+            "WHERE id = %s AND session_id = %s AND thread_id = %s AND user_id = %s",
+            (message_id, session_id, thread_id, user_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Message not found")
+    langgraph_id, tool_name = row
+    if not langgraph_id:
+        return {"images": [], "count": 0, "tool": tool_name}
+
+    try:
+        agent = _get_agent(model)
+        state = agent.get_state(
+            {
+                "configurable": {
+                    "thread_id": f"{user_id}:{session_id}",
+                    "user_id": user_id,
+                    "session_id": session_id,
+                }
+            }
+        )
+        messages = (state.values or {}).get("messages", []) or []
+    except Exception as e:
+        raise HTTPException(500, f"Could not read conversation state: {e}")
+
+    target = next(
+        (m for m in messages if getattr(m, "id", None) == langgraph_id), None
+    )
+    images: List[str] = []
+    content = getattr(target, "content", None) if target is not None else None
+    if isinstance(content, list):
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "image_url":
+                url = (b.get("image_url") or {}).get("url", "")
+                if url:
+                    images.append(url)
+            elif b.get("type") == "image":
+                src = b.get("source") or {}
+                if src.get("type") == "base64" and src.get("data"):
+                    mt = src.get("media_type", "image/png")
+                    images.append(f"data:{mt};base64,{src['data']}")
+    return {"images": images, "count": len(images), "tool": tool_name}
+
+
+# ─── relevance pruning (task-aware removal suggestions) ──────────────────
+
+
+def _thread_lc_messages(conn, user_id: str, session_id: str, thread_id: str):
+    """Load a thread's messages as ``List[BaseMessage]`` for the relevance
+    engine, plus a parallel ``meta`` list (``{db_id, langgraph_id, role}``) so an
+    episode's member indices map back onto rows the delete path can remove."""
+    rows = conn.execute(
+        """
+        SELECT id, role, content, tool_name, tool_calls_json, langgraph_id
+          FROM messages
+         WHERE session_id = %s AND thread_id = %s AND user_id = %s
+         ORDER BY id ASC
+        """,
+        (session_id, thread_id, user_id),
+    ).fetchall()
+    lc: List[Any] = []
+    meta: List[Dict[str, Any]] = []
+    for row_id, role, content, tool_name, _tool_calls_json, langgraph_id in rows:
+        text = content or ""
+        r = (role or "").lower()
+        # Relevance only reads message *text* + role; tool_call structures aren't
+        # needed for segmentation/judging, so we never reconstruct them (the
+        # DB's tool_calls_json isn't in LangChain's {name,args,id} shape and
+        # would fail AIMessage validation).
+        if r in ("assistant", "ai"):
+            msg: Any = AIMessage(content=text)
+        elif r == "tool":
+            msg = ToolMessage(content=text, tool_call_id="", name=tool_name or None)
+        elif r == "system":
+            msg = SystemMessage(content=text)
+        else:
+            msg = HumanMessage(content=text)
+        lc.append(msg)
+        meta.append({"db_id": int(row_id), "langgraph_id": langgraph_id, "role": r})
+    return lc, meta
+
+
+def _resolve_relevance_cfg(conn, user_id: str, session_id: str):
+    """Resolved relevance_pruning config for this thread (or schema defaults)."""
+    from context_profiles import resolve_profile  # lazy
+
+    try:
+        profile, _name = resolve_profile(
+            conn, user_id=user_id, session_id=session_id
+        )
+        return getattr(profile.context_management, "relevance_pruning", None)
+    except Exception as e:
+        print(f"[relevance] profile resolve failed: {e!r}", flush=True)
+        return None
+
+
+@app.post("/sessions/{session_id}/threads/{thread_id}/relevance/suggest")
+def relevance_suggest(
+    session_id: str,
+    thread_id: str,
+    model: Optional[str] = None,
+    user_id: str = Depends(get_current_user),
+):
+    """Audit this thread and return per-episode KEEP/SUMMARIZE/DROP suggestions.
+    Suggest-only — nothing is removed. Each suggestion lists ``member_ids`` (DB
+    message ids) so the UI can drop a whole episode via /relevance/apply."""
+    from relevance import suggest_removals  # lazy
+
+    with app.state.pool.connection() as conn:
+        _verify_thread(conn, user_id, session_id, thread_id)
+        lc, meta = _thread_lc_messages(conn, user_id, session_id, thread_id)
+        cfg = _resolve_relevance_cfg(conn, user_id, session_id)
+    if not lc:
+        return {"thread_id": thread_id, "suggestions": [], "info": {}}
+
+    keep_recent = int(getattr(cfg, "keep_recent", 3) if cfg else 3)
+    mode = str(getattr(cfg, "mode", "judge") if cfg else "judge")
+    arbitration = str(getattr(cfg, "arbitration", "safest") if cfg else "safest")
+    drop_t = float(getattr(cfg, "drop_threshold", 0.35) if cfg else 0.35)
+    summ_t = float(getattr(cfg, "summarize_threshold", 0.6) if cfg else 0.6)
+
+    need_judge = mode in ("judge", "ensemble")
+    need_encoder = mode in ("encoder", "ensemble")
+
+    judge = None
+    if need_judge:
+        slug = (getattr(cfg, "judge_model", None) if cfg else None) or model or DEFAULT_MODEL
+        try:
+            judge = _build_model(slug)
+        except Exception as e:
+            print(f"[relevance] judge model {slug!r} failed: {e!r}", flush=True)
+            if mode == "judge":
+                raise HTTPException(502, f"judge model unavailable: {e}")
+
+    encoder = None
+    if need_encoder:
+        try:
+            from relevance_encoder import EncoderSuggester  # lazy (heavy deps)
+
+            path = (getattr(cfg, "encoder_path", None) if cfg else None) or os.getenv(
+                "ACM_ENCODER_PATH"
+            )
+            encoder = EncoderSuggester(
+                path or None, drop_threshold=drop_t, summarize_threshold=summ_t
+            )
+        except Exception as e:
+            print(f"[relevance] encoder init failed: {e!r}", flush=True)
+            if mode == "encoder":
+                raise HTTPException(502, f"encoder unavailable: {e}")
+
+    suggestions, info, episodes = suggest_removals(
+        lc,
+        keep_recent=keep_recent,
+        mode=mode,
+        arbitration=arbitration,
+        judge_client=judge,
+        encoder=encoder,
+        return_episodes=True,
+    )
+    # Capture features (task + episode text + model label) for the training
+    # loop, unless the profile turned logging off.
+    if getattr(cfg, "feedback_logging", True):
+        try:
+            from relevance import active_task, build_audit_rows, record_audit  # lazy
+
+            record_audit(
+                build_audit_rows(
+                    episodes,
+                    suggestions,
+                    task=active_task(lc),
+                    conv=thread_id,
+                    surface="website",
+                )
+            )
+        except Exception as e:
+            print(f"[relevance] audit log failed: {e!r}", flush=True)
+    out: List[Dict[str, Any]] = []
+    for s in suggestions:
+        members = [meta[i] for i in s.member_indices if 0 <= i < len(meta)]
+        out.append(
+            {
+                **s.to_dict(),
+                "member_ids": [m["db_id"] for m in members],
+                "removable_from_state": any(m["langgraph_id"] for m in members),
+            }
+        )
+    return {"thread_id": thread_id, "suggestions": out, "info": info}
+
+
+class RelevanceApplyRequest(BaseModel):
+    message_ids: List[int]
+    episode_id: Optional[str] = None
+    label: Optional[str] = None
+    score: Optional[float] = None
+    source: Optional[str] = None
+    title: Optional[str] = None
+    freed_tokens: Optional[int] = 0
+    model: Optional[str] = None
+
+
+@app.post("/sessions/{session_id}/threads/{thread_id}/relevance/apply")
+def relevance_apply(
+    session_id: str,
+    thread_id: str,
+    req: RelevanceApplyRequest,
+    user_id: str = Depends(get_current_user),
+):
+    """Remove an accepted episode: delete its message rows + RemoveMessage them
+    from the agent state, log a context_event, and record the choice as
+    feedback for the training loop."""
+    from relevance import record_feedback  # lazy
+
+    removed = 0
+    state_removed = 0
+    lg_ids: List[str] = []
+    with app.state.pool.connection() as conn:
+        _verify_thread(conn, user_id, session_id, thread_id)
+        for mid in req.message_ids:
+            row = conn.execute(
+                "SELECT langgraph_id FROM messages "
+                "WHERE id = %s AND session_id = %s AND thread_id = %s AND user_id = %s",
+                (mid, session_id, thread_id, user_id),
+            ).fetchone()
+            if not row:
+                continue
+            if row[0]:
+                lg_ids.append(row[0])
+            conn.execute("DELETE FROM messages WHERE id = %s", (mid,))
+            removed += 1
+        _record_context_event(
+            conn,
+            user_id,
+            session_id,
+            thread_id,
+            turn_index=0,
+            edit_type="relevance_pruning",
+            freed_tokens=int(req.freed_tokens or 0),
+            details={
+                "episode_id": req.episode_id,
+                "label": req.label,
+                "source": req.source,
+                "removed": removed,
+                "title": (req.title or "")[:120],
+            },
+        )
+
+    if lg_ids:
+        try:
+            agent = _get_agent(req.model)
+            agent.update_state(
+                {
+                    "configurable": {
+                        "thread_id": f"{user_id}:{session_id}",
+                        "user_id": user_id,
+                        "session_id": session_id,
+                    }
+                },
+                {"messages": [RemoveMessage(id=i) for i in lg_ids]},
+            )
+            state_removed = len(lg_ids)
+        except Exception as e:
+            print(f"[relevance_apply] update_state failed: {e!r}", flush=True)
+
+    try:
+        record_feedback(
+            {
+                "surface": "website",
+                "user_id": user_id,
+                "session_id": session_id,
+                "thread_id": thread_id,
+                "episode_id": req.episode_id,
+                "title": req.title,
+                "shown_label": req.label,
+                "user_action": "accept_drop",
+                "final_label": req.label,
+                "score": req.score,
+                "source": req.source,
+                "tokens": req.freed_tokens,
+            }
+        )
+    except Exception as e:
+        print(f"[relevance_apply] feedback log failed: {e!r}", flush=True)
+
+    return {"ok": True, "removed": removed, "removed_from_state": state_removed}
+
+
+class RelevanceSummarizeRequest(BaseModel):
+    message_ids: List[int]
+    episode_id: Optional[str] = None
+    title: Optional[str] = None
+    score: Optional[float] = None
+    source: Optional[str] = None
+    freed_tokens: Optional[int] = 0
+    model: Optional[str] = None
+
+
+@app.post("/sessions/{session_id}/threads/{thread_id}/relevance/summarize")
+def relevance_summarize(
+    session_id: str,
+    thread_id: str,
+    req: RelevanceSummarizeRequest,
+    user_id: str = Depends(get_current_user),
+):
+    """Replace an episode's messages with a short LLM summary — saves tokens
+    while keeping the gist (unlike Remove, which drops it entirely). Summarises
+    the episode, deletes the originals (DB + checkpoint), and inserts one
+    summary message in their place."""
+    import uuid as _uuid
+
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+    # 1. Load the episode's messages in chronological order.
+    with app.state.pool.connection() as conn:
+        _verify_thread(conn, user_id, session_id, thread_id)
+        rows = conn.execute(
+            "SELECT id, role, content, tool_name, langgraph_id FROM messages "
+            "WHERE id = ANY(%s) AND session_id = %s AND thread_id = %s "
+            "AND user_id = %s ORDER BY id ASC",
+            (list(req.message_ids), session_id, thread_id, user_id),
+        ).fetchall()
+    if not rows:
+        raise HTTPException(404, "No messages found for this episode.")
+
+    transcript = "\n".join(
+        f"[{(tool_name or role or 'msg')}] {(content or '')[:2000]}"
+        for _id, role, content, tool_name, _lg in rows
+    )[:12000]
+
+    # 2. Summarise via the active chat model.
+    try:
+        chat_model, _ = _resolve_chat_model(req.model, user_id, session_id)
+        sys = (
+            "Summarise this finished portion of an agent conversation in 2-4 "
+            "sentences. Keep concrete results, decisions, file names and "
+            "identifiers; drop verbose tool output. Output only the summary."
+        )
+        resp = chat_model.invoke(
+            [SystemMessage(content=sys), HumanMessage(content=transcript)]
+        )
+        summary = getattr(resp, "content", "") or ""
+        if isinstance(summary, list):
+            summary = _tool_content_to_text(summary)
+        summary = summary.strip()
+    except Exception as e:
+        raise HTTPException(500, f"Summarisation failed: {e}")
+    if not summary:
+        raise HTTPException(500, "Summariser returned empty text.")
+
+    title = (req.title or "earlier step").strip()
+    summary_text = f"[Summary of earlier step — {title}]\n{summary}"
+    new_lg_id = f"acm-summary-{_uuid.uuid4().hex[:16]}"
+
+    # 3. Delete originals from the DB + insert the summary row.
+    lg_ids: List[str] = []
+    removed = 0
+    with app.state.pool.connection() as conn:
+        for _id, role, content, tool_name, lg in rows:
+            if lg:
+                lg_ids.append(lg)
+            conn.execute("DELETE FROM messages WHERE id = %s", (_id,))
+            removed += 1
+        _record_message(
+            conn,
+            session_id,
+            thread_id,
+            user_id,
+            "assistant",
+            summary_text,
+            tokens=_estimate_tokens(summary_text),
+            langgraph_id=new_lg_id,
+        )
+        _record_context_event(
+            conn,
+            user_id,
+            session_id,
+            thread_id,
+            turn_index=0,
+            edit_type="relevance_summarize",
+            freed_tokens=int(req.freed_tokens or 0),
+            details={
+                "episode_id": req.episode_id,
+                "title": title[:120],
+                "removed": removed,
+            },
+        )
+
+    # 4. Mirror to the checkpoint: drop originals, add the summary so the
+    #    model actually sees fewer tokens next turn.
+    state_removed = 0
+    try:
+        agent = _get_agent(req.model)
+        cfg = {
+            "configurable": {
+                "thread_id": f"{user_id}:{session_id}",
+                "user_id": user_id,
+                "session_id": session_id,
+            }
+        }
+        updates: List[Any] = [RemoveMessage(id=i) for i in lg_ids]
+        updates.append(AIMessage(content=summary_text, id=new_lg_id))
+        agent.update_state(cfg, {"messages": updates})
+        state_removed = len(lg_ids)
+    except Exception as e:
+        print(f"[relevance_summarize] update_state failed: {e!r}", flush=True)
+
+    try:
+        from relevance import record_feedback  # lazy
+
+        record_feedback(
+            {
+                "surface": "website",
+                "user_id": user_id,
+                "session_id": session_id,
+                "thread_id": thread_id,
+                "episode_id": req.episode_id,
+                "title": req.title,
+                "shown_label": "SUMMARIZE",
+                "user_action": "accept_summarize",
+                "final_label": "SUMMARIZE",
+                "score": req.score,
+                "source": req.source,
+                "tokens": req.freed_tokens,
+            }
+        )
+    except Exception as e:
+        print(f"[relevance_summarize] feedback log failed: {e!r}", flush=True)
+
+    return {
+        "ok": True,
+        "removed": removed,
+        "removed_from_state": state_removed,
+        "summary": summary_text,
+    }
+
+
+class RelevanceFeedbackRequest(BaseModel):
+    episode_id: Optional[str] = None
+    title: Optional[str] = None
+    shown_label: Optional[str] = None
+    user_action: Optional[str] = None
+    final_label: Optional[str] = None
+    score: Optional[float] = None
+    source: Optional[str] = None
+    tokens: Optional[int] = 0
+
+
+@app.post("/sessions/{session_id}/threads/{thread_id}/relevance/feedback")
+def relevance_feedback(
+    session_id: str,
+    thread_id: str,
+    req: RelevanceFeedbackRequest,
+    user_id: str = Depends(get_current_user),
+):
+    """Log a non-removal decision (reject/keep/edit) so the training loop sees
+    the negative examples too, not just accepted drops."""
+    from relevance import record_feedback  # lazy
+
+    with app.state.pool.connection() as conn:
+        _verify_thread(conn, user_id, session_id, thread_id)
+    try:
+        record_feedback(
+            {
+                "surface": "website",
+                "user_id": user_id,
+                "session_id": session_id,
+                "thread_id": thread_id,
+                **req.model_dump(),
+            }
+        )
+    except Exception as e:
+        raise HTTPException(500, f"feedback log failed: {e}")
+    return {"ok": True}
+
+
 @app.post("/chat")
 def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
     import traceback
@@ -2267,7 +3787,29 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
     clear_cancel(req.thread_id)
 
     try:
-        agent = _get_agent_for_request(req.model, user_id)
+        # Resolve which context-management profile applies to this turn.
+        # Order: one-off body > saved id > legacy strategy > session
+        # override > user default > built-in `minimal`.
+        from context_profiles import resolve_profile  # lazy
+
+        with app.state.pool.connection() as _conn:
+            _profile, _profile_name = resolve_profile(
+                _conn,
+                user_id=user_id,
+                session_id=req.session_id,
+                request_profile_id=req.context_profile_id,
+                request_profile_body=req.context_profile,
+                legacy_strategy=req.context_strategy,
+            )
+        agent = _get_agent_for_request(
+            req.model,
+            user_id,
+            session_id=req.session_id,
+            profile=_profile,
+        )
+        _note_visual_method_skip(
+            _profile, req.model, user_id, req.session_id, req.thread_id
+        )
 
         # Project sessions get a sandboxed workspace; chat-only sessions don't.
         # The lazy-create returns an existing workspace if there is one (auto-
@@ -2319,6 +3861,60 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
             ],
             "configurable": configurable,
         }
+
+        # PR #3: context-editing pass. Runs every enabled technique on
+        # the in-flight message list before agent.ainvoke. PR #3 ships
+        # tool_result_trimming; PRs #5/#6 will add summarisation +
+        # sliding window inside the same orchestrator.
+        try:
+            from context_editing import apply_context_edits  # lazy
+
+            def _log_edit(edit_type, turn_index, freed_tokens, details):
+                with app.state.pool.connection() as _ec:
+                    _record_context_event(
+                        _ec,
+                        user_id=user_id,
+                        session_id=req.session_id,
+                        thread_id=req.thread_id,
+                        turn_index=turn_index,
+                        edit_type=edit_type,
+                        freed_tokens=freed_tokens,
+                        details=details,
+                    )
+
+            # Re-resolve the active chat model so the summariser step
+            # (PR #5) has something to call. _resolve_chat_model is LRU-
+            # cached, so the second call this turn is free.
+            try:
+                _chat_model, _ = _resolve_chat_model(
+                    req.model, user_id, req.session_id
+                )
+            except Exception:
+                _chat_model = None
+            apply_context_edits(
+                agent, config, _profile,
+                chat_model=_chat_model,
+                record_event=_log_edit,
+                estimator=_estimate_tokens,
+            )
+            # Safety net: if the active model can't read images, drop any
+            # image blocks left in the thread so a leftover visual-method
+            # result can't 404 the turn ("no endpoints support image input").
+            if _chat_model is not None and not _model_supports_vision(
+                _model_id_of(_chat_model)
+            ):
+                from context_editing import sanitize_images_for_text_model
+
+                n = sanitize_images_for_text_model(agent, config)
+                if n:
+                    print(
+                        f"[/chat] stripped {n} image block(s) for text-only "
+                        f"model {_model_id_of(_chat_model)!r}",
+                        flush=True,
+                    )
+        except Exception as _e:
+            # Edits are best-effort — never block the user's turn.
+            print(f"[/chat] context_editing failed: {_e!r}", flush=True)
 
         # Record the user's message in DB *before* invoking the agent. That
         # way it survives in chat history even if the model crashes mid-turn.
@@ -2454,6 +4050,7 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
                                 input_tokens=breakdown["input"],
                                 output_tokens=breakdown["output"],
                                 thinking_tokens=breakdown["thinking"],
+                                cache_read_tokens=breakdown.get("cache_read", 0),
                                 langgraph_id=msg_id,
                             )
                         if content:
@@ -2465,7 +4062,7 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
                             req.thread_id,
                             user_id,
                             "tool",
-                            str(msg.content),
+                            _tool_content_to_text(msg.content),
                             tool_name=getattr(msg, "name", ""),
                             langgraph_id=msg_id,
                         )
@@ -2571,6 +4168,9 @@ class ResumeChatRequest(BaseModel):
     approved: bool
     reason: Optional[str] = None
     model: Optional[str] = None
+    context_strategy: Optional[str] = None
+    context_profile_id: Optional[str] = None
+    context_profile: Optional[Dict[str, Any]] = None
 
 
 class CancelChatRequest(BaseModel):
@@ -2650,7 +4250,29 @@ def chat_resume(req: ResumeChatRequest, user_id: str = Depends(get_current_user)
     clear_cancel(req.thread_id)
 
     try:
-        agent = _get_agent_for_request(req.model, user_id)
+        # Resolve which context-management profile applies to this turn.
+        # Order: one-off body > saved id > legacy strategy > session
+        # override > user default > built-in `minimal`.
+        from context_profiles import resolve_profile  # lazy
+
+        with app.state.pool.connection() as _conn:
+            _profile, _profile_name = resolve_profile(
+                _conn,
+                user_id=user_id,
+                session_id=req.session_id,
+                request_profile_id=req.context_profile_id,
+                request_profile_body=req.context_profile,
+                legacy_strategy=req.context_strategy,
+            )
+        agent = _get_agent_for_request(
+            req.model,
+            user_id,
+            session_id=req.session_id,
+            profile=_profile,
+        )
+        _note_visual_method_skip(
+            _profile, req.model, user_id, req.session_id, req.thread_id
+        )
 
         # Recover session mode + workspace state to rebuild the same config.
         workspace_ref: Optional[str] = None
@@ -2694,6 +4316,51 @@ def chat_resume(req: ResumeChatRequest, user_id: str = Depends(get_current_user)
             "configurable": configurable,
         }
 
+        # PR #3: same context-editing pass as /chat. The user might have
+        # spent several turns under this conversation since the last
+        # resume, so a long-running approval flow still benefits.
+        try:
+            from context_editing import apply_context_edits  # lazy
+
+            def _log_edit(edit_type, turn_index, freed_tokens, details):
+                with app.state.pool.connection() as _ec:
+                    _record_context_event(
+                        _ec,
+                        user_id=user_id,
+                        session_id=req.session_id,
+                        thread_id=req.thread_id,
+                        turn_index=turn_index,
+                        edit_type=edit_type,
+                        freed_tokens=freed_tokens,
+                        details=details,
+                    )
+
+            # Re-resolve the active chat model so the summariser step
+            # (PR #5) has something to call. _resolve_chat_model is LRU-
+            # cached, so the second call this turn is free.
+            try:
+                _chat_model, _ = _resolve_chat_model(
+                    req.model, user_id, req.session_id
+                )
+            except Exception:
+                _chat_model = None
+            apply_context_edits(
+                agent, config, _profile,
+                chat_model=_chat_model,
+                record_event=_log_edit,
+                estimator=_estimate_tokens,
+            )
+            # Safety net: strip leftover image blocks for a text-only model
+            # (see /chat for the rationale).
+            if _chat_model is not None and not _model_supports_vision(
+                _model_id_of(_chat_model)
+            ):
+                from context_editing import sanitize_images_for_text_model
+
+                sanitize_images_for_text_model(agent, config)
+        except Exception as _e:
+            print(f"[/chat/resume] context_editing failed: {_e!r}", flush=True)
+
         pre_state = agent.get_state(config)
         pre_count = len(
             (pre_state.values or {}).get("messages", []) if pre_state else []
@@ -2732,6 +4399,7 @@ def chat_resume(req: ResumeChatRequest, user_id: str = Depends(get_current_user)
                             tool_calls.append({"name": tc["name"], "args": tc["args"]})
                         content = msg.content or ""
                         if content or tool_calls:
+                            _bd = _ai_token_breakdown(msg)
                             _record_message(
                                 conn,
                                 req.session_id,
@@ -2740,7 +4408,11 @@ def chat_resume(req: ResumeChatRequest, user_id: str = Depends(get_current_user)
                                 "assistant",
                                 content,
                                 tool_calls=tool_calls or None,
-                                tokens=_ai_token_breakdown(msg).get("total", 0),
+                                tokens=_bd.get("total", 0),
+                                input_tokens=_bd.get("input", 0),
+                                output_tokens=_bd.get("output", 0),
+                                thinking_tokens=_bd.get("thinking", 0),
+                                cache_read_tokens=_bd.get("cache_read", 0),
                                 langgraph_id=getattr(msg, "id", None),
                             )
                         if content:
@@ -2752,7 +4424,7 @@ def chat_resume(req: ResumeChatRequest, user_id: str = Depends(get_current_user)
                             req.thread_id,
                             user_id,
                             "tool",
-                            str(msg.content),
+                            _tool_content_to_text(msg.content),
                             tool_name=getattr(msg, "name", ""),
                             langgraph_id=getattr(msg, "id", None),
                         )

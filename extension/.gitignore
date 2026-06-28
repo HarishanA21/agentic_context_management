@@ -1,0 +1,10 @@
+# Python build artifacts
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+.venv/
+
+# Local config copy (user edits; example is shipped)
+config/acm.config.json
