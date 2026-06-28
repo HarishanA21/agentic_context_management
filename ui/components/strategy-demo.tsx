@@ -118,6 +118,7 @@ const VISUAL_SAMPLE_PROMPTS = [
 type TabId = 'current_methods' | 'visual_compression'
 
 type ModelInfo = { id: string; name: string; context_length: number }
+type ProviderInfo = { id: string; label: string; model_id: string; is_default: boolean }
 
 export function StrategyDemoPanel() {
   const [tab, setTab] = useState<TabId>('current_methods')
@@ -126,13 +127,15 @@ export function StrategyDemoPanel() {
   const [error, setError] = useState<string | null>(null)
   const [response, setResponse] = useState<CompareResponse | null>(null)
   const samplePrompts = tab === 'visual_compression' ? VISUAL_SAMPLE_PROMPTS : SAMPLE_PROMPTS
-  // Model picker — fetched from /api/models on mount. Selection
-  // persists in localStorage under the same `selected_model` key the
-  // main chat uses, so the demo defaults to whatever the user last
-  // chose elsewhere.
+  // Unified model + provider picker — fetched from /api/models and
+  // /api/providers on mount. `selectedModel` persists in localStorage under
+  // the same `selected_model` key the main chat uses; `pickerValue` is the
+  // combined "provider:<id>" or "model:<id>" selection.
   const [models, setModels] = useState<ModelInfo[]>([])
   const [defaultModel, setDefaultModel] = useState<string>('')
   const [selectedModel, setSelectedModel] = useState<string>('')
+  const [providers, setProviders] = useState<ProviderInfo[]>([])
+  const [pickerValue, setPickerValue] = useState<string>('')
   const [activeModal, setActiveModal] = useState<{ type: 'context' | 'judge'; colIdx: number } | null>(null)
   // Tab 2 runs its 10 columns in batches of 2 (to dodge provider rate
   // limits). Columns land here by index as each batch returns, so the UI
@@ -145,23 +148,41 @@ export function StrategyDemoPanel() {
     let cancelled = false
     ;(async () => {
       try {
-        const r = await authFetch('/api/models')
-        if (!r.ok) return
-        const data = await r.json()
+        const [mRes, pRes] = await Promise.all([
+          authFetch('/api/models'),
+          authFetch('/api/providers'),
+        ])
         if (cancelled) return
-        const list: ModelInfo[] = Array.isArray(data?.models) ? data.models : []
-        setModels(list)
-        setDefaultModel(data?.default || list[0]?.id || '')
-        const saved =
-          typeof window !== 'undefined'
-            ? localStorage.getItem('selected_model') || ''
-            : ''
-        const initial =
-          (saved && list.some((m) => m.id === saved) && saved) ||
-          data?.default ||
-          list[0]?.id ||
-          ''
-        setSelectedModel(initial)
+
+        // Models
+        if (mRes.ok) {
+          const data = await mRes.json()
+          const list: ModelInfo[] = Array.isArray(data?.models) ? data.models : []
+          setModels(list)
+          setDefaultModel(data?.default || list[0]?.id || '')
+          const saved =
+            typeof window !== 'undefined'
+              ? localStorage.getItem('selected_model') || ''
+              : ''
+          const initial =
+            (saved && list.some((m) => m.id === saved) && saved) ||
+            data?.default ||
+            list[0]?.id ||
+            ''
+          setSelectedModel(initial)
+          // Default picker to first provider if any, otherwise first model
+          setPickerValue((prev) => prev || (initial ? `model:${initial}` : ''))
+        }
+
+        // Providers
+        if (pRes.ok) {
+          const pData = await pRes.json()
+          const pList: ProviderInfo[] = Array.isArray(pData) ? pData : []
+          setProviders(pList)
+          // If there is a default provider, pre-select it
+          const def = pList.find((p) => p.is_default)
+          if (def) setPickerValue(`provider:${def.id}`)
+        }
       } catch {
         // Non-critical — the picker stays empty and the backend default wins.
       }
@@ -180,12 +201,20 @@ export function StrategyDemoPanel() {
       if (tab === 'visual_compression') {
         await runVisualStream()
       } else {
+        // Resolve the active model/provider from the combined picker value.
+        const activeModel = pickerValue.startsWith('model:')
+          ? pickerValue.slice('model:'.length)
+          : selectedModel || undefined
+        const activeProviderId = pickerValue.startsWith('provider:')
+          ? pickerValue.slice('provider:'.length)
+          : undefined
         const r = await authFetch('/api/demo/compare', {
           method: 'POST',
           body: JSON.stringify({
             prompt: prompt.trim(),
             strategies: ['tool_calling', 'ts_code_mode'],
-            model: selectedModel || undefined,
+            model: activeModel,
+            provider_id: activeProviderId,
           }),
         })
         if (!r.ok) {
@@ -381,29 +410,49 @@ export function StrategyDemoPanel() {
                 ))}
               </div>
               <div className="flex items-center gap-2">
-                {models.length > 0 ? (
-                  <div className="chip flex items-center gap-2 pr-1">
+                {(providers.length > 0 || models.length > 0) ? (
+                  <div className="chip flex items-center gap-2 pr-1" title="Select provider or model for comparison">
                     <span className="dot bg-emerald-400" />
                     <select
-                      value={selectedModel}
+                      value={pickerValue}
                       disabled={running}
                       onChange={(e) => {
-                        const v = e.target.value
-                        setSelectedModel(v)
-                        if (typeof window !== 'undefined') {
-                          localStorage.setItem('selected_model', v)
+                        const raw = e.target.value
+                        setPickerValue(raw)
+                        if (raw.startsWith('model:')) {
+                          const mid = raw.slice('model:'.length)
+                          setSelectedModel(mid)
+                          if (typeof window !== 'undefined') {
+                            localStorage.setItem('selected_model', mid)
+                          }
                         }
                       }}
-                      className="bg-transparent text-xs text-fog-50 outline-none max-w-[16rem] truncate disabled:opacity-50"
-                      title="Model used for both strategies in the comparison"
+                      className="bg-transparent text-xs text-fog-50 outline-none max-w-[22rem] truncate disabled:opacity-50"
                     >
+                      {/* ── Configured providers at top ── */}
+                      {providers.length > 0 && (
+                        <optgroup label="Your Providers">
+                          {providers.map((p) => (
+                            <option
+                              key={`provider:${p.id}`}
+                              value={`provider:${p.id}`}
+                              className="bg-ink-200 text-fog-50"
+                            >
+                              {p.is_default ? '★ ' : ''}{p.label} · {p.model_id}
+                            </option>
+                          ))}
+                        </optgroup>
+                      )}
+                      {/* ── OpenRouter models below, grouped Primary / Other.
+                           `model:`-prefixed so they round-trip through the
+                           shared picker onChange (which also handles `provider:`). ── */}
                       {(() => {
                         const primary = PRIMARY_MODEL_IDS
                           .map((id) => models.find((m) => m.id === id))
                           .filter(Boolean) as ModelInfo[]
                         const rest = models.filter((m) => !PRIMARY_MODEL_IDS.includes(m.id))
                         const opt = (m: ModelInfo) => (
-                          <option key={m.id} value={m.id} className="bg-ink-200 text-fog-50">
+                          <option key={`model:${m.id}`} value={`model:${m.id}`} className="bg-ink-200 text-fog-50">
                             {m.name.replace(/\s*\(free\)\s*$/i, '')}
                           </option>
                         )

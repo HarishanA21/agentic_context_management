@@ -8,6 +8,11 @@ import remarkGfm from 'remark-gfm'
 import { supabase, authFetch, authToken } from '@/lib/supabase'
 import { useTheme } from '@/lib/theme'
 import { MCPInventoryPanel } from '@/components/mcp-inventory'
+import {
+  SkillsInventoryPanel,
+  SkillsComposerFlyout,
+} from '@/components/skills-inventory'
+import { PluginsInventoryPanel } from '@/components/plugins-inventory'
 import { StrategyDemoPanel } from '@/components/strategy-demo'
 import { ContextProfilesPanel } from '@/components/context-profiles'
 import { RelevanceCleanupSection } from '@/components/relevance-cleanup'
@@ -250,6 +255,8 @@ export default function AppPage() {
   const [demoOpen, setDemoOpen] = useState(false)
   // PR #8: context-profile manager panel. Opens in-place like MCPs/Demo.
   const [contextProfilesOpen, setContextProfilesOpen] = useState(false)
+  // Skills manage panel — swaps into the main pane like MCPs/Demo.
+  const [skillsOpen, setSkillsOpen] = useState(false)
   const [projectModalOpen, setProjectModalOpen] = useState(false)
 
   // Per-row "⋯" menu — keyed by `${kind}:${id}` so chats and threads don't collide
@@ -325,6 +332,18 @@ export default function AppPage() {
   const [liveTokens, setLiveTokens] = useState('')
   // Composer "+" attach menu
   const [composerMenuOpen, setComposerMenuOpen] = useState(false)
+  // Skills quick-toggle flyout that opens to the side of the composer "+" menu.
+  const [skillsFlyoutOpen, setSkillsFlyoutOpen] = useState(false)
+  // "/" slash-menu: pick a skill to force-activate it for the next message.
+  const [slashMenuOpen, setSlashMenuOpen] = useState(false)
+  const [slashIndex, setSlashIndex] = useState(0)
+  const [skillList, setSkillList] = useState<
+    { name: string; description: string }[]
+  >([])
+  // Skills the user activated via "/" for the next message (names).
+  const [triggeredSkills, setTriggeredSkills] = useState<string[]>([])
+  // Plugins manage page — swaps into the main pane like Skills/MCPs.
+  const [pluginsOpen, setPluginsOpen] = useState(false)
   const [uploading, setUploading] = useState(false)
   // Model picker
   const [models, setModels] = useState<
@@ -393,6 +412,7 @@ export default function AppPage() {
       loadStrategies()
       loadProfiles()
       loadProviders()
+      loadSkillList()
     })
     const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
       if (!session) router.replace('/login')
@@ -447,10 +467,14 @@ export default function AppPage() {
     function onClick(e: MouseEvent) {
       if (!composerMenuRef.current?.contains(e.target as Node)) {
         setComposerMenuOpen(false)
+        setSkillsFlyoutOpen(false)
       }
     }
     function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') setComposerMenuOpen(false)
+      if (e.key === 'Escape') {
+        setComposerMenuOpen(false)
+        setSkillsFlyoutOpen(false)
+      }
     }
     window.addEventListener('mousedown', onClick)
     window.addEventListener('keydown', onKey)
@@ -537,6 +561,10 @@ export default function AppPage() {
           // preview now that the canonical version is in `messages`.
           if (evt.role === 'assistant' && evt.content) {
             setLiveTokens('')
+            // Clear any forced-skill ("/") indicator rows for this turn.
+            setInflightTools((prev) =>
+              prev.filter((t) => t.tool_name !== 'skill_triggered'),
+            )
           }
           setMessages((prev) => mergeIncomingMessage(prev, evt))
           // Keep the floating ring's percentage in sync. Debounce so a
@@ -567,6 +595,23 @@ export default function AppPage() {
           // event was missed (e.g. tool errored without persisting).
           setInflightTools((prev) =>
             prev.filter((t) => t.run_id !== evt.run_id),
+          )
+        } else if (evt?.type === 'skill_triggered') {
+          // A skill the user force-activated via "/" was applied this turn —
+          // show it in the activity timeline like a tool/sandbox step.
+          setLlmThinking(false)
+          setInflightTools((prev) =>
+            prev.some((t) => t.run_id === `skill:${evt.skill_name}`)
+              ? prev
+              : [
+                  ...prev,
+                  {
+                    run_id: `skill:${evt.skill_name}`,
+                    tool_name: 'skill_triggered',
+                    args: { skill_name: evt.skill_name },
+                    started_at: Date.now(),
+                  },
+                ],
           )
         } else if (evt?.type === 'llm_started') {
           setLlmThinking(true)
@@ -879,6 +924,18 @@ export default function AppPage() {
   async function signOut() {
     await supabase.auth.signOut()
     router.replace('/login')
+  }
+  async function loadSkillList() {
+    try {
+      const r = await authFetch('/api/skills')
+      if (!r.ok) return
+      const list: any[] = await r.json()
+      setSkillList(
+        list.map((s) => ({ name: s.name, description: s.description || '' })),
+      )
+    } catch {
+      /* slash menu just stays empty */
+    }
   }
   async function loadSessions() {
     const r = await authFetch('/api/sessions')
@@ -1452,6 +1509,8 @@ export default function AppPage() {
     setMcpsOpen(false)
     setDemoOpen(false)
     setContextProfilesOpen(false)
+    setSkillsOpen(false)
+    setPluginsOpen(false)
     setActiveSession(sid)
     setActiveThread(tid)
     setMessages([])
@@ -1478,6 +1537,8 @@ export default function AppPage() {
     setMcpsOpen(false)
     setDemoOpen(false)
     setContextProfilesOpen(false)
+    setSkillsOpen(false)
+    setPluginsOpen(false)
     setActiveSession(sid)
     setActiveThread(null)
     setMessages([])
@@ -1490,15 +1551,43 @@ export default function AppPage() {
     refreshFiles(sid)
   }
 
+  // "/" slash menu: skills matching the text typed after a leading "/".
+  function slashCandidates(): { name: string; description: string }[] {
+    if (!input.startsWith('/')) return []
+    const q = input.slice(1).toLowerCase().trim()
+    return skillList
+      .filter((s) => !triggeredSkills.includes(s.name))
+      .filter(
+        (s) =>
+          !q ||
+          s.name.toLowerCase().includes(q) ||
+          s.description.toLowerCase().includes(q),
+      )
+      .slice(0, 8)
+  }
+
+  function activateSkill(name: string) {
+    setTriggeredSkills((prev) =>
+      prev.includes(name) ? prev : [...prev, name],
+    )
+    setInput('')
+    setSlashMenuOpen(false)
+    setSlashIndex(0)
+    composerRef.current?.focus()
+  }
+
   async function send() {
     if (!input.trim() || !activeSession || !activeThread || sending) return
     const sid = activeSession
     const tid = activeThread
     const msg = input.trim()
     const filesToUpload = pendingFiles
+    const skillsToTrigger = triggeredSkills
     const isFirstMessage = messages.length === 0
     setInput('')
     setPendingFiles([])
+    setTriggeredSkills([])
+    setSlashMenuOpen(false)
     setSending(true)
     setMessages((prev) => [...prev, { role: 'user', content: msg }])
 
@@ -1579,6 +1668,7 @@ export default function AppPage() {
         thread_id: tid,
         message: msg,
         attached_files: attachedFiles,
+        triggered_skills: skillsToTrigger,
         model: selectedModel || undefined,
         context_strategy: selectedStrategy || undefined,
         context_profile_id: selectedProfileId || undefined,
@@ -2143,6 +2233,8 @@ export default function AppPage() {
                 if (next) {
                   setDemoOpen(false)
                   setMcpsOpen(false)
+                  setSkillsOpen(false)
+                  setPluginsOpen(false)
                 }
                 return next
               })
@@ -2174,6 +2266,8 @@ export default function AppPage() {
                 if (next) {
                   setMcpsOpen(false)
                   setContextProfilesOpen(false)
+                  setSkillsOpen(false)
+                  setPluginsOpen(false)
                 }
                 return next
               })
@@ -2192,6 +2286,104 @@ export default function AppPage() {
               </svg>
             </span>
             <span className="text-sm flex-1 text-left">Strategy Demo</span>
+          </button>
+        </div>
+
+        {/* MCP inventory entry — sits above the user profile so it's
+            findable without diving into the user menu. Toggles the MCP
+            panel in the main pane (in place of chat). */}
+        <div className="px-3 pt-1">
+          <button
+            onClick={() =>
+              setMcpsOpen((v) => {
+                const next = !v
+                if (next) {
+                  setDemoOpen(false)
+                  setContextProfilesOpen(false)
+                  setSkillsOpen(false)
+                  setPluginsOpen(false)
+                }
+                return next
+              })
+            }
+            aria-pressed={mcpsOpen}
+            className={`w-full flex items-center gap-3 px-2 py-2 rounded-md transition ${
+              mcpsOpen
+                ? 'bg-soft/[0.08] text-fog-50'
+                : 'hover:bg-soft/[0.04] text-fog-200'
+            }`}
+          >
+            <span className="w-7 h-7 rounded-md bg-soft/10 text-accent flex items-center justify-center">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+                <path d="M3.27 6.96L12 12.01l8.73-5.05M12 22.08V12" opacity="0.6" />
+              </svg>
+            </span>
+            <span className="text-sm flex-1 text-left">MCP Inventory</span>
+          </button>
+        </div>
+
+        {/* Skills entry — toggleable instruction bundles. Swaps the manage
+            panel into the main pane, same exclusivity model as MCPs/Demo. */}
+        <div className="px-3 pt-1">
+          <button
+            onClick={() =>
+              setSkillsOpen((v) => {
+                const next = !v
+                if (next) {
+                  setMcpsOpen(false)
+                  setDemoOpen(false)
+                  setContextProfilesOpen(false)
+                  setPluginsOpen(false)
+                }
+                return next
+              })
+            }
+            aria-pressed={skillsOpen}
+            className={`w-full flex items-center gap-3 px-2 py-2 rounded-md transition ${
+              skillsOpen
+                ? 'bg-soft/[0.08] text-fog-50'
+                : 'hover:bg-soft/[0.04] text-fog-200'
+            }`}
+          >
+            <span className="w-7 h-7 rounded-md bg-soft/10 text-accent flex items-center justify-center">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 3l2.4 5.6L20 10l-4.5 3.9L17 20l-5-3-5 3 1.5-6.1L4 10l5.6-1.4z" />
+              </svg>
+            </span>
+            <span className="text-sm flex-1 text-left">Skills</span>
+          </button>
+        </div>
+
+        {/* Plugins entry — code-defined tools the agent can call. Swaps the
+            manage page into the main pane, same exclusivity model as Skills. */}
+        <div className="px-3 pt-1">
+          <button
+            onClick={() =>
+              setPluginsOpen((v) => {
+                const next = !v
+                if (next) {
+                  setMcpsOpen(false)
+                  setDemoOpen(false)
+                  setContextProfilesOpen(false)
+                  setSkillsOpen(false)
+                }
+                return next
+              })
+            }
+            aria-pressed={pluginsOpen}
+            className={`w-full flex items-center gap-3 px-2 py-2 rounded-md transition ${
+              pluginsOpen
+                ? 'bg-soft/[0.08] text-fog-50'
+                : 'hover:bg-soft/[0.04] text-fog-200'
+            }`}
+          >
+            <span className="w-7 h-7 rounded-md bg-soft/10 text-accent flex items-center justify-center">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 2a3 3 0 0 1 3 3v2h2a2 2 0 0 1 2 2v3a3 3 0 0 1 0 6 2 2 0 0 1-2 2h-3v-2a3 3 0 0 0-6 0v2H5a2 2 0 0 1-2-2v-3a3 3 0 0 0 0-6V9a2 2 0 0 1 2-2h2V5a3 3 0 0 1 3-3z" />
+              </svg>
+            </span>
+            <span className="text-sm flex-1 text-left">Plugins</span>
           </button>
         </div>
 
@@ -2272,6 +2464,10 @@ export default function AppPage() {
           <StrategyDemoPanel />
         ) : mcpsOpen ? (
           <MCPInventoryPanel embedded />
+        ) : skillsOpen ? (
+          <SkillsInventoryPanel embedded />
+        ) : pluginsOpen ? (
+          <PluginsInventoryPanel embedded />
         ) : (
         <>
         {/* Top bar */}
@@ -2361,60 +2557,62 @@ export default function AppPage() {
                 }}
               />
             )}
-            {providers.length > 0 ? (
-              <div className="chip flex items-center gap-2 pr-1" title="LLM provider for this session">
+            {(providers.length > 0 || models.length > 0) ? (
+              <div className="chip flex items-center gap-2 pr-1" title="Select LLM provider or model">
                 <span className="dot bg-emerald-400" />
                 <select
-                  value={
-                    (activeSession && sessionProviders[activeSession]) || ''
-                  }
+                  value={(() => {
+                    // If session has a provider override, show that
+                    if (activeSession && sessionProviders[activeSession]) {
+                      return `provider:${sessionProviders[activeSession]}`
+                    }
+                    // Otherwise show selected OpenRouter model
+                    return selectedModel ? `model:${selectedModel}` : ''
+                  })()}
                   onChange={(e) => {
-                    const v = e.target.value
-                    if (!activeSession) return
-                    setSessionProvider(activeSession, v || null)
-                  }}
-                  disabled={!activeSession}
-                  className="bg-transparent text-xs text-fog-50 outline-none max-w-[18rem] truncate disabled:opacity-50"
-                >
-                  <option value="" className="bg-ink-200 text-fog-50">
-                    {(() => {
-                      const def = providers.find((p) => p.is_default)
-                      return def
-                        ? `Default · ${def.label} · ${def.model_id}`
-                        : 'Default (env fallback)'
-                    })()}
-                  </option>
-                  {providers.map((p) => (
-                    <option
-                      key={p.id}
-                      value={p.id}
-                      className="bg-ink-200 text-fog-50"
-                    >
-                      {p.label} · {p.model_id}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            ) : models.length > 0 ? (
-              <div className="chip flex items-center gap-2 pr-1">
-                <span className="dot bg-emerald-400" />
-                <select
-                  value={selectedModel}
-                  onChange={(e) => {
-                    const v = e.target.value
-                    setSelectedModel(v)
-                    if (typeof window !== 'undefined') {
-                      localStorage.setItem('selected_model', v)
+                    const raw = e.target.value
+                    if (raw.startsWith('provider:')) {
+                      const pid = raw.slice('provider:'.length)
+                      if (!activeSession) return
+                      setSessionProvider(activeSession, pid || null)
+                    } else if (raw.startsWith('model:')) {
+                      const mid = raw.slice('model:'.length)
+                      // Clear any session provider override so model is used
+                      if (activeSession && sessionProviders[activeSession]) {
+                        setSessionProvider(activeSession, null)
+                      }
+                      setSelectedModel(mid)
+                      if (typeof window !== 'undefined') {
+                        localStorage.setItem('selected_model', mid)
+                      }
                     }
                   }}
-                  className="bg-transparent text-xs text-fog-50 outline-none max-w-[14rem] truncate"
+                  disabled={!activeSession && providers.length > 0}
+                  className="bg-transparent text-xs text-fog-50 outline-none max-w-[22rem] truncate disabled:opacity-50"
                   title="Chat model"
                 >
+                  {/* ── Your configured providers at the top ── */}
+                  {providers.length > 0 && (
+                    <optgroup label="Your Providers">
+                      {providers.map((p) => (
+                        <option
+                          key={`provider:${p.id}`}
+                          value={`provider:${p.id}`}
+                          className="bg-ink-200 text-fog-50"
+                        >
+                          {p.is_default ? '★ ' : ''}{p.label} · {p.model_id}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                  {/* ── OpenRouter models below, grouped Primary / Vision / Text-only.
+                       Values are `model:`-prefixed so they round-trip through the
+                       shared onChange handler (which also handles `provider:`). ── */}
                   {(() => {
                     type M = { id: string; name: string; vision?: boolean }
                     const clean = (n: string) => n.replace(/\s*\(free\)\s*$/i, '')
                     const opt = (m: M) => (
-                      <option key={m.id} value={m.id} className="bg-ink-200 text-fog-50">
+                      <option key={`model:${m.id}`} value={`model:${m.id}`} className="bg-ink-200 text-fog-50">
                         {clean(m.name)}{m.vision ? '  👁' : ''}
                       </option>
                     )
@@ -2639,8 +2837,73 @@ export default function AppPage() {
                 e.preventDefault()
                 send()
               }}
-              className="rounded-3xl border border-line bg-ink-100/80 hover:border-lineStrong focus-within:border-lineStrong transition-colors px-3 py-2"
+              className="relative rounded-3xl border border-line bg-ink-100/80 hover:border-lineStrong focus-within:border-lineStrong transition-colors px-3 py-2"
             >
+              {/* "/" slash menu — pick a skill to activate it for this message */}
+              {slashMenuOpen &&
+                (() => {
+                  const cands = slashCandidates()
+                  if (!cands.length) return null
+                  return (
+                    <div className="absolute bottom-full left-0 right-0 mb-2 z-50 rounded-xl border border-lineStrong bg-ink-200 p-1 text-sm shadow-2xl shadow-black/60 max-h-72 overflow-y-auto">
+                      <div className="px-3 pt-2 pb-1 text-[11px] uppercase tracking-wide text-fog-500">
+                        Skills
+                      </div>
+                      {cands.map((s, i) => (
+                        <button
+                          key={s.name}
+                          type="button"
+                          onMouseEnter={() => setSlashIndex(i)}
+                          onClick={() => activateSkill(s.name)}
+                          className={`w-full text-left px-3 py-2 rounded-md flex items-start gap-2.5 ${
+                            i === slashIndex ? 'bg-soft/[0.08]' : 'hover:bg-soft/[0.06]'
+                          }`}
+                        >
+                          <span className="text-accent mt-0.5">
+                            <IconSkill />
+                          </span>
+                          <span className="min-w-0">
+                            <span className="text-fog-50 font-medium">
+                              /{s.name}
+                            </span>
+                            <span className="block text-[11px] text-fog-400 line-clamp-1">
+                              {s.description}
+                            </span>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )
+                })()}
+
+              {/* Active-skill chips (force-activated via "/") */}
+              {triggeredSkills.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 px-1.5 pb-2">
+                  {triggeredSkills.map((name) => (
+                    <span
+                      key={name}
+                      className="chip text-[11px] py-0.5 pr-1 bg-accent/10 border-accent/30 text-accent"
+                      title={`Skill ${name} will run for this message`}
+                    >
+                      <IconSkill />
+                      <span className="max-w-[180px] truncate">{name}</span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setTriggeredSkills((prev) =>
+                            prev.filter((n) => n !== name),
+                          )
+                        }
+                        className="ml-1 w-4 h-4 rounded-full text-accent/70 hover:text-accent hover:bg-soft/[0.1] flex items-center justify-center text-[10px]"
+                        aria-label={`Remove ${name}`}
+                      >
+                        ✕
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+
               {pendingFiles.length > 0 && (
                 <div className="flex flex-wrap gap-1.5 px-1.5 pb-2">
                   {pendingFiles.map((f) => (
@@ -2715,6 +2978,68 @@ export default function AppPage() {
                           </div>
                         </div>
                       </button>
+
+                      <div className="my-1 border-t border-line" />
+
+                      <button
+                        type="button"
+                        onClick={() => setSkillsFlyoutOpen((v) => !v)}
+                        aria-expanded={skillsFlyoutOpen}
+                        className={`w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5 ${
+                          skillsFlyoutOpen ? 'bg-soft/[0.06]' : ''
+                        }`}
+                      >
+                        <IconSkill />
+                        <div className="flex-1">
+                          <div className="text-fog-100">Skills</div>
+                          <div className="text-[11px] text-fog-400">
+                            Turn specialist instructions on
+                          </div>
+                        </div>
+                        <span className="text-fog-400 text-xs">›</span>
+                      </button>
+
+                      {/* Quick-toggle flyout to the side, claude.ai-style.
+                          Nested in the menu's DOM so the outside-click guard
+                          still treats interactions here as "inside". */}
+                      {skillsFlyoutOpen && (
+                        <div className="absolute left-full bottom-0 ml-2">
+                          <SkillsComposerFlyout
+                            onManage={() => {
+                              setDemoOpen(false)
+                              setContextProfilesOpen(false)
+                              setMcpsOpen(false)
+                              setSkillsOpen(true)
+                            }}
+                            onClose={() => {
+                              setSkillsFlyoutOpen(false)
+                              setComposerMenuOpen(false)
+                            }}
+                          />
+                        </div>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setComposerMenuOpen(false)
+                          setSkillsFlyoutOpen(false)
+                          setDemoOpen(false)
+                          setContextProfilesOpen(false)
+                          setMcpsOpen(false)
+                          setSkillsOpen(false)
+                          setPluginsOpen(true)
+                        }}
+                        className="w-full text-left px-3 py-2 rounded-md hover:bg-soft/[0.06] flex items-center gap-2.5"
+                      >
+                        <IconPlugin />
+                        <div className="flex-1">
+                          <div className="text-fog-100">Add plugins…</div>
+                          <div className="text-[11px] text-fog-400">
+                            Give the agent new tools
+                          </div>
+                        </div>
+                      </button>
                     </div>
                   )}
 
@@ -2744,8 +3069,37 @@ export default function AppPage() {
                 <textarea
                   ref={composerRef}
                   value={input}
-                  onChange={(e) => setInput(e.target.value)}
+                  onChange={(e) => {
+                    const v = e.target.value
+                    setInput(v)
+                    const open = v.startsWith('/')
+                    setSlashMenuOpen(open)
+                    if (open) setSlashIndex(0)
+                  }}
                   onKeyDown={(e) => {
+                    const cands = slashMenuOpen ? slashCandidates() : []
+                    if (slashMenuOpen && cands.length) {
+                      if (e.key === 'ArrowDown') {
+                        e.preventDefault()
+                        setSlashIndex((i) => (i + 1) % cands.length)
+                        return
+                      }
+                      if (e.key === 'ArrowUp') {
+                        e.preventDefault()
+                        setSlashIndex((i) => (i - 1 + cands.length) % cands.length)
+                        return
+                      }
+                      if (e.key === 'Enter' || e.key === 'Tab') {
+                        e.preventDefault()
+                        activateSkill(cands[Math.min(slashIndex, cands.length - 1)].name)
+                        return
+                      }
+                      if (e.key === 'Escape') {
+                        e.preventDefault()
+                        setSlashMenuOpen(false)
+                        return
+                      }
+                    }
                     if (e.key === 'Enter' && !e.shiftKey) {
                       e.preventDefault()
                       send()
@@ -2755,7 +3109,7 @@ export default function AppPage() {
                   rows={1}
                   placeholder={
                     activeThread
-                      ? 'Reply to Agent…'
+                      ? 'Reply to Agent…  (type / for skills)'
                       : 'Start a new chat or pick one from the sidebar'
                   }
                   className="flex-1 resize-none bg-transparent outline-none px-1 py-2 text-[15px] placeholder:text-fog-400 disabled:opacity-50 leading-6"
@@ -3653,6 +4007,44 @@ function ToolMessageCard({
   if (name === 'list_project_files')
     return <ListFilesEventRow content={content} isError={isError} />
 
+  if (name === 'read_skill')
+    return (
+      <EventRow
+        icon={<SkillRunIcon />}
+        verb="Skill"
+        target={String(args?.skill_name ?? '')}
+        verbColor="text-accent"
+        subtext={
+          <span className="text-fog-500">
+            {isError ? 'not found' : 'instructions loaded'}
+          </span>
+        }
+      />
+    )
+
+  if (name === 'skill_used')
+    return (
+      <EventRow
+        icon={<SkillRunIcon />}
+        verb="Skill"
+        target={content}
+        verbColor="text-accent"
+        subtext={<span className="text-fog-500">applied</span>}
+      />
+    )
+
+  if (PLUGIN_TOOL_NAMES.has(name))
+    return (
+      <EventRow
+        icon={<PluginRunIcon />}
+        verb="Plugin"
+        target={name}
+        verbColor="text-accent"
+      >
+        <DetailsBlock content={content} />
+      </EventRow>
+    )
+
   return (
     <EventRow icon={<ToolIcon />} verb={name || 'tool'} verbColor="text-fog-200">
       <DetailsBlock content={content} />
@@ -4373,12 +4765,30 @@ function ToolErrorRow({
 }
 
 /** Tool whose result hasn't landed yet — shown with a spinner. */
+// Tool names contributed by plugins (backend/plugins_catalog.py). Used to badge
+// their calls as "Plugin" in the activity timeline.
+const PLUGIN_TOOL_NAMES = new Set([
+  'fetch_url',
+  'json_tool',
+  'convert_units',
+  'text_transform',
+  'generate_uuid',
+  'datetime_tool',
+  'regex_test',
+  'system_info',
+  'list_directory',
+  'review_python',
+])
+
 function InflightToolRow({ tool }: { tool: InflightTool }) {
   const args = tool.args || {}
   const name = tool.tool_name
   let verb = name
   let target: string | undefined
   let icon: React.ReactNode = <ToolIcon />
+  let subtext: React.ReactNode = (
+    <span className="text-fog-500 italic">running…</span>
+  )
   if (name === 'run_shell') {
     verb = 'Run'
     target = String(args.cmd ?? '')
@@ -4395,6 +4805,20 @@ function InflightToolRow({ tool }: { tool: InflightTool }) {
     verb = 'List'
     target = 'project files'
     icon = <ListIcon />
+  } else if (name === 'read_skill') {
+    verb = 'Skill'
+    target = String(args.skill_name ?? '')
+    icon = <SkillRunIcon />
+    subtext = <span className="text-fog-500 italic">loading…</span>
+  } else if (name === 'skill_triggered') {
+    verb = 'Skill'
+    target = String(args.skill_name ?? '')
+    icon = <SkillRunIcon />
+    subtext = <span className="text-fog-500 italic">applied</span>
+  } else if (PLUGIN_TOOL_NAMES.has(name)) {
+    verb = 'Plugin'
+    target = name
+    icon = <PluginRunIcon />
   }
   return (
     <EventRow
@@ -4402,8 +4826,25 @@ function InflightToolRow({ tool }: { tool: InflightTool }) {
       icon={icon}
       verb={verb}
       target={target}
-      subtext={<span className="text-fog-500 italic">running…</span>}
+      subtext={subtext}
     />
+  )
+}
+
+function SkillRunIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="text-accent">
+      <path d="M12 3l2.4 5.6L20 10l-4.5 3.9L17 20l-5-3-5 3 1.5-6.1L4 10l5.6-1.4z" />
+    </svg>
+  )
+}
+function PluginRunIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="text-accent">
+      <path d="M12 2a3 3 0 0 1 3 3v2h2a2 2 0 0 1 2 2v3a3 3 0 0 1 0 6 2 2 0 0 1-2 2h-3v-2a3 3 0 0 0-6 0v2H5a2 2 0 0 1-2-2v-3a3 3 0 0 0 0-6V9a2 2 0 0 1 2-2h2V5a3 3 0 0 1 3-3z" />
+    </svg>
   )
 }
 
@@ -5143,6 +5584,26 @@ function IconChat({
         strokeWidth="1.7"
         strokeLinejoin="round"
       />
+    </svg>
+  )
+}
+function IconSkill() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+      <path
+        d="M12 3l2.4 5.6L20 10l-4.5 3.9L17 20l-5-3-5 3 1.5-6.1L4 10l5.6-1.4z"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+    </svg>
+  )
+}
+function IconPlugin() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 2a3 3 0 0 1 3 3v2h2a2 2 0 0 1 2 2v3a3 3 0 0 1 0 6 2 2 0 0 1-2 2h-3v-2a3 3 0 0 0-6 0v2H5a2 2 0 0 1-2-2v-3a3 3 0 0 0 0-6V9a2 2 0 0 1 2-2h2V5a3 3 0 0 1 3-3z" />
     </svg>
   )
 }
