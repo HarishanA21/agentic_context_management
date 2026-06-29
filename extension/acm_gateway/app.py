@@ -1,16 +1,23 @@
-"""FastAPI app for the gateway.
+"""FastAPI app for the gateway — an LLM proxy that rewrites the context window.
+
+The IDE points its model endpoint at this server instead of the real provider.
+Each request flows through the technique pipeline (trim / summarise / evict /
+sliding-window / cache) before being forwarded upstream, so we edit the context
+window *on the wire* — the position the LangGraph middleware occupies in-process.
 
 Endpoints:
   * ``POST /v1/chat/completions`` — OpenAI-compatible. The IDE points its
-    "OpenAI base URL" at ``http://127.0.0.1:8807/v1`` and the request flows
-    through the technique pipeline before being forwarded upstream.
-  * ``GET  /status`` — what the IDE settings panels poll: active profile, which
-    techniques are on, and the last batch of fired events.
-  * ``GET  /v1/models`` — pass-through so pickers that list models still work.
-
-The Anthropic-compatible ``/v1/messages`` surface is stubbed (see TODO) — the
-shape differs enough to warrant its own translator; the OpenAI path is the
-common case for Cursor/VSCode custom endpoints.
+    "OpenAI base URL" at ``http://127.0.0.1:8807/v1`` (Cursor, Continue, Cline,
+    any OpenAI-compatible client). Rewrites, then forwards to the resolved
+    OpenAI-style provider.
+  * ``POST /v1/messages`` — Anthropic-native. Point Claude Code at it with
+    ``ANTHROPIC_BASE_URL=http://127.0.0.1:8807``. Same pipeline, via the
+    Messages-API translator + an Anthropic upstream (forwards the
+    ``anthropic-beta`` header / ``?beta=true``).
+  * ``GET  /v1/models`` — pass-through so model pickers keep working.
+  * ``GET  /status`` + the control-plane routes — what the IDE settings panels
+    poll: active profile, enabled techniques, recent fired events, memory,
+    drop-list, relevance, providers.
 """
 
 from __future__ import annotations
@@ -367,6 +374,15 @@ def list_messages(conv: str = "") -> Dict[str, Any]:
     whether each is currently dropped. ``conv`` defaults to the latest."""
     key = conv or _DROP.latest_conversation() or ""
     return {"conversation": key, "messages": _DROP.seen(key)}
+
+
+@app.get("/context_window")
+def context_window(conv: str = "") -> Dict[str, Any]:
+    """The exact payload last forwarded upstream for ``conv`` — the post-pipeline
+    wire body (system, messages, tools) the model actually saw. Powers the
+    Context Window view. ``conv`` defaults to the latest conversation."""
+    key = conv or _DROP.latest_conversation() or ""
+    return _DROP.sent(key)
 
 
 @app.get("/messages/text")
@@ -782,12 +798,30 @@ async def chat_completions(request: Request) -> Any:
             status_code=400,
         )
     body["model"] = target.model
+    # Snapshot exactly what we forward (post-pipeline) for the Context Window view.
+    _DROP.record_sent(
+        conv,
+        surface="openai",
+        model=body.get("model"),
+        system=None,
+        messages=body.get("messages"),
+        tools=body.get("tools"),
+    )
     up = GenericUpstream(target.url, target.headers or {})
     if body.get("stream"):
         return StreamingResponse(
             up.chat_stream(body), media_type="text/event-stream"
         )
-    data = await up.chat(body)
+    try:
+        data = await up.chat(body)
+    except httpx.HTTPStatusError as e:
+        # Surface the upstream's real status + body instead of a bare 500, so the
+        # IDE shows the actual reason (mirrors the /v1/messages path).
+        try:
+            payload = e.response.json()
+        except Exception:
+            payload = {"error": {"message": e.response.text[:1000]}}
+        return JSONResponse(payload, status_code=e.response.status_code)
     return JSONResponse(data)
 
 
@@ -842,6 +876,16 @@ async def anthropic_messages(request: Request) -> Any:
         body["model"] = target.model
     else:
         up = _anthropic_upstream()
+
+    # Snapshot exactly what we forward (post-pipeline) for the Context Window view.
+    _DROP.record_sent(
+        conv,
+        surface="anthropic",
+        model=body.get("model"),
+        system=body.get("system"),
+        messages=body.get("messages"),
+        tools=body.get("tools"),
+    )
 
     # Pass through Claude Code's beta opt-ins: the `anthropic-beta` header and
     # the `?beta=true` endpoint selector. Stripping these makes the upstream

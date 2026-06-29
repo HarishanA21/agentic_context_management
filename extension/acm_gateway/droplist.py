@@ -127,6 +127,11 @@ class DropStore:
         # relevance auditor can re-read the real conversation on demand without
         # the gateway storing it to disk. Indices line up 1:1 with self._seen.
         self._seen_msgs: Dict[str, List[BaseMessage]] = {}
+        # in-memory: conv_key -> the exact wire body last *forwarded* upstream
+        # (post-pipeline: drops + trimming + summaries already applied). This is
+        # "what we actually send each call" — distinct from self._seen, which is
+        # the INCOMING view captured before the technique pipeline runs.
+        self._sent: Dict[str, Dict[str, Any]] = {}
 
     # ── persistence ──────────────────────────────────────────────────────
     def _load(self) -> Dict[str, List[str]]:
@@ -249,6 +254,45 @@ class DropStore:
         auditor segments. Indices match :meth:`seen`, so an episode's member
         indices map straight onto fingerprints via :func:`fingerprint`."""
         return self._seen_msgs.get(conv, [])
+
+    # ── last-sent (the forwarded payload, for the Context Window view) ─────
+    def record_sent(
+        self,
+        conv: str,
+        *,
+        surface: str,
+        model: Any,
+        system: Any,
+        messages: Any,
+        tools: Any,
+    ) -> None:
+        """Snapshot the exact wire body forwarded upstream for ``conv`` — the
+        post-pipeline payload (drops + trimming + summaries already applied), so
+        a UI can show "what we actually send each call". In-memory only;
+        overwritten on every call."""
+        self._sent[conv] = {
+            "ts": time.time(),
+            "surface": surface,
+            "model": model or "",
+            "system": system,
+            "messages": messages or [],
+            "tools": tools or [],
+        }
+
+    def sent(self, conv: str) -> Dict[str, Any]:
+        """The last forwarded payload for ``conv`` (or an empty shell)."""
+        snap = self._sent.get(conv)
+        if not snap:
+            return {
+                "conversation": conv,
+                "ts": 0,
+                "surface": "",
+                "model": "",
+                "system": None,
+                "messages": [],
+                "tools": [],
+            }
+        return {"conversation": conv, **snap}
 
     # Markers for messages that are injected context, not a real user prompt —
     # used to pick a human-readable conversation title.

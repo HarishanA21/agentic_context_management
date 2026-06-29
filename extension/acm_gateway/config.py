@@ -51,6 +51,21 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        # Load a .env so a plain `acm-gateway` picks up keys without a manual
+        # export. Search from the cwd upward, then the repo root next to
+        # extension/. Real env vars win (override=False). No-op if python-dotenv
+        # is missing or no .env exists.
+        try:
+            from dotenv import find_dotenv, load_dotenv
+
+            found = find_dotenv(usecwd=True)
+            if found:
+                load_dotenv(found)
+            repo_env = _EXT_ROOT.parent / ".env"
+            if repo_env.is_file():
+                load_dotenv(repo_env)
+        except Exception:
+            pass
         return cls(
             host=os.getenv("ACM_HOST", "127.0.0.1"),
             port=int(os.getenv("ACM_PORT", "8807")),

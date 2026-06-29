@@ -69,6 +69,21 @@ class GenericUpstream:
             async with client.stream(
                 "POST", self.url, headers=self.headers, json=body
             ) as resp:
+                if resp.status_code >= 400:
+                    # Surface the upstream error inside the SSE stream instead of
+                    # forwarding a JSON error body as text/event-stream (which the
+                    # IDE can't parse, so it silently retries). Mirrors the
+                    # Anthropic stream path.
+                    import json as _json
+
+                    raw = await resp.aread()
+                    try:
+                        err = _json.loads(raw.decode())
+                    except Exception:
+                        err = {"error": {"message": raw.decode(errors="replace")[:1000]}}
+                    yield (f"data: {_json.dumps(err)}\n\n").encode()
+                    yield b"data: [DONE]\n\n"
+                    return
                 # aiter_bytes() yields content-decoded bytes (httpx undoes the
                 # upstream's gzip/br). aiter_raw() would forward still-compressed
                 # bytes, which the IDE — told it's plain text/event-stream —

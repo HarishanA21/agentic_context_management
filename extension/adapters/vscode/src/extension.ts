@@ -8,7 +8,7 @@
 import * as vscode from 'vscode';
 import { AcmClient } from './acmClient';
 import { registerTools } from './tools';
-import { AcmViewProvider, openSettingsPanel } from './webview';
+import { AcmViewProvider, openSettingsPanel, openContextWindowPanel } from './webview';
 
 function gatewayUrl(): string {
   return vscode.workspace.getConfiguration('acm').get<string>('gatewayUrl', 'http://127.0.0.1:8807');
@@ -32,6 +32,9 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand('acm.openSettings', () =>
       openSettingsPanel(context.extensionUri, client),
+    ),
+    vscode.commands.registerCommand('acm.showContextWindow', () =>
+      openContextWindowPanel(context.extensionUri, client),
     ),
     vscode.commands.registerCommand('acm.showStatus', async () => {
       try {
