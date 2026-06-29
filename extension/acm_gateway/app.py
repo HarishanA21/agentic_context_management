@@ -54,7 +54,15 @@ from .config import (
     load_visual_cfg,
     user_config_path,
 )
-from .droplist import DropStore, _norm_text, conversation_key, fingerprint
+from .context_windows import ContextWindowStore, in_project
+from .droplist import (
+    DropStore,
+    _norm_text,
+    conversation_key,
+    fingerprint,
+    project_path,
+    session_namespace,
+)
 from .pipeline import run_pipeline
 from .providers_store import ProviderStore
 from .translate import lc_to_openai, openai_to_lc
@@ -74,6 +82,7 @@ _LAST_EVENTS: List[Dict[str, Any]] = []
 _MEMORY = MemoryStore()
 _DROP = DropStore()
 _PROVIDERS = ProviderStore()
+_WINDOWS = ContextWindowStore()
 
 
 def _env_openai() -> tuple:
@@ -95,10 +104,34 @@ def _resolve(model: str, request: Request):
     )
 
 
-def _conv_key(request: Request, messages) -> str:
-    """Conversation id from an explicit header, else derived from the prefix."""
+def _conv_key(request: Request, messages, body: Dict[str, Any] | None = None) -> str:
+    """Conversation (context-window) id: an explicit header, else the settled
+    prefix hash namespaced by the Claude Code session id when present."""
     explicit = request.headers.get("x-acm-conversation")
-    return conversation_key(messages, explicit)
+    return conversation_key(messages, explicit, namespace=session_namespace(body))
+
+
+def _resolve_profile(conv: str):
+    """The technique profile for this chat: an inline per-window body wins, then
+    a named preset override, then the global active profile (the default every
+    new chat inherits until the user changes it)."""
+    win = _WINDOWS.get(conv)
+    if win:
+        body = win.get("profile_body")
+        if body:
+            try:
+                return parse_profile(body)
+            except Exception as e:  # pragma: no cover - defensive
+                print(f"[acm-gateway] bad per-chat profile for {conv}: {e}", flush=True)
+        name = win.get("profile_name")
+        if name:
+            preset = next((p for p in BUILTIN_PRESETS if p["name"] == name), None)
+            if preset:
+                try:
+                    return parse_profile(preset["body"])
+                except Exception:  # pragma: no cover - defensive
+                    pass
+    return load_profile(active_config_path())
 
 
 def _apply_droplist(conv: str, messages):
@@ -120,6 +153,51 @@ def _anthropic_upstream() -> AnthropicUpstream:
         _SETTINGS.anthropic_api_key,
         _SETTINGS.anthropic_version,
     )
+
+
+# Claude Code's identity headers — forwarded verbatim in OAuth passthrough so the
+# subscription endpoint sees the same request shape it expects. Everything else
+# (host, content-length, accept-encoding, the client's auth) is dropped/replaced.
+_PASSTHROUGH_EXACT = {
+    "user-agent",
+    "x-app",
+    "anthropic-version",
+    "anthropic-dangerous-direct-browser-access",
+}
+_PASSTHROUGH_PREFIXES = ("x-stainless-",)
+
+# What credential the last Anthropic turn used — surfaced by /status so the UI
+# can show "monitoring subscription" vs "api-key".
+_LAST_AUTH: Dict[str, Any] = {"mode": "api_key", "subscription": False, "token_tail": None}
+
+
+def _passthrough_headers(request: Request) -> Dict[str, str]:
+    """The client's identity headers to forward in OAuth passthrough mode."""
+    out: Dict[str, str] = {}
+    for k, v in request.headers.items():
+        lk = k.lower()
+        if lk in _PASSTHROUGH_EXACT or lk.startswith(_PASSTHROUGH_PREFIXES):
+            out[k] = v
+    return out
+
+
+def _anthropic_auth_decision(request: Request, target) -> tuple[bool, str | None]:
+    """Decide whether to forward the client's own bearer (a Claude *subscription*
+    OAuth session) instead of injecting our x-api-key.
+
+    Only applies to the env upstream — an explicitly-configured Anthropic
+    provider always authenticates with its own key. Returns
+    ``(use_passthrough, auth_header)``."""
+    incoming = request.headers.get("authorization")
+    has_bearer = bool(incoming and incoming.lower().startswith("bearer "))
+    mode = _SETTINGS.anthropic_auth_mode
+    if target.kind == "anthropic":
+        return False, None
+    if mode == "passthrough" and has_bearer:
+        return True, incoming
+    if mode == "auto" and has_bearer:
+        return True, incoming
+    return False, None
 
 
 def _record(events: List[Dict[str, Any]]) -> None:
@@ -166,6 +244,10 @@ def status() -> Dict[str, Any]:
             "default": prov["default"],
             "configured": sorted(prov["providers"].keys()),
         },
+        # How the Anthropic surface authenticated upstream on the last turn.
+        # `subscription` is true when we forwarded Claude Code's own OAuth bearer
+        # (so the turn billed the user's plan, not API credits) — drives the HUD.
+        "auth": {"configured_mode": _SETTINGS.anthropic_auth_mode, **_LAST_AUTH},
         # Live context of the latest conversation (each message counted once):
         # `tokens` = what the model still sees, `saved_tokens` = what ACM has
         # removed. Drives the Overview gauge + the status-bar HUD.
@@ -385,6 +467,121 @@ def context_window(conv: str = "") -> Dict[str, Any]:
     return _DROP.sent(key)
 
 
+# ─── context windows (one per chat: per-chat profile + lifecycle) ─────────
+
+
+def _window_view(conv: str, include_profile: bool = False) -> Dict[str, Any]:
+    """One chat as the UI sees it: the persistent window row merged with live
+    token/title stats and the *effective* technique set (after the per-chat
+    override or the global default). ``include_profile`` adds the full effective
+    Profile body — for the per-chat technique editor."""
+    row = _WINDOWS.get(conv) or {"id": conv}
+    seen = _DROP.seen(conv)
+    eff = _resolve_profile(conv)
+    cm = eff.context_management
+    view = {
+        **row,
+        "id": conv,
+        "title": row.get("title") or _DROP.title(conv),
+        # Live stats win while the conversation is in memory this run; else the
+        # values mirrored into the registry (so the list survives a restart).
+        "tokens": _DROP.context_tokens(conv) or row.get("tokens", 0),
+        "messages": len(seen) or row.get("messages", 0),
+        "dropped": sum(1 for r in seen if r.get("dropped")),
+        "profile_source": (
+            "body"
+            if row.get("profile_body")
+            else "preset"
+            if row.get("profile_name")
+            else "global"
+        ),
+        "techniques": {
+            "tool_result_trimming": cm.tool_result_trimming.enabled,
+            "summarization": cm.summarization.enabled,
+            "sliding_window": cm.sliding_window.enabled,
+            "image_recall": cm.image_recall.mode,
+            "memory": cm.memory.enabled,
+            "subagent": cm.subagent.enabled,
+            "jit_tools": cm.jit_tools.enabled,
+            "relevance_pruning": getattr(
+                getattr(cm, "relevance_pruning", None), "enabled", False
+            ),
+        },
+    }
+    if include_profile:
+        view["profile"] = eff.model_dump()
+    return view
+
+
+@app.get("/context_windows")
+def list_context_windows(project: str = "") -> Dict[str, Any]:
+    """Chats' context windows, pinned-then-newest. With ``project`` set, only
+    this project's chats (Claude-Code-style per-project history). Includes live
+    conversations seen this run even if not yet registered."""
+    ids = {w["id"] for w in _WINDOWS.list(project)}
+    ids.update(c["key"] for c in _DROP.conversations())
+    windows = [_window_view(c) for c in ids]
+    if project:
+        windows = [w for w in windows if in_project(w.get("project", ""), project)]
+    windows.sort(
+        key=lambda w: (bool(w.get("pinned")), w.get("last_seen", 0)), reverse=True
+    )
+    return {"windows": windows}
+
+
+@app.get("/context_windows/{conv}")
+def get_context_window(conv: str) -> Dict[str, Any]:
+    return _window_view(conv, include_profile=True)
+
+
+@app.post("/context_windows/{conv}/profile")
+async def set_context_window_profile(conv: str, request: Request) -> Any:
+    """Point this chat at a technique profile. Body: ``{"name": "<preset>"}``,
+    ``{"body": {<Profile>}}`` (inline), or ``{"clear": true}`` to revert to the
+    global default."""
+    body: Dict[str, Any] = await request.json()
+    if body.get("clear"):
+        _WINDOWS.clear_profile(conv)
+    elif body.get("name"):
+        name = body["name"]
+        if not any(p["name"] == name for p in BUILTIN_PRESETS):
+            return JSONResponse({"error": f"unknown preset '{name}'"}, status_code=400)
+        _WINDOWS.set_profile(conv, name=name)
+    elif body.get("body"):
+        try:
+            parsed = parse_profile(body["body"]).model_dump()
+        except Exception as e:
+            return JSONResponse({"error": f"invalid profile: {e}"}, status_code=400)
+        _WINDOWS.set_profile(conv, body=parsed)
+    else:
+        return JSONResponse(
+            {"error": "provide 'name', 'body', or 'clear'"}, status_code=400
+        )
+    _record([{"type": "context_window_profile", "conversation": conv}])
+    return JSONResponse(_window_view(conv, include_profile=True))
+
+
+@app.delete("/context_windows/{conv}")
+def delete_context_window(conv: str) -> Any:
+    """Delete a chat's context window and purge all of its managed state
+    (drop-list, summaries, snapshots)."""
+    existed = _WINDOWS.delete(conv)
+    _DROP.forget(conv)
+    return JSONResponse({"ok": True, "deleted": existed, "conversation": conv})
+
+
+@app.post("/context_windows/{conv}/title")
+async def rename_context_window(conv: str, request: Request) -> Any:
+    body: Dict[str, Any] = await request.json()
+    return JSONResponse(_WINDOWS.rename(conv, (body.get("title") or "").strip()))
+
+
+@app.post("/context_windows/{conv}/pin")
+async def pin_context_window(conv: str, request: Request) -> Any:
+    body: Dict[str, Any] = await request.json()
+    return JSONResponse(_WINDOWS.set_pinned(conv, bool(body.get("pinned", True))))
+
+
 @app.get("/messages/text")
 def message_text(conv: str = "", fp: str = "") -> Dict[str, Any]:
     """Full text of one message — the seen rows only carry a 120-char preview,
@@ -518,9 +715,9 @@ def relevance_suggest(conv: str = "") -> Dict[str, Any]:
     ``mode`` (from the profile) selects the engine(s): ``judge`` (LLM only),
     ``encoder`` (local model only), or ``ensemble`` (both, reconciled by
     ``arbitration``)."""
-    profile = load_profile(active_config_path())
-    cfg = getattr(profile.context_management, "relevance_pruning", None)
     key = conv or _DROP.latest_conversation() or ""
+    profile = _resolve_profile(key)
+    cfg = getattr(profile.context_management, "relevance_pruning", None)
     if not key:
         return {"conversation": "", "suggestions": [], "info": {}, "error": "no conversation seen yet"}
     messages = _DROP.seen_full(key)
@@ -752,14 +949,26 @@ async def models() -> Any:
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> Any:
     body: Dict[str, Any] = await request.json()
-    profile = load_profile(active_config_path())
 
     incoming = body.get("messages", []) or []
     lc_messages = openai_to_lc(incoming)
 
+    # Resolve the chat (context window) + its per-chat profile before anything,
+    # scoped to the project (cwd) the client is running in.
+    conv = _conv_key(request, lc_messages, body)
+    proj = project_path(lc_messages)
+    profile = _resolve_profile(conv)
+    _WINDOWS.ensure(conv, project=proj)
+
     # Manual removal: strip any tombstoned messages before anything else.
-    conv = _conv_key(request, lc_messages)
     lc_messages = _apply_droplist(conv, lc_messages)
+    _WINDOWS.touch(
+        conv,
+        title=_DROP.title(conv),
+        tokens=_DROP.context_tokens(conv),
+        messages=len(_DROP.seen(conv)),
+        project=proj,
+    )
 
     summariser = None
     if profile.context_management.summarization.enabled:
@@ -830,16 +1039,43 @@ async def anthropic_messages(request: Request) -> Any:
     """Anthropic-native surface (Claude Code). Same pipeline as the OpenAI path,
     using the Messages-API translator + an Anthropic upstream."""
     body: Dict[str, Any] = await request.json()
-    profile = load_profile(active_config_path())
 
     lc_messages = anthropic_to_lc(body.get("system"), body.get("messages", []) or [])
 
+    # Snapshot the client's original system block + the identity of its system
+    # messages *before* the pipeline runs. In OAuth/subscription passthrough the
+    # system must be forwarded verbatim (the endpoint validates Claude Code's
+    # identity prompt), and any system note the pipeline injects (e.g. a summary)
+    # has to be re-homed into the message array rather than that block.
+    orig_system = body.get("system")
+    orig_system_ids = {id(m) for m in lc_messages if isinstance(m, SystemMessage)}
+
+    # Which chat is this? Resolve its context window + per-chat profile, and
+    # auto-create the window on first sight (inheriting the global default),
+    # scoped to the project (cwd) Claude Code is running in.
+    conv = _conv_key(request, lc_messages, body)
+    proj = project_path(lc_messages)
+    profile = _resolve_profile(conv)
+    _WINDOWS.ensure(conv, project=proj)
+
     # Manual removal: strip tombstoned messages before the pipeline.
-    conv = _conv_key(request, lc_messages)
     lc_messages = _apply_droplist(conv, lc_messages)
+    _WINDOWS.touch(
+        conv,
+        title=_DROP.title(conv),
+        tokens=_DROP.context_tokens(conv),
+        messages=len(_DROP.seen(conv)),
+        project=proj,
+    )
 
     summariser = None
-    if profile.context_management.summarization.enabled:
+    if (
+        profile.context_management.summarization.enabled
+        and _SETTINGS.anthropic_api_key
+    ):
+        # The summariser is a separate model call needing its own key — it can't
+        # ride the client's single-purpose OAuth token, so it only runs when an
+        # x-api-key is configured (subscription-only setups skip summarisation).
         slug = profile.context_management.summarization.summariser_model or body.get(
             "model"
         )
@@ -859,16 +1095,37 @@ async def anthropic_messages(request: Request) -> Any:
     )
     _record(events)
 
+    # Route to a configured Anthropic provider if one is selected, else env,
+    # then decide whether to forward the client's own subscription bearer.
+    target = _resolve(body.get("model", ""), request)
+    use_passthrough, auth_header = _anthropic_auth_decision(request, target)
+
+    # In passthrough mode, re-home any pipeline-injected system note (a summary)
+    # into the message array so its content survives without overwriting Claude
+    # Code's identity prompt — which `lc_to_anthropic` would otherwise merge into
+    # the system block and trip the OAuth endpoint's validation.
+    if use_passthrough:
+        new_messages = [
+            HumanMessage(content=m.content, id=getattr(m, "id", None))
+            if isinstance(m, SystemMessage) and id(m) not in orig_system_ids
+            else m
+            for m in new_messages
+        ]
+
     new_system, new_msgs = lc_to_anthropic(new_messages)
     body = dict(body)
     body["messages"] = new_msgs
-    if new_system is not None:
+    if use_passthrough:
+        # Forward the client's original system byte-for-byte (OAuth invariant).
+        if orig_system is not None:
+            body["system"] = orig_system
+        elif "system" in body:
+            del body["system"]
+    elif new_system is not None:
         body["system"] = new_system
     elif "system" in body:
         del body["system"]
 
-    # Route to a configured Anthropic provider if one is selected, else env.
-    target = _resolve(body.get("model", ""), request)
     if target.kind == "anthropic":
         up = AnthropicUpstream(
             target.base_url, target.api_key, _SETTINGS.anthropic_version
@@ -876,6 +1133,18 @@ async def anthropic_messages(request: Request) -> Any:
         body["model"] = target.model
     else:
         up = _anthropic_upstream()
+
+    passthrough_headers = _passthrough_headers(request) if use_passthrough else None
+
+    # Record which credential this turn used, for the /status HUD.
+    global _LAST_AUTH
+    _LAST_AUTH = {
+        "mode": "passthrough" if use_passthrough else "api_key",
+        "subscription": bool(use_passthrough),
+        "token_tail": (
+            auth_header.strip()[-4:] if use_passthrough and auth_header else None
+        ),
+    }
 
     # Snapshot exactly what we forward (post-pipeline) for the Context Window view.
     _DROP.record_sent(
@@ -888,12 +1157,12 @@ async def anthropic_messages(request: Request) -> Any:
     )
 
     # Pass through Claude Code's beta opt-ins: the `anthropic-beta` header and
-    # the `?beta=true` endpoint selector. Stripping these makes the upstream
-    # 400 on otherwise-valid requests. We drop only auth-mode-specific betas
-    # (``oauth-*``) — we forward with x-api-key, not the user's OAuth token, so
-    # an oauth beta would itself be rejected.
+    # the `?beta=true` endpoint selector. Stripping these makes the upstream 400
+    # on otherwise-valid requests. In api-key mode we drop the auth-specific
+    # ``oauth-*`` betas (they'd be rejected against an x-api-key); in passthrough
+    # mode we forward the client's own bearer, so we keep them.
     beta = request.headers.get("anthropic-beta")
-    if beta:
+    if beta and not use_passthrough:
         beta = ",".join(
             b.strip()
             for b in beta.split(",")
@@ -903,11 +1172,23 @@ async def anthropic_messages(request: Request) -> Any:
 
     if body.get("stream"):
         return StreamingResponse(
-            up.messages_stream(body, beta=beta, beta_query=beta_query),
+            up.messages_stream(
+                body,
+                beta=beta,
+                beta_query=beta_query,
+                auth_header=auth_header,
+                passthrough_headers=passthrough_headers,
+            ),
             media_type="text/event-stream",
         )
     try:
-        data = await up.messages(body, beta=beta, beta_query=beta_query)
+        data = await up.messages(
+            body,
+            beta=beta,
+            beta_query=beta_query,
+            auth_header=auth_header,
+            passthrough_headers=passthrough_headers,
+        )
     except httpx.HTTPStatusError as e:
         # Surface the upstream's real status + body instead of a bare 500, so
         # the IDE stops retrying blindly and shows the actual reason.

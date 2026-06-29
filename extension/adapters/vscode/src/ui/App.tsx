@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { rpc, getState, setState } from './bridge';
+import { rpc, getState, setState, openChat, projectRoot, chatConv } from './bridge';
 
 type Theme = 'auto' | 'light' | 'dark';
 const THEME_ICON: Record<Theme, string> = { auto: '◐', light: '☀', dark: '☾' };
@@ -36,7 +36,7 @@ function classify(m: any): { cls: string; label: string; context: boolean } {
   return { cls: 'system', label: 'System', context: true };
 }
 
-const TABS = ['Overview', 'Context Window', 'Chats', 'Cleanup', 'Techniques', 'Profiles', 'Providers', 'Memory'];
+const TABS = ['Overview', 'Chats', 'Techniques', 'Profiles', 'Providers', 'Memory'];
 
 // Per-label colour for relevance suggestion cards (theme-agnostic alpha fills).
 const LABEL_STYLE: Record<string, { bg: string; fg: string; label: string }> = {
@@ -125,9 +125,7 @@ export function App() {
 
       <main className="body">
         {tab === 'Overview' && <Overview status={status} reachable={reachable} onRefresh={poll} />}
-        {tab === 'Context Window' && <ContextWindow />}
         {tab === 'Chats' && <Chats />}
-        {tab === 'Cleanup' && <Cleanup />}
         {tab === 'Techniques' && <Techniques />}
         {tab === 'Profiles' && <Profiles />}
         {tab === 'Providers' && <Providers />}
@@ -261,84 +259,147 @@ function Overview({ status, reachable, onRefresh }: any) {
   );
 }
 
-// ── Chats (agent conversations) ────────────────────────────────────────
+// ── Chats (per-chat context windows) ──────────────────────────────────
+function profileLabel(w: any): string {
+  if (w && w.profile_source === 'preset') return w.profile_name || 'preset';
+  if (w && w.profile_source === 'body') return 'custom';
+  return 'default';
+}
+
 function Chats() {
-  const [convs, setConvs] = useState<any[]>([]);
-  const [sel, setSel] = useState<string>('');
-  const [msgs, setMsgs] = useState<any[]>([]);
+  const [wins, setWins] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
-  const [raw, setRaw] = useState(true); // raw = every message in order (like the website)
+  const [busy, setBusy] = useState(false);
   const [n, reload] = useReload();
 
   useEffect(() => {
-    rpc('conversations').then((d: any) => {
-      const list = d.conversations || [];
-      setConvs(list);
-      setSel((cur) => cur || (list[0] ? list[0].key : ''));
+    rpc('contextWindows', { project: projectRoot }).then((d: any) => {
+      setWins(d.windows || []);
       setLoading(false);
     }).catch(() => setLoading(false));
   }, [n]);
 
-  useEffect(() => {
-    if (!sel) { setMsgs([]); return; }
-    rpc('messages', { conv: sel }).then((d: any) => setMsgs(d.messages || []));
-  }, [sel, n]);
-
-  const act = (method: string, fp: string) => rpc(method, { fp, conv: sel }).then(reload);
+  const del = (e: any, id: string) => {
+    e.stopPropagation();
+    if (!window.confirm(
+      'Delete this context window and all its ACM state (drop-list, summaries)? ' +
+      'The chat in your IDE is unaffected.')) return;
+    setBusy(true);
+    rpc('deleteWindow', { conv: id }).then(reload).finally(() => setBusy(false));
+  };
 
   if (loading) return <Loading />;
-  if (convs.length === 0)
+  if (wins.length === 0)
     return (
       <div className="empty">
-        <p>No agent conversations yet.</p>
-        <p className="tiny">Point your IDE's model endpoint at the gateway and chat, then come back.
-          Conversations the gateway sees appear here, where you can inspect and remove messages.</p>
+        <p>No chats in this project yet.</p>
+        <p className="tiny">Each Claude Code chat in this project becomes its own context window — with
+          its own techniques. Point your IDE's model endpoint at the gateway and chat, then come back.</p>
         <button className="btn sec sm" onClick={reload}>Refresh</button>
       </div>
     );
 
   return (
     <div>
-      <h3 className="sec">Conversations</h3>
+      <div className="row" style={{ alignItems: 'baseline', justifyContent: 'space-between' }}>
+        <h3 className="sec" style={{ margin: 0 }}>Chats <span className="muted tiny">— this project · click to open</span></h3>
+        <button className="btn sec sm" onClick={reload}>Refresh</button>
+      </div>
+      <p className="muted tiny">Each chat is its own context window with its own techniques. Open one to
+        see exactly what's sent to the model and tune that chat's settings.</p>
       <div className="conv-list">
-        {convs.map((c) => (
-          <div key={c.key} className={'conv' + (c.key === sel ? ' active' : '')} onClick={() => setSel(c.key)}>
-            <span className="id" title={c.key} style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+        {wins.map((c) => (
+          <div key={c.id} className="conv" onClick={() => openChat(c.id)} title="Open chat detail">
+            <span className="id" style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
               <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {c.title || 'Untitled conversation'}
+                {c.title || 'Untitled chat'}
               </span>
-              <span className="muted tiny" style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)' }}>{c.key}</span>
+              <span className="muted tiny" style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)' }}>{c.id}</span>
             </span>
             <span className="meta">
-              <span className="count-badge">{c.count} msg</span>
-              {c.dropped ? <> · <span className="muted">{c.dropped} removed</span></> : null}
-              <div>{rel(c.ts)}</div>
+              <span className="badge" title="Active technique profile for this chat">{profileLabel(c)}</span>
+              <div className="count-badge">
+                {fmtTok(c.tokens || 0)} tok · {c.messages} msg{c.dropped ? ` · ${c.dropped} removed` : ''}
+              </div>
+              <div className="row" style={{ gap: 6, alignItems: 'center', justifyContent: 'flex-end' }}>
+                <span>{rel(c.last_seen)}</span>
+                <button className="btn sm ghost" disabled={busy} title="Delete this context window"
+                  onClick={(e) => del(e, c.id)}>✕</button>
+              </div>
             </span>
           </div>
         ))}
       </div>
+    </div>
+  );
+}
 
-      <div className="row" style={{ alignItems: 'center', justifyContent: 'space-between', marginTop: 14 }}>
-        <h3 className="sec" style={{ margin: 0 }}>
-          Transcript <span className="muted tiny">— {msgs.length} message{msgs.length === 1 ? '' : 's'} in context order</span>
-        </h3>
-        <div className="row" style={{ gap: 4 }}>
-          <button className={'btn sm ' + (raw ? '' : 'ghost')} onClick={() => setRaw(true)}>Raw</button>
-          <button className={'btn sm ' + (raw ? 'ghost' : '')} onClick={() => setRaw(false)}>Grouped</button>
+// ── Chat detail (two columns: context window | per-chat settings) ──────
+export function ChatDetail({ conv }: { conv: string }) {
+  const [theme] = useState<Theme>(() => (getState().theme as Theme) || 'auto');
+  const [win, setWin] = useState<any>(null);
+  const [presets, setPresets] = useState<any[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [n, reload] = useReload();
+
+  useEffect(() => {
+    rpc('getContextWindow', { conv }).then(setWin).catch(() => setWin(null));
+  }, [conv, n]);
+  useEffect(() => {
+    rpc('getProfile').then((d: any) => setPresets(d.presets || [])).catch(() => {});
+  }, []);
+
+  const setProfile = (value: string) => {
+    setBusy(true);
+    const params = value === '' ? { conv, clear: true } : { conv, name: value };
+    rpc('setWindowProfile', params).then(reload).finally(() => setBusy(false));
+  };
+
+  const source = win?.profile_source || 'global';
+  return (
+    <div className="acm" data-theme={theme}>
+      <header className="hd">
+        <svg className="logo" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 3 3 7.5 12 12l9-4.5L12 3Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+          <path d="m3 12 9 4.5L21 12M3 16.5l9 4.5 9-4.5" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+        </svg>
+        <div style={{ minWidth: 0 }}>
+          <div className="title">{win?.title || 'Chat'}</div>
+          <div className="sub" style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)' }}>{conv}</div>
         </div>
-      </div>
-      <p className="muted tiny" style={{ marginTop: -4 }}>
-        Removing hides a message from the model on every future turn (the IDE still shows it).
-      </p>
-      <div className="card">
-        {msgs.length === 0 ? <p className="muted tiny">No messages recorded for this conversation.</p> :
-          raw
-            ? msgs.map((m, i) => <MsgRow key={m.fp ?? i} m={m} conv={sel} onAct={act} />)
-            : groupTurns(msgs).map((t, i) => (
-                <TurnGroup key={t.user?.fp ?? 'turn-' + i} turn={t} conv={sel} onAct={act} />
-              ))}
-      </div>
-      <p><button className="btn sec sm" onClick={reload}>Refresh</button></p>
+      </header>
+      <main className="body">
+        <div className="two-col">
+          <section className="col">
+            <h3 className="sec">Context window <span className="muted tiny">— what's sent to the model</span></h3>
+            <ContextWindow conv={conv} />
+          </section>
+          <section className="col">
+            <h3 className="sec">Settings <span className="muted tiny">— this chat only</span></h3>
+            <div className="card">
+              <div className="row" style={{ alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <strong className="tiny">Profile</strong>
+                <select disabled={busy}
+                  value={source === 'preset' ? (win?.profile_name || '') : (source === 'body' ? '__custom__' : '')}
+                  onChange={(e) => setProfile(e.target.value === '__custom__' ? '' : e.target.value)}>
+                  <option value="">Global default</option>
+                  {presets.map((p: any) => <option key={p.name} value={p.name}>{p.name}</option>)}
+                  {source === 'body' && <option value="__custom__" disabled>custom (inline)</option>}
+                </select>
+                <span className="muted tiny" style={{ marginLeft: 'auto' }}>
+                  {source === 'global' ? 'inheriting global default' : source === 'preset' ? `preset: ${win?.profile_name}` : 'custom techniques'}
+                </span>
+              </div>
+            </div>
+
+            <h4 className="sec" style={{ marginTop: 16 }}>Techniques</h4>
+            <Techniques conv={conv} onChanged={reload} />
+
+            <h4 className="sec" style={{ marginTop: 16 }}>Cleanup</h4>
+            <Cleanup conv={conv} />
+          </section>
+        </div>
+      </main>
     </div>
   );
 }
@@ -515,21 +576,33 @@ function TurnGroup({ turn, conv, onAct }: { turn: ChatTurn; conv: string; onAct:
 }
 
 // ── Cleanup (task-aware relevance suggestions) ─────────────────────────
-function Cleanup() {
+function Cleanup({ conv: fixedConv }: { conv?: string } = {}) {
   const [convs, setConvs] = useState<any[]>([]);
-  const [sel, setSel] = useState<string>('');
+  const [sel, setSel] = useState<string>(fixedConv || '');
   const [sugs, setSugs] = useState<any[] | null>(null);
   const [info, setInfo] = useState<any>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  // Per-chat (fixedConv) also shows the message-level drop transcript.
+  const [msgs, setMsgs] = useState<any[]>([]);
+  const [raw, setRaw] = useState(true);
+  const [mn, mreload] = useReload();
 
   useEffect(() => {
+    if (fixedConv) { setSel(fixedConv); return; }
     rpc('conversations').then((d: any) => {
       const list = d.conversations || [];
       setConvs(list);
       setSel((cur) => cur || (list[0] ? list[0].key : ''));
     }).catch(() => {});
-  }, []);
+  }, [fixedConv]);
+
+  useEffect(() => {
+    if (!fixedConv || !sel) { setMsgs([]); return; }
+    rpc('messages', { conv: sel }).then((d: any) => setMsgs(d.messages || []));
+  }, [fixedConv, sel, mn]);
+
+  const act = (method: string, fp: string) => rpc(method, { fp, conv: sel }).then(mreload);
 
   const analyze = async () => {
     setBusy(true); setErr(''); setSugs(null); setInfo(null);
@@ -624,14 +697,16 @@ function Cleanup() {
         logged to improve the model.
       </p>
       <div className="row">
-        <select value={sel} onChange={(e) => setSel(e.target.value)} style={{ minWidth: 0, flex: 1 }}>
-          {convs.length === 0 && <option value="">(no conversations seen yet)</option>}
-          {convs.map((c) => (
-            <option key={c.key} value={c.key}>{c.key} · {c.count} msg</option>
-          ))}
-        </select>
+        {!fixedConv && (
+          <select value={sel} onChange={(e) => setSel(e.target.value)} style={{ minWidth: 0, flex: 1 }}>
+            {convs.length === 0 && <option value="">(no conversations seen yet)</option>}
+            {convs.map((c) => (
+              <option key={c.key} value={c.key}>{c.key} · {c.count} msg</option>
+            ))}
+          </select>
+        )}
         <button className="btn" onClick={analyze} disabled={busy || !sel}>
-          {busy ? <><span className="spin" /> Analyzing…</> : 'Analyze'}
+          {busy ? <><span className="spin" /> Analyzing…</> : 'Analyze relevance'}
         </button>
       </div>
 
@@ -686,33 +761,69 @@ function Cleanup() {
           ))}
         </>
       )}
+
+      {fixedConv && (
+        <>
+          <div className="row" style={{ alignItems: 'center', justifyContent: 'space-between', marginTop: 14 }}>
+            <h3 className="sec" style={{ margin: 0 }}>
+              Messages <span className="muted tiny">— {msgs.length}, in context order</span>
+            </h3>
+            <div className="row" style={{ gap: 4 }}>
+              <button className={'btn sm ' + (raw ? '' : 'ghost')} onClick={() => setRaw(true)}>Raw</button>
+              <button className={'btn sm ' + (raw ? 'ghost' : '')} onClick={() => setRaw(false)}>Grouped</button>
+            </div>
+          </div>
+          <p className="muted tiny" style={{ marginTop: -4 }}>
+            Removing hides a message from the model on every future turn (the IDE still shows it).
+          </p>
+          <div className="card">
+            {msgs.length === 0 ? <p className="muted tiny">No messages recorded for this chat yet.</p> :
+              raw
+                ? msgs.map((m, i) => <MsgRow key={m.fp ?? i} m={m} conv={sel} onAct={act} />)
+                : groupTurns(msgs).map((t, i) => (
+                    <TurnGroup key={t.user?.fp ?? 'turn-' + i} turn={t} conv={sel} onAct={act} />
+                  ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }
 
 // ── Techniques ─────────────────────────────────────────────────────────
-function Techniques() {
+function Techniques({ conv, onChanged }: { conv?: string; onChanged?: () => void } = {}) {
+  const perChat = !!conv;
   const [prof, setProf] = useState<any>(null);
-  const [vm, setVm] = useState<any>(null);
+  const [vm, setVm] = useState<any>(null); // visual method is a global axis — global tab only
   const [msg, setMsg] = useState('');
   const [n, reload] = useReload();
   useEffect(() => {
-    rpc('getProfile').then((p: any) => {
-      setProf(p.active);
-      setVm(p.visual_method || { enabled: false, trigger_tokens: 500, only_tools: [], exclude_tools: [] });
-    });
-  }, [n]);
-  if (!prof || !vm) return <Loading />;
+    if (perChat) {
+      rpc('getContextWindow', { conv }).then((w: any) => { setProf(w.profile); setVm(null); });
+    } else {
+      rpc('getProfile').then((p: any) => {
+        setProf(p.active);
+        setVm(p.visual_method || { enabled: false, trigger_tokens: 500, only_tools: [], exclude_tools: [] });
+      });
+    }
+  }, [n, conv]);
+  if (!prof) return <Loading />;
   const cm = prof.context_management;
   const setCM = (key: string, field: string, value: any) => { const x = clone(prof); x.context_management[key][field] = value; setProf(x); };
   const save = async () => {
     setMsg('saving…');
-    try { await rpc('setProfileBody', { body: prof, visual_method: vm }); setMsg('Saved ✓'); }
+    try {
+      if (perChat) { await rpc('setWindowProfile', { conv, body: prof }); onChanged?.(); }
+      else { await rpc('setProfileBody', { body: prof, visual_method: vm }); }
+      setMsg('Saved ✓');
+    }
     catch (e: any) { setMsg('Error: ' + e.message); }
   };
   return (
     <div>
-      <p className="muted tiny">Toggle techniques the gateway applies to every turn. Changes save to your config and take effect on the next request.</p>
+      <p className="muted tiny">{perChat
+        ? 'Toggle techniques for this chat only. Saved to this context window; the next turn uses them.'
+        : 'Toggle techniques the gateway applies by default to every chat. Changes save to your config and take effect on the next request.'}</p>
       {TECHS.map((t) => (
         <div className="card tech" key={t.key}>
           <Toggle on={!!cm[t.key].enabled} onChange={(v) => setCM(t.key, 'enabled', v)} />
@@ -756,7 +867,7 @@ function Techniques() {
           <Toggle on={!!cm.relevance_pruning.enabled} onChange={(v) => setCM('relevance_pruning', 'enabled', v)} />
           <div className="meta">
             <div className="name">Relevance cleanup</div>
-            <div className="desc">Split the chat into episodes and suggest which finished/unrelated ones to remove. Suggest-only — review &amp; apply in the Cleanup tab.</div>
+            <div className="desc">Split the chat into episodes and suggest which finished/unrelated ones to remove. Suggest-only — review &amp; apply in Cleanup (open a chat).</div>
             {cm.relevance_pruning.enabled && (
               <div className="params">
                 <label className="field">Engine
@@ -784,6 +895,7 @@ function Techniques() {
         </div>
       )}
 
+      {!perChat && vm && (
       <div className="card tech">
         <Toggle on={!!vm.enabled} onChange={(v) => setVm({ ...vm, enabled: v })} />
         <div className="meta">
@@ -798,6 +910,7 @@ function Techniques() {
           )}
         </div>
       </div>
+      )}
 
       <div className="row" style={{ marginTop: 12 }}>
         <button className="btn" onClick={save}>Save changes</button>
@@ -1200,21 +1313,23 @@ function CwTokens({ a }: { a: CwAnalysis }) {
   );
 }
 
-export function ContextWindow({ standalone }: { standalone?: boolean }) {
+export function ContextWindow({ standalone, conv }: { standalone?: boolean; conv?: string }) {
   const [theme] = useState<Theme>(() => (getState().theme as Theme) || 'auto');
   const [convs, setConvs] = useState<any[]>([]);
-  const [sel, setSel] = useState('');
+  const [sel, setSel] = useState(conv || '');
   const [data, setData] = useState<any>(null);
   const [view, setView] = useState<'proper' | 'raw' | 'tokens'>('proper');
-  const [ready, setReady] = useState(false);
+  const [ready, setReady] = useState(!!conv);
 
   useEffect(() => {
+    // Pinned to one chat (chat detail) — no conversation picker needed.
+    if (conv) { setSel(conv); setReady(true); return; }
     rpc('conversations').then((d: any) => {
       const list = d.conversations || [];
       setConvs(list);
       setSel((cur) => cur || (list[0] ? list[0].key : ''));
     }).catch(() => {}).finally(() => setReady(true));
-  }, []);
+  }, [conv]);
 
   const load = useCallback(() => {
     rpc('contextWindow', { conv: sel }).then((d: any) => setData(d)).catch(() => setData(null));
@@ -1233,11 +1348,11 @@ export function ContextWindow({ standalone }: { standalone?: boolean }) {
     <>
       <div className="row" style={{ justifyContent: 'space-between' }}>
         <div className="row" style={{ gap: 6 }}>
-          {convs.length > 0 ? (
+          {!conv && (convs.length > 0 ? (
             <select value={sel} onChange={(e) => setSel(e.target.value)} style={{ maxWidth: 280 }}>
               {convs.map((c) => <option key={c.key} value={c.key}>{c.title || c.key}</option>)}
             </select>
-          ) : <span className="muted tiny">no conversations yet</span>}
+          ) : <span className="muted tiny">no conversations yet</span>)}
           <button className="btn sec sm" onClick={load}>Refresh</button>
         </div>
         <div className="row" style={{ gap: 4 }}>

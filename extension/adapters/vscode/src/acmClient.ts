@@ -5,6 +5,24 @@
 import * as http from 'http';
 import { URL } from 'url';
 
+export interface AcmAuth {
+  /** The configured ACM_ANTHROPIC_AUTH_MODE (auto | passthrough | api_key). */
+  configured_mode: string;
+  /** What the last Anthropic turn actually used (passthrough | api_key). */
+  mode: string;
+  /** True when the last turn forwarded the user's own subscription bearer. */
+  subscription: boolean;
+  token_tail: string | null;
+}
+
+export interface AcmContext {
+  conversation: string;
+  tokens: number;
+  saved_tokens: number;
+  messages: number;
+  dropped: number;
+}
+
 export interface AcmStatus {
   ok: boolean;
   upstream: string;
@@ -12,6 +30,8 @@ export interface AcmStatus {
   tool_surface: string;
   techniques: Record<string, unknown>;
   last_events: Array<Record<string, unknown>>;
+  context?: AcmContext;
+  auth?: AcmAuth;
 }
 
 export interface AcmProfile {
@@ -164,6 +184,27 @@ export class AcmClient {
     );
   }
 
+  // ── context windows (one per chat: per-chat profile + lifecycle) ─────
+  contextWindows(project = ''): Promise<{ windows: AcmContextWindowRow[] }> {
+    const q = project ? '?project=' + encodeURIComponent(project) : '';
+    return this.request('GET', '/context_windows' + q);
+  }
+
+  getContextWindow(conv: string): Promise<AcmContextWindowRow & { profile?: Record<string, unknown> }> {
+    return this.request('GET', `/context_windows/${encodeURIComponent(conv)}`);
+  }
+
+  setWindowProfile(
+    conv: string,
+    sel: { name?: string; body?: Record<string, unknown>; clear?: boolean },
+  ): Promise<AcmContextWindowRow> {
+    return this.request('POST', `/context_windows/${encodeURIComponent(conv)}/profile`, sel);
+  }
+
+  deleteWindow(conv: string): Promise<{ ok: boolean; deleted: boolean; conversation: string }> {
+    return this.request('DELETE', `/context_windows/${encodeURIComponent(conv)}`);
+  }
+
   // ── multi-provider ──────────────────────────────────────────────────
   providers(): Promise<{ default: string | null; providers: Record<string, any> }> {
     return this.request('GET', '/providers');
@@ -188,6 +229,21 @@ export interface AcmMessageRow {
   preview: string;
   tool_call_id: string;
   dropped: boolean;
+}
+
+// One chat's context window: its effective profile + live stats.
+export interface AcmContextWindowRow {
+  id: string;
+  title: string;
+  project: string;
+  profile_name: string | null;
+  profile_source: 'global' | 'preset' | 'body';
+  tokens: number;
+  messages: number;
+  dropped: number;
+  pinned: boolean;
+  last_seen: number;
+  techniques: Record<string, unknown>;
 }
 
 // The exact wire body the gateway last forwarded upstream for a conversation.
