@@ -174,3 +174,8 @@ input[type='text'] { min-width: 150px; }
 .cw-md blockquote { margin: 4px 0; padding-left: 8px; border-left: 2px solid var(--border); color: var(--fg-muted); }
 .cw-md img { max-width: 140px; height: auto; border-radius: 4px; }
 .cw-md table { border-collapse: collapse; } .cw-md td, .cw-md th { border: 1px solid var(--border); padding: 2px 6px; }
+
+/* Two-column chat detail (context window | per-chat settings) */
+.two-col { display: flex; gap: 18px; align-items: flex-start; }
+.two-col > .col { flex: 1 1 0; min-width: 0; }
+@media (max-width: 880px) { .two-col { flex-direction: column; } }

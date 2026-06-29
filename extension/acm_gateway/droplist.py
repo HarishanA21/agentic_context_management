@@ -30,7 +30,13 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 _DEFAULT_PATH = Path(
     os.getenv("ACM_DROPLIST_PATH", str(Path.home() / ".acm" / "dropped.json"))
@@ -94,12 +100,61 @@ def _stable_for_key(text: str) -> str:
     return _VOLATILE_RE.sub("", text)
 
 
+# Claude Code stamps `metadata.user_id` with a `session_<uuid>` segment that is
+# constant across the turns of one chat. We use it to *namespace* the
+# conversation key so two chats that happen to open with the same first message
+# don't share a window — while the prefix hash still distinguishes chats within
+# one session (a new chat = a new first message = a new hash).
+_SESSION_RE = re.compile(r"session[_-]([0-9a-fA-F][0-9a-fA-F-]{6,})")
+
+
+# Claude Code embeds the working directory in its system/env block — e.g.
+# "Working directory: /Users/me/project". We read it so chats can be scoped per
+# project, the same way Claude Code keys its own history by the project path.
+_CWD_RE = re.compile(
+    r"(?:Working directory|Current working directory|cwd)\s*[:=]\s*([^\n\r]+)", re.I
+)
+
+
+def project_path(messages: List[BaseMessage]) -> str:
+    """Best-effort project root for a request (the cwd Claude Code embeds in its
+    env block). Returns '' when not present — those windows stay unscoped."""
+    for m in messages:
+        if not isinstance(m, (SystemMessage, HumanMessage)):
+            continue
+        text = _norm_text(getattr(m, "content", ""))
+        low = text.lower()
+        if "directory" not in low and "cwd" not in low:
+            continue
+        mt = _CWD_RE.search(text)
+        if mt:
+            return mt.group(1).strip().strip("`'\"").rstrip("/")
+    return ""
+
+
+def session_namespace(body: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Stable per-chat namespace from the request's Claude Code metadata, or
+    None when absent (then the prefix hash stands alone — today's behaviour)."""
+    if not isinstance(body, dict):
+        return None
+    meta = body.get("metadata")
+    uid = meta.get("user_id") if isinstance(meta, dict) else None
+    if not isinstance(uid, str):
+        return None
+    m = _SESSION_RE.search(uid)
+    return "s" + m.group(1).replace("-", "")[:24] if m else None
+
+
 def conversation_key(
-    messages: List[BaseMessage], explicit: Optional[str] = None
+    messages: List[BaseMessage],
+    explicit: Optional[str] = None,
+    namespace: Optional[str] = None,
 ) -> str:
     """Identify the conversation. Prefer an explicit id from the client; else
     hash the settled prefix (first system + first non-system message) with the
-    per-turn billing header stripped, so it stays stable across a session."""
+    per-turn billing header stripped, so it stays stable across a session. A
+    ``namespace`` (e.g. the Claude Code session id) is prepended when available,
+    so identical openings in different chats resolve to different windows."""
     if explicit:
         return explicit.strip()[:64]
     system = next((m for m in messages if isinstance(m, SystemMessage)), None)
@@ -107,7 +162,12 @@ def conversation_key(
     basis = _stable_for_key(_norm_text(getattr(system, "content", ""))) + "␟" + (
         _norm_text(getattr(first, "content", ""))
     )
-    return "c_" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:14]
+    base = "c_" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:14]
+    if namespace:
+        ns = re.sub(r"[^A-Za-z0-9_-]", "", namespace)[:32]
+        if ns:
+            return f"{ns}_{base}"
+    return base
 
 
 class DropStore:
@@ -332,6 +392,22 @@ class DropStore:
     def latest_conversation(self) -> Optional[str]:
         convs = self.conversations()
         return convs[0]["key"] if convs else None
+
+    def title(self, conv: str) -> str:
+        """The human-readable title for ``conv`` (first real user message)."""
+        return self._title(self._seen.get(conv, {}).get("messages", []))
+
+    def forget(self, conv: str) -> None:
+        """Purge every trace of a conversation — its drop-list, summaries, and
+        cached views. Used when a context window is deleted so nothing lingers."""
+        dropped_changed = self._dropped.pop(conv, None) is not None
+        if self._summaries.pop(conv, None) is not None:
+            self._save_summaries()
+        self._seen.pop(conv, None)
+        self._seen_msgs.pop(conv, None)
+        self._sent.pop(conv, None)
+        if dropped_changed:
+            self._save()
 
     # ── the actual removal (cascade-safe) ────────────────────────────────
     def apply(

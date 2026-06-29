@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy the relevant blocks into ~/.claude/settings.json (or .claude/settings.json in a project). Replace <EXT> with the absolute path to the extension/ folder. The hooks shrink big tool outputs and auto-load memory; the mcpServers block registers the ACM tool buttons; env points Claude Code at the gateway for full-parity context editing.",
+  "_comment": "Copy the relevant blocks into ~/.claude/settings.json (or .claude/settings.json in a project). Replace <EXT> with the absolute path to the extension/ folder. The hooks shrink big tool outputs and auto-load memory; the mcpServers block registers the ACM tool buttons; env points Claude Code at the gateway for full-parity context editing. On a Claude subscription this needs no API key — the gateway forwards your own OAuth token (auth mode 'auto') and monitors the traffic; set ACM_ANTHROPIC_API_KEY only to forward to the API instead.",
 
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8807"

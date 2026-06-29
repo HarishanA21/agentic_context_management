@@ -2,7 +2,7 @@
   "name": "acm-context-management",
   "displayName": "ACM — Context Management",
   "description": "Bring the ACM context-management techniques (trimming, summarisation, image-recall, memory) into VSCode via the gateway, Language Model Tools, and a settings panel.",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "publisher": "acm",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -44,6 +44,18 @@
       {
         "command": "acm.recall",
         "title": "ACM: Recall Memory"
+      },
+      {
+        "command": "acm.enableMonitoring",
+        "title": "ACM: Monitor Claude Code (route through gateway)"
+      },
+      {
+        "command": "acm.disableMonitoring",
+        "title": "ACM: Stop Monitoring Claude Code (restore routing)"
+      },
+      {
+        "command": "acm.restartGateway",
+        "title": "ACM: Restart Gateway"
       }
     ],
     "viewsContainers": {
@@ -80,6 +92,34 @@
             "thread"
           ],
           "description": "Default scope for ACM memory tools."
+        },
+        "acm.manageGateway": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start and supervise the acm-gateway process automatically (restart on crash, stop on shutdown). If a gateway is already running on the URL, it is adopted instead of spawning a duplicate."
+        },
+        "acm.gatewayCommand": {
+          "type": "string",
+          "default": "acm-gateway",
+          "description": "Command used to launch the gateway when acm.manageGateway is on. Must be on PATH (e.g. after `uv tool install acm-context-management`) or an absolute path / full command (e.g. `python -m acm_gateway`)."
+        },
+        "acm.routeClaudeCode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Point Claude Code at the gateway by managing env.ANTHROPIC_BASE_URL in your Claude Code settings. Written only once the gateway is healthy and removed on shutdown, so Claude Code is never left pointing at a dead gateway. On a Claude subscription this needs no API key — your own OAuth token is forwarded and monitored."
+        },
+        "acm.routeScope": {
+          "type": "string",
+          "default": "user",
+          "enum": [
+            "user",
+            "project"
+          ],
+          "enumDescriptions": [
+            "Write ANTHROPIC_BASE_URL to ~/.claude/settings.json — applies to every Claude Code session on this machine (recommended; the gateway URL is machine-local).",
+            "Advanced: write to this workspace's .claude/settings.local.json — scoped to this project and not committed to git."
+          ],
+          "description": "Where to manage ANTHROPIC_BASE_URL for Claude Code routing."
         }
       }
     },

@@ -26,7 +26,16 @@ export function rpc<T = any>(method: string, params?: any): Promise<T> {
   });
 }
 
+// Ask the host to open a chat's two-column detail in an editor tab.
+export function openChat(conv: string): void {
+  vscode.postMessage({ type: 'open-chat', conv });
+}
+
 export const mount: string = (window as Window).acmMount || 'panel';
+// The current project root + (for the chat tab) which chat to show — injected by
+// the host into the webview HTML.
+export const projectRoot: string = (window as any).acmProject || '';
+export const chatConv: string = (window as any).acmChat || '';
 
 // Persisted webview state (theme choice, last tab, …). acquireVsCodeApi can only
 // be called once, so these reuse the single instance above.

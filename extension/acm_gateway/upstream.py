@@ -100,19 +100,44 @@ class GenericUpstream:
 
 class AnthropicUpstream:
     """Forward to a real Anthropic Messages API (``/messages``). Auth + version
-    go in headers (``x-api-key`` / ``anthropic-version``), not a bearer token."""
+    go in headers (``x-api-key`` / ``anthropic-version``), not a bearer token.
+
+    Two auth modes:
+      * **api-key** (default) — inject our own ``x-api-key`` (bills API credits).
+      * **passthrough** — forward the client's own ``Authorization: Bearer``
+        header instead. Claude Code on a Claude *subscription* authenticates with
+        an OAuth token; forwarding it untouched lets the request bill the
+        subscription, so we can monitor it without an API key. The caller passes
+        ``auth_header`` (the verbatim ``Authorization`` value) plus
+        ``passthrough_headers`` (the client's identity headers — user-agent,
+        ``x-app``, ``x-stainless-*``, ``anthropic-version``) the OAuth path checks.
+    """
 
     def __init__(self, base_url: str, api_key: str | None, version: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.version = version
 
-    def _headers(self, beta: str | None = None) -> Dict[str, str]:
+    def _headers(
+        self,
+        beta: str | None = None,
+        *,
+        auth_header: str | None = None,
+        passthrough_headers: Dict[str, str] | None = None,
+    ) -> Dict[str, str]:
         h = {
             "Content-Type": "application/json",
             "anthropic-version": self.version,
         }
-        if self.api_key:
+        # Client identity headers first, so a forwarded anthropic-version wins
+        # over our default while we still set the load-bearing ones below.
+        if passthrough_headers:
+            h.update(passthrough_headers)
+        if auth_header:
+            # Subscription / OAuth passthrough: forward the caller's own
+            # credential. Do NOT also send x-api-key — mixing the two 400s.
+            h["Authorization"] = auth_header
+        elif self.api_key:
             h["x-api-key"] = self.api_key
         # Forward the client's anthropic-beta header — Claude Code gates
         # features (interleaved thinking, fine-grained tool streaming, 1M
@@ -125,11 +150,20 @@ class AnthropicUpstream:
         return f"{self.base_url}/messages" + ("?beta=true" if beta_query else "")
 
     async def messages_stream(
-        self, body: Dict[str, Any], *, beta: str | None = None, beta_query: bool = False
+        self,
+        body: Dict[str, Any],
+        *,
+        beta: str | None = None,
+        beta_query: bool = False,
+        auth_header: str | None = None,
+        passthrough_headers: Dict[str, str] | None = None,
     ) -> AsyncIterator[bytes]:
+        headers = self._headers(
+            beta, auth_header=auth_header, passthrough_headers=passthrough_headers
+        )
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream(
-                "POST", self._url(beta_query), headers=self._headers(beta), json=body
+                "POST", self._url(beta_query), headers=headers, json=body
             ) as resp:
                 if resp.status_code >= 400:
                     # Surface the upstream error inside the SSE stream so the
@@ -154,11 +188,20 @@ class AnthropicUpstream:
                     yield chunk
 
     async def messages(
-        self, body: Dict[str, Any], *, beta: str | None = None, beta_query: bool = False
+        self,
+        body: Dict[str, Any],
+        *,
+        beta: str | None = None,
+        beta_query: bool = False,
+        auth_header: str | None = None,
+        passthrough_headers: Dict[str, str] | None = None,
     ) -> Dict[str, Any]:
+        headers = self._headers(
+            beta, auth_header=auth_header, passthrough_headers=passthrough_headers
+        )
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
             resp = await client.post(
-                self._url(beta_query), headers=self._headers(beta), json=body
+                self._url(beta_query), headers=headers, json=body
             )
             resp.raise_for_status()
             return resp.json()

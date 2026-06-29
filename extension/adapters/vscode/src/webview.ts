@@ -4,7 +4,29 @@
 // messages to here, and this dispatches them to the AcmClient (HTTP -> gateway).
 
 import * as vscode from 'vscode';
+import * as fs from 'fs';
 import { AcmClient } from './acmClient';
+
+// Cache-buster for webview resources: VSCode caches the bundle by URL, so without
+// a version that changes on rebuild a reloaded webview can serve a stale main.js
+// (old tabs lingering after a recompile). The UI bundle's mtime changes on every
+// build, so it's a perfect version token.
+function bundleVersion(extUri: vscode.Uri): string {
+  try {
+    const p = vscode.Uri.joinPath(extUri, 'out', 'ui', 'main.js').fsPath;
+    return String(Math.floor(fs.statSync(p).mtimeMs));
+  } catch {
+    return '0';
+  }
+}
+
+// The current project root (workspace folder), injected into webviews as
+// `window.acmProject` so the Chats list scopes to this project's chats — set
+// once on activation by the extension host.
+let _projectRoot = '';
+export function setProjectRoot(root: string): void {
+  _projectRoot = root || '';
+}
 
 function nonce(): string {
   let s = '';
@@ -15,10 +37,18 @@ function nonce(): string {
   return s;
 }
 
-function renderHtml(webview: vscode.Webview, extUri: vscode.Uri, mount: string): string {
+function renderHtml(
+  webview: vscode.Webview,
+  extUri: vscode.Uri,
+  mount: string,
+  conv?: string,
+): string {
   const n = nonce();
-  const js = webview.asWebviewUri(vscode.Uri.joinPath(extUri, 'out', 'ui', 'main.js'));
-  const css = webview.asWebviewUri(vscode.Uri.joinPath(extUri, 'out', 'ui', 'main.css'));
+  const v = bundleVersion(extUri);
+  const js =
+    webview.asWebviewUri(vscode.Uri.joinPath(extUri, 'out', 'ui', 'main.js')).toString() + '?v=' + v;
+  const css =
+    webview.asWebviewUri(vscode.Uri.joinPath(extUri, 'out', 'ui', 'main.css')).toString() + '?v=' + v;
   const csp =
     `default-src 'none'; img-src ${webview.cspSource} data:; ` +
     `font-src ${webview.cspSource}; style-src ${webview.cspSource} 'unsafe-inline'; ` +
@@ -34,7 +64,11 @@ function renderHtml(webview: vscode.Webview, extUri: vscode.Uri, mount: string):
 </head>
 <body>
   <div id="root"></div>
-  <script nonce="${n}">window.acmMount = ${JSON.stringify(mount)};</script>
+  <script nonce="${n}">
+    window.acmMount = ${JSON.stringify(mount)};
+    window.acmProject = ${JSON.stringify(_projectRoot)};
+    window.acmChat = ${JSON.stringify(conv || '')};
+  </script>
   <script nonce="${n}" src="${js}"></script>
 </body>
 </html>`;
@@ -67,6 +101,14 @@ async function dispatch(client: AcmClient, method: string, params: any): Promise
       return client.memoryClear(p.scope || 'user');
     case 'conversations':
       return client.conversations();
+    case 'contextWindows':
+      return client.contextWindows(p.project || '');
+    case 'getContextWindow':
+      return client.getContextWindow(p.conv);
+    case 'setWindowProfile':
+      return client.setWindowProfile(p.conv, { name: p.name, body: p.body, clear: p.clear });
+    case 'deleteWindow':
+      return client.deleteWindow(p.conv);
     case 'messages':
       return client.messages(p.conv || '');
     case 'contextWindow':
@@ -97,9 +139,21 @@ async function dispatch(client: AcmClient, method: string, params: any): Promise
   }
 }
 
-function wireRpc(webview: vscode.Webview, clientFactory: () => AcmClient): vscode.Disposable {
+function wireRpc(
+  webview: vscode.Webview,
+  clientFactory: () => AcmClient,
+  extUri: vscode.Uri,
+): vscode.Disposable {
   return webview.onDidReceiveMessage(async (msg: any) => {
-    if (!msg || msg.type !== 'rpc') {
+    if (!msg) {
+      return;
+    }
+    // A chat row was clicked — open its two-column detail in an editor tab.
+    if (msg.type === 'open-chat' && msg.conv) {
+      openChatPanel(extUri, clientFactory, String(msg.conv));
+      return;
+    }
+    if (msg.type !== 'rpc') {
       return;
     }
     try {
@@ -126,7 +180,7 @@ export class AcmViewProvider implements vscode.WebviewViewProvider {
   resolveWebviewView(view: vscode.WebviewView): void {
     view.webview.options = { enableScripts: true, localResourceRoots: [this.extUri] };
     view.webview.html = renderHtml(view.webview, this.extUri, 'sidebar');
-    wireRpc(view.webview, this.clientFactory);
+    wireRpc(view.webview, this.clientFactory, this.extUri);
   }
 }
 
@@ -145,8 +199,34 @@ export function openSettingsPanel(extUri: vscode.Uri, clientFactory: () => AcmCl
     { enableScripts: true, localResourceRoots: [extUri], retainContextWhenHidden: true },
   );
   panel.webview.html = renderHtml(panel.webview, extUri, 'panel');
-  wireRpc(panel.webview, clientFactory);
+  wireRpc(panel.webview, clientFactory, extUri);
   panel.onDidDispose(() => (panel = undefined));
+}
+
+/** One chat's two-column detail (context window | per-chat settings), opened as
+ *  an editor tab from the Chats list. One panel reused per chat id. */
+const chatPanels = new Map<string, vscode.WebviewPanel>();
+
+export function openChatPanel(
+  extUri: vscode.Uri,
+  clientFactory: () => AcmClient,
+  conv: string,
+): void {
+  const existing = chatPanels.get(conv);
+  if (existing) {
+    existing.reveal(vscode.ViewColumn.Active);
+    return;
+  }
+  const p = vscode.window.createWebviewPanel(
+    'acmChat',
+    'ACM Chat',
+    vscode.ViewColumn.Active,
+    { enableScripts: true, localResourceRoots: [extUri], retainContextWhenHidden: true },
+  );
+  p.webview.html = renderHtml(p.webview, extUri, 'chat', conv);
+  wireRpc(p.webview, clientFactory, extUri);
+  chatPanels.set(conv, p);
+  p.onDidDispose(() => chatPanels.delete(conv));
 }
 
 /** Standalone "Context Window" editor tab — the same React bundle mounted via
@@ -168,6 +248,6 @@ export function openContextWindowPanel(
     { enableScripts: true, localResourceRoots: [extUri], retainContextWhenHidden: true },
   );
   cwPanel.webview.html = renderHtml(cwPanel.webview, extUri, 'context-window');
-  wireRpc(cwPanel.webview, clientFactory);
+  wireRpc(cwPanel.webview, clientFactory, extUri);
   cwPanel.onDidDispose(() => (cwPanel = undefined));
 }

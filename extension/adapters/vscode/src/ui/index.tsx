@@ -1,13 +1,20 @@
 import { createRoot } from 'react-dom/client';
-import { App, ContextWindow } from './App';
+import { App, ContextWindow, ChatDetail } from './App';
+import { chatConv } from './bridge';
 import './styles.css';
 
-// `window.acmMount` is injected by the host (webview.ts -> renderHtml). The
-// standalone "Context Window" editor tab mounts just that view full-screen;
-// every other placement (sidebar view + settings panel) renders the full app.
+// `window.acmMount` is injected by the host (webview.ts -> renderHtml):
+//   'context-window' — the standalone Context Window editor tab
+//   'chat'           — one chat's two-column detail (context window | settings)
+//   anything else    — the full app (sidebar view + settings panel)
 const mount = (window as any).acmMount as string | undefined;
 
 const el = document.getElementById('root');
 if (el) {
-  createRoot(el).render(mount === 'context-window' ? <ContextWindow standalone /> : <App />);
+  const root = createRoot(el);
+  root.render(
+    mount === 'context-window' ? <ContextWindow standalone />
+    : mount === 'chat' ? <ChatDetail conv={chatConv} />
+    : <App />,
+  );
 }
