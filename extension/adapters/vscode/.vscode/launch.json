@@ -1,0 +1,17 @@
+{
+  // Run the ACM extension in a VSCode Extension Development Host.
+  // Open this folder (extension/adapters/vscode) as the workspace, then press F5.
+  // Requires the acm-gateway running (see README "Prerequisites").
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run ACM Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      "outFiles": ["${workspaceFolder}/out/**/*.js"],
+      "preLaunchTask": "npm: compile",
+      "sourceMaps": true
+    }
+  ]
+}

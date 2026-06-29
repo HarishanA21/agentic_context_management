@@ -1,0 +1,31 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "type": "npm",
+      "script": "compile",
+      "label": "npm: compile",
+      "detail": "tsc host build + esbuild webview bundle",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "type": "npm",
+      "script": "watch",
+      "label": "npm: watch",
+      "detail": "Recompile host TS on change (run 'npm: watch:ui' for the webview)",
+      "group": "build",
+      "isBackground": true,
+      "problemMatcher": ["$tsc-watch"]
+    },
+    {
+      "type": "npm",
+      "script": "watch:ui",
+      "label": "npm: watch:ui",
+      "detail": "Rebuild the React webview bundle on change",
+      "group": "build",
+      "isBackground": true,
+      "problemMatcher": []
+    }
+  ]
+}

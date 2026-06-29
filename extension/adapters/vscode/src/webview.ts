@@ -69,6 +69,8 @@ async function dispatch(client: AcmClient, method: string, params: any): Promise
       return client.conversations();
     case 'messages':
       return client.messages(p.conv || '');
+    case 'contextWindow':
+      return client.contextWindow(p.conv || '');
     case 'dropMessage':
       return client.dropMessage(p.fp, p.conv || '');
     case 'restoreMessage':
@@ -145,4 +147,27 @@ export function openSettingsPanel(extUri: vscode.Uri, clientFactory: () => AcmCl
   panel.webview.html = renderHtml(panel.webview, extUri, 'panel');
   wireRpc(panel.webview, clientFactory);
   panel.onDidDispose(() => (panel = undefined));
+}
+
+/** Standalone "Context Window" editor tab — the same React bundle mounted via
+ *  the `context-window` flag so it renders just that view full-screen. */
+let cwPanel: vscode.WebviewPanel | undefined;
+
+export function openContextWindowPanel(
+  extUri: vscode.Uri,
+  clientFactory: () => AcmClient,
+): void {
+  if (cwPanel) {
+    cwPanel.reveal(vscode.ViewColumn.Active);
+    return;
+  }
+  cwPanel = vscode.window.createWebviewPanel(
+    'acmContextWindow',
+    'ACM Context Window',
+    vscode.ViewColumn.Active,
+    { enableScripts: true, localResourceRoots: [extUri], retainContextWhenHidden: true },
+  );
+  cwPanel.webview.html = renderHtml(cwPanel.webview, extUri, 'context-window');
+  wireRpc(cwPanel.webview, clientFactory);
+  cwPanel.onDidDispose(() => (cwPanel = undefined));
 }

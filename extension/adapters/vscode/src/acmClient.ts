@@ -103,6 +103,14 @@ export class AcmClient {
     return this.request('GET', '/messages?conv=' + encodeURIComponent(conv));
   }
 
+  // The exact payload last forwarded upstream (post-pipeline) for a conversation.
+  contextWindow(conv = ''): Promise<AcmContextWindow> {
+    return this.request<AcmContextWindow>(
+      'GET',
+      '/context_window?conv=' + encodeURIComponent(conv),
+    );
+  }
+
   dropMessage(fp: string, conv = ''): Promise<{ ok: boolean }> {
     return this.request('POST', '/messages/drop', { fp, conv: conv || null });
   }
@@ -180,6 +188,19 @@ export interface AcmMessageRow {
   preview: string;
   tool_call_id: string;
   dropped: boolean;
+}
+
+// The exact wire body the gateway last forwarded upstream for a conversation.
+// `messages` / `system` / `tools` are raw provider-shaped JSON (OpenAI or
+// Anthropic, per `surface`); the UI normalises them for display.
+export interface AcmContextWindow {
+  conversation: string;
+  ts: number;
+  surface: '' | 'openai' | 'anthropic';
+  model: string;
+  system: unknown;
+  messages: any[];
+  tools: any[];
 }
 
 export interface RelevanceSuggestion {

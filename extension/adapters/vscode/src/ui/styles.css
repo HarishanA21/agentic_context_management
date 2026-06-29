@@ -161,3 +161,16 @@ input[type='text'] { min-width: 150px; }
 .toast { font-size: 11px; color: var(--fg-muted); }
 .spin { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: sp 0.7s linear infinite; vertical-align: middle; }
 @keyframes sp { to { transform: rotate(360deg); } }
+
+/* ── context window (markdown render) ─────────────────── */
+.cw-md { font-size: 12px; overflow-wrap: anywhere; }
+.cw-md > :first-child { margin-top: 0; }
+.cw-md > :last-child { margin-bottom: 0; }
+.cw-md p { margin: 4px 0; }
+.cw-md ul, .cw-md ol { margin: 4px 0; padding-left: 18px; }
+.cw-md h1, .cw-md h2, .cw-md h3, .cw-md h4 { font-size: 12.5px; margin: 8px 0 4px; }
+.cw-md pre { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.cw-md code { font-family: var(--vscode-editor-font-family, monospace); }
+.cw-md blockquote { margin: 4px 0; padding-left: 8px; border-left: 2px solid var(--border); color: var(--fg-muted); }
+.cw-md img { max-width: 140px; height: auto; border-radius: 4px; }
+.cw-md table { border-collapse: collapse; } .cw-md td, .cw-md th { border: 1px solid var(--border); padding: 2px 6px; }

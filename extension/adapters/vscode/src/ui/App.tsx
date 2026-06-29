@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
+import ReactMarkdown from 'react-markdown';
 import { rpc, getState, setState } from './bridge';
 
 type Theme = 'auto' | 'light' | 'dark';
@@ -35,7 +36,7 @@ function classify(m: any): { cls: string; label: string; context: boolean } {
   return { cls: 'system', label: 'System', context: true };
 }
 
-const TABS = ['Overview', 'Chats', 'Cleanup', 'Techniques', 'Profiles', 'Providers', 'Memory'];
+const TABS = ['Overview', 'Context Window', 'Chats', 'Cleanup', 'Techniques', 'Profiles', 'Providers', 'Memory'];
 
 // Per-label colour for relevance suggestion cards (theme-agnostic alpha fills).
 const LABEL_STYLE: Record<string, { bg: string; fg: string; label: string }> = {
@@ -124,6 +125,7 @@ export function App() {
 
       <main className="body">
         {tab === 'Overview' && <Overview status={status} reachable={reachable} onRefresh={poll} />}
+        {tab === 'Context Window' && <ContextWindow />}
         {tab === 'Chats' && <Chats />}
         {tab === 'Cleanup' && <Cleanup />}
         {tab === 'Techniques' && <Techniques />}
@@ -932,4 +934,357 @@ function Memory() {
         items.map((it, i) => <div className="card tiny" key={i}>{it}</div>)}
     </div>
   );
+}
+
+// ── Context Window (the exact payload we forward to the model each call) ──
+// The gateway snapshots this AFTER its technique pipeline runs (drops + trimming
+// + summaries already applied), so it is literally "what the model sees on every
+// call" — distinct from the Chats tab, which shows the incoming messages.
+type CwCat = 'context' | 'tools' | 'skills' | 'user' | 'thinking' | 'assistant' | 'tool';
+const CW_SECTIONS: { cat: CwCat; title: string }[] = [
+  { cat: 'context', title: 'Context window' },
+  { cat: 'tools', title: 'Available tools' },
+  { cat: 'skills', title: 'Skills' },
+  { cat: 'user', title: 'User message' },
+  { cat: 'thinking', title: 'Thinking' },
+  { cat: 'assistant', title: 'My response' },
+  { cat: 'tool', title: 'Tool response' },
+];
+// Which role-colour badge each section/segment uses (reuses the .badge.* styles).
+const CW_BADGE: Record<CwCat, string> = {
+  context: 'context', tools: 'system', skills: 'system',
+  user: 'user', thinking: 'assistant', assistant: 'assistant', tool: 'tool',
+};
+
+// Same ~4-chars/token estimate the HUD / Overview / gateway use, kept consistent.
+const estTok = (s: string): number => (s && s.trim() ? Math.max(1, Math.ceil(s.length / 4)) : 0);
+
+// Flatten provider-shaped content (string | block[]) to plain text/markdown.
+function cwFlatten(content: any): string {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((b) => {
+        if (typeof b === 'string') return b;
+        if (!b || typeof b !== 'object') return String(b ?? '');
+        if (b.type === 'text') return b.text || '';
+        if (b.type === 'thinking') return b.thinking || '';
+        if (b.type === 'image' || b.type === 'image_url') return '_[image]_';
+        if (b.type === 'tool_use') return '→ called `' + (b.name || 'tool') + '`' + (b.input ? ' `' + JSON.stringify(b.input) + '`' : '');
+        if (b.type === 'tool_result') return cwFlatten(b.content);
+        return b.text || '';
+      })
+      .filter(Boolean)
+      .join('\n\n');
+  }
+  return String(content);
+}
+
+// Pull a "skills are available" listing out of context text (the header line —
+// which may be followed by a blank line — plus the bullet list under it).
+const CW_SKILLS_RE = /The following skills are available[^\n]*\n+(?:[ \t]*-[^\n]*\n?)+/;
+
+type CwSeg = { cat: CwCat; label: string; text: string; tokens: number };
+type CwRaw = { label: string; cls: string; text: string };
+type CwAnalysis = {
+  segments: CwSeg[];
+  raw: CwRaw[];
+  tools: { name: string; desc: string; tokens: number }[];
+  catTokens: Record<string, number>;
+  total: number;
+};
+
+// Normalise the captured wire body (either provider surface) into: categorised
+// segments (Proper format / Token usage) + an ordered per-message list (Raw).
+function cwAnalyze(data: any): CwAnalysis {
+  const surface = (data && data.surface) || '';
+  const msgs: any[] = data && Array.isArray(data.messages) ? data.messages : [];
+  const segments: CwSeg[] = [];
+  const raw: CwRaw[] = [];
+  let skills = '';
+
+  const harvestSkills = (text: string): string => {
+    const m = text.match(CW_SKILLS_RE);
+    if (m) { skills += (skills ? '\n\n' : '') + m[0].trim(); return text.replace(m[0], '').trim(); }
+    return text;
+  };
+  const pushSeg = (cat: CwCat, label: string, text: string) => {
+    if (text && text.trim()) segments.push({ cat, label, text, tokens: estTok(text) });
+  };
+
+  // Anthropic: the system prompt is a separate field, not a message.
+  if (surface === 'anthropic' && data.system != null) {
+    const sysFull = cwFlatten(data.system);
+    pushSeg('context', 'System prompt', harvestSkills(sysFull));
+    raw.push({ label: 'System', cls: 'context', text: sysFull });
+  }
+
+  for (const m of msgs) {
+    const role = String((m && m.role) || '').toLowerCase();
+    const full = cwFlatten(m && m.content);
+    if (role === 'system') {
+      pushSeg('context', 'System prompt', harvestSkills(full));
+      raw.push({ label: 'System', cls: 'context', text: full });
+    } else if (role === 'user' || role === 'human') {
+      // Anthropic returns tool results on a user-role message — treat as tool.
+      const isToolResult = Array.isArray(m.content) && m.content.some((b: any) => b && b.type === 'tool_result');
+      if (isToolResult) {
+        pushSeg('tool', 'Tool result', full);
+        raw.push({ label: 'Tool', cls: 'tool', text: full });
+      } else {
+        const ctx = CONTEXT_RE.test(full);
+        pushSeg(ctx ? 'context' : 'user', ctx ? 'Injected context' : 'User', ctx ? harvestSkills(full) : full);
+        raw.push({ label: ctx ? 'Context' : 'User', cls: ctx ? 'context' : 'user', text: full });
+      }
+    } else if (role === 'assistant' || role === 'ai') {
+      let thinking = '';
+      let say = '';
+      if (Array.isArray(m.content)) {
+        for (const b of m.content) {
+          if (!b || typeof b !== 'object') { say += String(b ?? ''); continue; }
+          if (b.type === 'thinking') thinking += (b.thinking || '') + '\n';
+          else if (b.type === 'text') say += (b.text || '') + '\n';
+          else if (b.type === 'tool_use') say += '→ called `' + (b.name || 'tool') + '`' + (b.input ? ' `' + JSON.stringify(b.input) + '`' : '') + '\n';
+        }
+      } else {
+        say = typeof m.content === 'string' ? m.content : cwFlatten(m.content);
+      }
+      // OpenAI tool calls live on the message, not in content blocks.
+      const calls = Array.isArray(m.tool_calls) ? m.tool_calls : [];
+      for (const c of calls) {
+        const fn = (c && c.function) || {};
+        say += '→ called `' + (fn.name || (c && c.name) || 'tool') + '`' + (fn.arguments ? ' `' + fn.arguments + '`' : '') + '\n';
+      }
+      pushSeg('thinking', 'Thinking', thinking.trim());
+      pushSeg('assistant', 'My response', say.trim());
+      const rawText = [thinking.trim() && ('> 🧠 ' + thinking.trim().replace(/\n/g, '\n> ')), say.trim()].filter(Boolean).join('\n\n') || full;
+      raw.push({ label: 'Assistant', cls: 'assistant', text: rawText });
+    } else if (role === 'tool') {
+      pushSeg('tool', 'Tool result', full);
+      raw.push({ label: 'Tool', cls: 'tool', text: full });
+    } else {
+      pushSeg('context', role || 'Other', full);
+      raw.push({ label: role || 'Other', cls: 'system', text: full });
+    }
+  }
+
+  if (skills) pushSeg('skills', 'Skills', skills);
+
+  const toolsArr: any[] = data && Array.isArray(data.tools) ? data.tools : [];
+  const tools = toolsArr.map((t) => {
+    const fn = (t && t.function) || t || {};
+    return {
+      name: fn.name || (t && t.name) || '(unnamed)',
+      desc: fn.description || (t && t.description) || '',
+      tokens: estTok(JSON.stringify(t || {})),
+    };
+  });
+
+  const catTokens: Record<string, number> = {};
+  for (const s of segments) catTokens[s.cat] = (catTokens[s.cat] || 0) + s.tokens;
+  catTokens.tools = tools.reduce((acc, t) => acc + t.tokens, 0);
+  const total = Object.values(catTokens).reduce((acc, n) => acc + n, 0);
+
+  return { segments, raw, tools, catTokens, total };
+}
+
+function CwMd({ text }: { text: string }) {
+  return <div className="cw-md"><ReactMarkdown>{text}</ReactMarkdown></div>;
+}
+
+// One collapsible message/segment block; long blocks (e.g. the system prompt)
+// can be folded for navigation but default to fully expanded ("show fully").
+function CwBlock({ label, cls, tokens, text }: { label: string; cls: string; tokens?: number; text: string }) {
+  const [open, setOpen] = useState(true);
+  const long = text.length > 1500;
+  return (
+    <div className={'msg ' + cls}>
+      <div className="rail" />
+      <div className="content">
+        <div className="head">
+          <span className={'badge ' + cls}>{label}</span>
+          {typeof tokens === 'number' ? <span className="muted tiny">≈{fmtTok(tokens)} tok</span> : null}
+          {long ? <button className="btn ghost sm act" onClick={() => setOpen((v) => !v)}>{open ? 'Collapse' : 'Expand'}</button> : null}
+        </div>
+        {open ? <CwMd text={text} /> : <div className="muted tiny">{text.slice(0, 160)}…</div>}
+      </div>
+    </div>
+  );
+}
+
+function CwProper({ a }: { a: CwAnalysis }) {
+  const sections = CW_SECTIONS.map((sec) => {
+    if (sec.cat === 'tools') {
+      if (!a.tools.length) return null;
+      return (
+        <div key="tools">
+          <h3 className="sec">{sec.title} <span className="muted tiny">· {a.tools.length} · ≈{fmtTok(a.catTokens.tools || 0)} tok</span></h3>
+          <div className="card">
+            {a.tools.map((t, i) => (
+              <div key={i} className="msg system">
+                <div className="rail" />
+                <div className="content">
+                  <div className="head"><code>{t.name}</code><span className="muted tiny act">≈{fmtTok(t.tokens)} tok</span></div>
+                  {t.desc ? <div className="muted tiny">{t.desc}</div> : null}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+    const segs = a.segments.filter((s) => s.cat === sec.cat);
+    if (!segs.length) return null;
+    const tok = segs.reduce((x, s) => x + s.tokens, 0);
+    return (
+      <div key={sec.cat}>
+        <h3 className="sec">{sec.title} <span className="muted tiny">· {segs.length} · ≈{fmtTok(tok)} tok</span></h3>
+        <div className="card">
+          {segs.map((s, i) => <CwBlock key={i} label={s.label} cls={CW_BADGE[s.cat]} tokens={s.tokens} text={s.text} />)}
+        </div>
+      </div>
+    );
+  }).filter(Boolean);
+  return <div>{sections}</div>;
+}
+
+function CwRawView({ a }: { a: CwAnalysis }) {
+  return (
+    <div className="card">
+      {a.raw.map((m, i) => <CwBlock key={i} label={m.label} cls={m.cls} text={m.text} />)}
+      {a.tools.length ? (
+        <div className="msg system">
+          <div className="rail" />
+          <div className="content">
+            <div className="head"><span className="badge system">Tools</span><span className="muted tiny act">{a.tools.length} available</span></div>
+            <CwMd text={a.tools.map((t) => '- `' + t.name + '`' + (t.desc ? ' — ' + t.desc : '')).join('\n')} />
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function CwTokens({ a }: { a: CwAnalysis }) {
+  const rows = CW_SECTIONS
+    .map((s) => ({ title: s.title, cls: CW_BADGE[s.cat], tok: a.catTokens[s.cat] || 0 }))
+    .filter((r) => r.tok > 0);
+  const max = rows.reduce((m, r) => Math.max(m, r.tok), 1);
+  return (
+    <div>
+      <div className="card" style={{ padding: 14 }}>
+        <div style={{ fontSize: 26, fontWeight: 700, lineHeight: 1.1 }}>
+          {fmtTok(a.total)}<span className="muted" style={{ fontSize: 13, fontWeight: 400 }}> tokens sent each call</span>
+        </div>
+        <div className="muted tiny" style={{ marginTop: 3 }}>estimated at ~4 chars/token, summed across everything in the forwarded payload</div>
+      </div>
+      <h3 className="sec">Breakdown by section</h3>
+      <div className="card">
+        {rows.map((r, i) => {
+          const pct = a.total > 0 ? Math.round((r.tok / a.total) * 100) : 0;
+          return (
+            <div key={i} style={{ marginBottom: 10 }}>
+              <div className="row" style={{ justifyContent: 'space-between' }}>
+                <span className={'badge ' + r.cls}>{r.title}</span>
+                <span className="muted tiny">{fmtTok(r.tok)} tok · {pct}%</span>
+              </div>
+              <div style={{ height: 8, borderRadius: 5, overflow: 'hidden', marginTop: 5, background: 'rgba(127,127,127,0.18)' }}>
+                <div style={{ width: Math.max(2, Math.round((r.tok / max) * 100)) + '%', height: '100%', background: 'var(--accent)' }} />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+export function ContextWindow({ standalone }: { standalone?: boolean }) {
+  const [theme] = useState<Theme>(() => (getState().theme as Theme) || 'auto');
+  const [convs, setConvs] = useState<any[]>([]);
+  const [sel, setSel] = useState('');
+  const [data, setData] = useState<any>(null);
+  const [view, setView] = useState<'proper' | 'raw' | 'tokens'>('proper');
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    rpc('conversations').then((d: any) => {
+      const list = d.conversations || [];
+      setConvs(list);
+      setSel((cur) => cur || (list[0] ? list[0].key : ''));
+    }).catch(() => {}).finally(() => setReady(true));
+  }, []);
+
+  const load = useCallback(() => {
+    rpc('contextWindow', { conv: sel }).then((d: any) => setData(d)).catch(() => setData(null));
+  }, [sel]);
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 5000);
+    return () => clearInterval(id);
+  }, [load]);
+
+  const a = data ? cwAnalyze(data) : null;
+  const has = !!(a && (a.segments.length || a.tools.length));
+  const views: [typeof view, string][] = [['proper', 'Proper format'], ['raw', 'Raw'], ['tokens', 'Token usage']];
+
+  const controls = (
+    <>
+      <div className="row" style={{ justifyContent: 'space-between' }}>
+        <div className="row" style={{ gap: 6 }}>
+          {convs.length > 0 ? (
+            <select value={sel} onChange={(e) => setSel(e.target.value)} style={{ maxWidth: 280 }}>
+              {convs.map((c) => <option key={c.key} value={c.key}>{c.title || c.key}</option>)}
+            </select>
+          ) : <span className="muted tiny">no conversations yet</span>}
+          <button className="btn sec sm" onClick={load}>Refresh</button>
+        </div>
+        <div className="row" style={{ gap: 4 }}>
+          {views.map(([k, label]) => (
+            <button key={k} className={'btn sm ' + (view === k ? '' : 'ghost')} onClick={() => setView(k)}>{label}</button>
+          ))}
+        </div>
+      </div>
+      {a && data && data.ts ? (
+        <p className="muted tiny" style={{ marginTop: 8 }}>
+          {data.model ? <>Model <code>{data.model}</code> · </> : null}
+          {data.surface || '—'} · <strong>{fmtTok(a.total)}</strong> tokens sent each call · {a.segments.length} parts · captured {rel(data.ts)}
+        </p>
+      ) : null}
+      <p className="muted tiny" style={{ marginTop: 4 }}>
+        The exact message array the gateway forwards to the model every call, after
+        context-management (drops, trimming, summarisation) is applied.
+      </p>
+    </>
+  );
+
+  const inner = !ready ? <Loading /> : !has ? (
+    <div className="empty">
+      <p>No model call captured yet.</p>
+      <p className="tiny">Point your IDE's model endpoint at the gateway and send a message —
+        the exact payload we forward will appear here.</p>
+    </div>
+  ) : view === 'proper' ? <CwProper a={a!} />
+    : view === 'raw' ? <CwRawView a={a!} />
+    : <CwTokens a={a!} />;
+
+  if (standalone) {
+    return (
+      <div className="acm" data-theme={theme}>
+        <header className="hd">
+          <svg className="logo" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M12 3 3 7.5 12 12l9-4.5L12 3Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+            <path d="m3 12 9 4.5L21 12M3 16.5l9 4.5 9-4.5" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+          </svg>
+          <div style={{ minWidth: 0 }}>
+            <div className="title">ACM Context Window</div>
+            <div className="sub">what we send to the model each call</div>
+          </div>
+        </header>
+        <main className="body">{controls}{inner}</main>
+      </div>
+    );
+  }
+  return <div>{controls}{inner}</div>;
 }
