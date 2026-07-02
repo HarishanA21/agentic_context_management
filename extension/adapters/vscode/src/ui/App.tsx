@@ -1,6 +1,8 @@
 import { useEffect, useState, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { rpc, getState, setState, openChat, projectRoot, chatConv } from './bridge';
+import { rpc, getState, setState, openChat, projectRoot, chatConv, useAcmEvents } from './bridge';
+import type { AcmEvent } from './bridge';
+import { Onboarding } from './Onboarding';
 
 type Theme = 'auto' | 'light' | 'dark';
 const THEME_ICON: Record<Theme, string> = { auto: '◐', light: '☀', dark: '☾' };
@@ -11,6 +13,16 @@ const useReload = (): [number, () => void] => {
   const [n, setN] = useState(0);
   return [n, useCallback(() => setN((x) => x + 1), [])];
 };
+// A chat's conversation key is a long hash (e.g. "s7f3a..._c91b2..."). The full
+// string is noise in the UI; this distils it to a short, stable handle like
+// "#c91b2" so each chat has a readable identifier next to its title without two
+// chats ever colliding visually.
+function shortId(conv: string): string {
+  if (!conv) return '#????';
+  const tail = conv.includes('_') ? conv.slice(conv.lastIndexOf('_') + 1) : conv;
+  return '#' + tail.replace(/^c/, '').slice(0, 5);
+}
+
 function rel(ts: number): string {
   if (!ts) return '';
   const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
@@ -71,6 +83,14 @@ export function App() {
   const [status, setStatus] = useState<any>(null);
   const [reachable, setReachable] = useState<boolean | null>(null);
   const [theme, setTheme] = useState<Theme>(() => (getState().theme as Theme) || 'auto');
+  // First-run onboarding: show until the user gets started, then never again
+  // (persisted in webview state). They can reopen it from the header.
+  const [onboarded, setOnboarded] = useState<boolean>(() => Boolean(getState().onboarded));
+
+  const finishOnboarding = () => {
+    setOnboarded(true);
+    setState({ onboarded: true });
+  };
 
   const cycleTheme = () => {
     const next = NEXT_THEME[theme];
@@ -86,6 +106,14 @@ export function App() {
     const id = setInterval(poll, 5000);
     return () => clearInterval(id);
   }, [poll]);
+
+  if (!onboarded) {
+    return (
+      <div className="acm" data-theme={theme}>
+        <Onboarding onDone={finishOnboarding} />
+      </div>
+    );
+  }
 
   return (
     <div className="acm" data-theme={theme}>
@@ -169,12 +197,25 @@ function Overview({ status, reachable, onRefresh }: any) {
   const ctx = status.context || {};
   const live = Number(ctx.tokens || 0);
   const saved = Number(ctx.saved_tokens || 0);
+  const notices: any[] = status.notices || [];
   const orig = live + saved;
   const livePct = orig > 0 ? Math.max(2, Math.round((live / orig) * 100)) : 100;
   const savedPct = orig > 0 ? Math.round((saved / orig) * 100) : 0;
 
   return (
     <div>
+      {/* Degraded-mode notices — config gaps that silently weaken ACM */}
+      {notices.length > 0 && (
+        <div className="notices">
+          {notices.map((n: any, i: number) => (
+            <div key={i} className={'notice ' + (n.level === 'error' ? 'error' : 'warn')}>
+              <span className="notice-dot" />
+              <span>{n.message}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Context gauge — the headline number for a context-management tool */}
       <div className="card" style={{ padding: 14 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
@@ -241,8 +282,9 @@ function Overview({ status, reachable, onRefresh }: any) {
         <ul className="timeline">
           {events.map((e: any, i: number) => (
             <li key={i}>
-              <span className="t">{e.type}</span>
+              <span className={'t' + (e.type === 'notice' ? ' ' + (e.level === 'error' ? 'error' : 'warn') : '')}>{e.type === 'notice' ? (e.step || 'notice') : e.type}</span>
               <span className="muted tiny">
+                {e.type === 'notice' ? e.message : ''}
                 {e.freed_tokens ? `freed ~${e.freed_tokens} tok` : ''}
                 {e.cleared ? ` · cleared ${e.cleared}` : ''}
                 {e.removed ? ` · removed ${e.removed}` : ''}
@@ -279,13 +321,29 @@ function Chats() {
     }).catch(() => setLoading(false));
   }, [n]);
 
-  const del = (e: any, id: string) => {
+  // Realtime: any turn or window change refreshes the chats list (live titles,
+  // token counts, and newly-created chats appear without a manual refresh).
+  useAcmEvents(useCallback(() => reload(), [reload]));
+
+  const del = async (e: any, id: string) => {
     e.stopPropagation();
-    if (!window.confirm(
-      'Delete this context window and all its ACM state (drop-list, summaries)? ' +
-      'The chat in your IDE is unaffected.')) return;
+    const ok = await rpc('confirm', {
+      message: 'Delete this context window and all its ACM state (drop-list, summaries)? ' +
+        'The chat in your IDE is unaffected.',
+    });
+    if (!ok) return;
     setBusy(true);
     rpc('deleteWindow', { conv: id }).then(reload).finally(() => setBusy(false));
+  };
+
+  const clearAll = async () => {
+    const ok = await rpc('confirm', {
+      message: 'Clear ALL chats and captured state (context windows, drop-lists, summaries)? ' +
+        'Provider config and memory are unaffected. This cannot be undone.',
+    });
+    if (!ok) return;
+    setBusy(true);
+    rpc('resetWindows', {}).then(reload).finally(() => setBusy(false));
   };
 
   if (loading) return <Loading />;
@@ -303,7 +361,11 @@ function Chats() {
     <div>
       <div className="row" style={{ alignItems: 'baseline', justifyContent: 'space-between' }}>
         <h3 className="sec" style={{ margin: 0 }}>Chats <span className="muted tiny">— this project · click to open</span></h3>
-        <button className="btn sec sm" onClick={reload}>Refresh</button>
+        <span className="row" style={{ gap: 6 }}>
+          <button className="btn sec sm" onClick={reload}>Refresh</button>
+          <button className="btn sec sm ghost" disabled={busy} onClick={clearAll}
+            title="Clear all chats and captured state">Clear all</button>
+        </span>
       </div>
       <p className="muted tiny">Each chat is its own context window with its own techniques. Open one to
         see exactly what's sent to the model and tune that chat's settings.</p>
@@ -314,7 +376,7 @@ function Chats() {
               <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {c.title || 'Untitled chat'}
               </span>
-              <span className="muted tiny" style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)' }}>{c.id}</span>
+              <span className="muted tiny" style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)' }} title={c.id}>{shortId(c.id)}</span>
             </span>
             <span className="meta">
               <span className="badge" title="Active technique profile for this chat">{profileLabel(c)}</span>
@@ -364,8 +426,8 @@ export function ChatDetail({ conv }: { conv: string }) {
           <path d="m3 12 9 4.5L21 12M3 16.5l9 4.5 9-4.5" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
         </svg>
         <div style={{ minWidth: 0 }}>
-          <div className="title">{win?.title || 'Chat'}</div>
-          <div className="sub" style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)' }}>{conv}</div>
+          <div className="title">{win?.title || 'Untitled chat'}</div>
+          <div className="sub" style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)' }} title={conv}>{shortId(conv)}</div>
         </div>
       </header>
       <main className="body">
@@ -1321,24 +1383,45 @@ export function ContextWindow({ standalone, conv }: { standalone?: boolean; conv
   const [view, setView] = useState<'proper' | 'raw' | 'tokens'>('proper');
   const [ready, setReady] = useState(!!conv);
 
-  useEffect(() => {
-    // Pinned to one chat (chat detail) — no conversation picker needed.
-    if (conv) { setSel(conv); setReady(true); return; }
+  const loadConvs = useCallback(() => {
     rpc('conversations').then((d: any) => {
       const list = d.conversations || [];
       setConvs(list);
       setSel((cur) => cur || (list[0] ? list[0].key : ''));
     }).catch(() => {}).finally(() => setReady(true));
-  }, [conv]);
+  }, []);
+  useEffect(() => {
+    // Pinned to one chat (chat detail) — no conversation picker needed.
+    if (conv) { setSel(conv); setReady(true); return; }
+    loadConvs();
+  }, [conv, loadConvs]);
 
   const load = useCallback(() => {
     rpc('contextWindow', { conv: sel }).then((d: any) => setData(d)).catch(() => setData(null));
   }, [sel]);
   useEffect(() => {
     load();
-    const id = setInterval(load, 5000);
+    // Slow fallback poll; realtime events below do the heavy lifting.
+    const id = setInterval(load, 15000);
     return () => clearInterval(id);
   }, [load]);
+
+  // When following, the panel tracks whichever chat last sent a turn — so it
+  // always shows the context window for the chat you're actively using in the
+  // IDE. Turned off the moment you pick a chat by hand. Pinned panels (a `conv`
+  // prop, i.e. chat detail) never follow.
+  const [follow, setFollow] = useState(!conv);
+
+  // Realtime: refresh the moment this chat's window changes. Events for other
+  // chats only refresh the picker (titles/token counts), not the open data.
+  const onEvent = useCallback((e: AcmEvent) => {
+    if (!conv) loadConvs();
+    if (!conv && follow && e.type === 'turn' && e.conv) { setSel(e.conv); return; }
+    if (!e.conv || e.conv === sel) load();
+  }, [conv, sel, follow, load, loadConvs]);
+  useAcmEvents(onEvent);
+
+  const pick = useCallback((key: string) => { setFollow(false); setSel(key); }, []);
 
   const a = data ? cwAnalyze(data) : null;
   const has = !!(a && (a.segments.length || a.tools.length));
@@ -1347,13 +1430,16 @@ export function ContextWindow({ standalone, conv }: { standalone?: boolean; conv
   const controls = (
     <>
       <div className="row" style={{ justifyContent: 'space-between' }}>
-        <div className="row" style={{ gap: 6 }}>
+        <div className="row" style={{ gap: 6, alignItems: 'center' }}>
           {!conv && (convs.length > 0 ? (
-            <select value={sel} onChange={(e) => setSel(e.target.value)} style={{ maxWidth: 280 }}>
-              {convs.map((c) => <option key={c.key} value={c.key}>{c.title || c.key}</option>)}
+            <select value={sel} onChange={(e) => pick(e.target.value)} style={{ maxWidth: 280 }}>
+              {convs.map((c) => <option key={c.key} value={c.key}>{(c.title || 'Untitled chat') + ' · ' + shortId(c.key)}</option>)}
             </select>
           ) : <span className="muted tiny">no conversations yet</span>)}
-          <button className="btn sec sm" onClick={load}>Refresh</button>
+          {!conv && (follow
+            ? <span className="badge" title="Tracking whichever chat you're actively using">● following active chat</span>
+            : <button className="btn sec sm" onClick={() => setFollow(true)} title="Track the chat you're actively using">Follow active</button>
+          )}
         </div>
         <div className="row" style={{ gap: 4 }}>
           {views.map(([k, label]) => (
@@ -1394,7 +1480,9 @@ export function ContextWindow({ standalone, conv }: { standalone?: boolean; conv
           </svg>
           <div style={{ minWidth: 0 }}>
             <div className="title">ACM Context Window</div>
-            <div className="sub">what we send to the model each call</div>
+            <div className="sub" title={sel}>
+              {sel ? (convs.find((c) => c.key === sel)?.title || 'Untitled chat') + ' · ' + shortId(sel) : 'what we send to the model each call'}
+            </div>
           </div>
         </header>
         <main className="body">{controls}{inner}</main>

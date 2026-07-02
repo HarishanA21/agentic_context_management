@@ -54,6 +54,7 @@ from .config import (
     load_visual_cfg,
     user_config_path,
 )
+from . import events
 from .context_windows import ContextWindowStore, in_project
 from .droplist import (
     DropStore,
@@ -259,7 +260,62 @@ def status() -> Dict[str, Any]:
             "dropped": sum(1 for r in rows if r.get("dropped")),
         },
         "last_events": _LAST_EVENTS[-20:],
+        "notices": _compute_notices(profile),
     }
+
+
+def _compute_notices(profile) -> List[Dict[str, str]]:
+    """Standing degraded-mode warnings for the Overview panel.
+
+    Unlike pipeline notices (per-turn, transient), these describe configuration
+    gaps that persist across turns: no summariser key, or a relevance encoder
+    that fell back to the untrained lexical backend."""
+    notices: List[Dict[str, str]] = []
+    cm = profile.context_management
+
+    if getattr(cm.summarization, "enabled", False) and not (
+        _SETTINGS.upstream_api_key or _SETTINGS.anthropic_api_key
+    ):
+        notices.append(
+            {
+                "level": "warn",
+                "step": "summarization",
+                "message": "Summarization is on but no upstream API key is configured — it will be skipped. Add one in Providers.",
+            }
+        )
+
+    rel = getattr(cm, "relevance_pruning", None)
+    if rel is not None and getattr(rel, "enabled", False):
+        mode = str(getattr(rel, "mode", "judge"))
+        if mode in ("encoder", "ensemble"):
+            encoder_path = getattr(rel, "encoder_path", None) or _SETTINGS.encoder_path
+            enc = _get_encoder(
+                encoder_path,
+                float(getattr(rel, "drop_threshold", 0.35) or 0.35),
+                float(getattr(rel, "summarize_threshold", 0.6) or 0.6),
+            )
+            if enc is None:
+                notices.append(
+                    {
+                        "level": "error",
+                        "step": "relevance_pruning",
+                        "message": "Relevance encoder could not be loaded — relevance pruning is unavailable.",
+                    }
+                )
+                return notices
+            try:
+                enc._ensure_loaded()
+            except Exception:  # pragma: no cover - defensive
+                pass
+            if getattr(enc, "backend", None) == "lexical":
+                notices.append(
+                    {
+                        "level": "warn",
+                        "step": "relevance_pruning",
+                        "message": "Relevance is using the untrained lexical fallback — suggestions are heuristic. Train or set an encoder model for better accuracy.",
+                    }
+                )
+    return notices
 
 
 def _pick_summariser(model: str | None):
@@ -444,6 +500,18 @@ async def memory_clear(request: Request) -> Any:
 # ─── manual message removal (drop-list) ──────────────────────────────────
 
 
+@app.get("/events")
+async def events_stream() -> StreamingResponse:
+    """Realtime push of context-window changes (Server-Sent Events). The VSCode
+    host subscribes here and relays each event to its webviews, so the panels
+    update the instant a turn flows through instead of waiting for a poll."""
+    return StreamingResponse(
+        events.stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/conversations")
 def list_conversations() -> Dict[str, Any]:
     """Conversations the gateway has seen this run, newest first (for the UI)."""
@@ -558,6 +626,7 @@ async def set_context_window_profile(conv: str, request: Request) -> Any:
             {"error": "provide 'name', 'body', or 'clear'"}, status_code=400
         )
     _record([{"type": "context_window_profile", "conversation": conv}])
+    events.publish({"type": "window", "conv": conv, "action": "profile"})
     return JSONResponse(_window_view(conv, include_profile=True))
 
 
@@ -567,19 +636,34 @@ def delete_context_window(conv: str) -> Any:
     (drop-list, summaries, snapshots)."""
     existed = _WINDOWS.delete(conv)
     _DROP.forget(conv)
+    events.publish({"type": "window", "conv": conv, "action": "delete"})
     return JSONResponse({"ok": True, "deleted": existed, "conversation": conv})
+
+
+@app.post("/context_windows/reset")
+def reset_context_windows() -> Any:
+    """Wipe every chat and all captured state — context windows, drop-lists,
+    summaries, and snapshots. Does not touch provider config or memory."""
+    cleared = _WINDOWS.clear()
+    _DROP.clear_all()
+    events.publish({"type": "window", "conv": "", "action": "reset"})
+    return JSONResponse({"ok": True, "cleared": cleared})
 
 
 @app.post("/context_windows/{conv}/title")
 async def rename_context_window(conv: str, request: Request) -> Any:
     body: Dict[str, Any] = await request.json()
-    return JSONResponse(_WINDOWS.rename(conv, (body.get("title") or "").strip()))
+    row = _WINDOWS.rename(conv, (body.get("title") or "").strip())
+    events.publish({"type": "window", "conv": conv, "action": "rename"})
+    return JSONResponse(row)
 
 
 @app.post("/context_windows/{conv}/pin")
 async def pin_context_window(conv: str, request: Request) -> Any:
     body: Dict[str, Any] = await request.json()
-    return JSONResponse(_WINDOWS.set_pinned(conv, bool(body.get("pinned", True))))
+    row = _WINDOWS.set_pinned(conv, bool(body.get("pinned", True)))
+    events.publish({"type": "window", "conv": conv, "action": "pin"})
+    return JSONResponse(row)
 
 
 @app.get("/messages/text")
@@ -982,13 +1066,22 @@ async def chat_completions(request: Request) -> Any:
                 _SETTINGS.upstream_base_url, _SETTINGS.upstream_api_key, slug
             )
 
-    new_messages, events = run_pipeline(
+    new_messages, pipeline_events = run_pipeline(
         lc_messages,
         profile,
         summariser=summariser,
         visual_cfg=load_visual_cfg(active_config_path()),
     )
-    _record(events)
+    if profile.context_management.summarization.enabled and summariser is None:
+        pipeline_events.append(
+            {
+                "type": "notice",
+                "level": "warn",
+                "step": "summarization",
+                "message": "Summarization is on but was skipped — no upstream API key configured. Add one in Providers.",
+            }
+        )
+    _record(pipeline_events)
 
     # Rebuild the forwarded body with the rewritten messages.
     body = dict(body)
@@ -1016,6 +1109,7 @@ async def chat_completions(request: Request) -> Any:
         messages=body.get("messages"),
         tools=body.get("tools"),
     )
+    events.publish({"type": "turn", "conv": conv, "project": proj})
     up = GenericUpstream(target.url, target.headers or {})
     if body.get("stream"):
         return StreamingResponse(
@@ -1087,13 +1181,22 @@ async def anthropic_messages(request: Request) -> Any:
                 slug,
             )
 
-    new_messages, events = run_pipeline(
+    new_messages, pipeline_events = run_pipeline(
         lc_messages,
         profile,
         summariser=summariser,
         visual_cfg=load_visual_cfg(active_config_path()),
     )
-    _record(events)
+    if profile.context_management.summarization.enabled and summariser is None:
+        pipeline_events.append(
+            {
+                "type": "notice",
+                "level": "warn",
+                "step": "summarization",
+                "message": "Summarization is on but was skipped — no upstream API key configured. Add one in Providers.",
+            }
+        )
+    _record(pipeline_events)
 
     # Route to a configured Anthropic provider if one is selected, else env,
     # then decide whether to forward the client's own subscription bearer.
@@ -1155,6 +1258,7 @@ async def anthropic_messages(request: Request) -> Any:
         messages=body.get("messages"),
         tools=body.get("tools"),
     )
+    events.publish({"type": "turn", "conv": conv, "project": proj})
 
     # Pass through Claude Code's beta opt-ins: the `anthropic-beta` header and
     # the `?beta=true` endpoint selector. Stripping these makes the upstream 400
