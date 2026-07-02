@@ -11,3 +11,4 @@ media/make_logo.py
 **/*.map
 **/*.ts
 !out/**/*.js
+*.vsix

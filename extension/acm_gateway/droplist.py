@@ -409,6 +409,17 @@ class DropStore:
         if dropped_changed:
             self._save()
 
+    def clear_all(self) -> None:
+        """Forget every conversation — drop-lists, summaries, and cached views.
+        Used by the bulk reset so no captured state lingers in memory or on disk."""
+        self._dropped = {}
+        self._summaries = {}
+        self._seen = {}
+        self._seen_msgs = {}
+        self._sent = {}
+        self._save()
+        self._save_summaries()
+
     # ── the actual removal (cascade-safe) ────────────────────────────────
     def apply(
         self, conv: str, messages: List[BaseMessage]
