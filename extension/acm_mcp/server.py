@@ -72,22 +72,59 @@ def recall(query: str = "", scope: str = "user", limit: int = 10) -> str:
 def compact(transcript: str, instructions: str = "") -> str:
     """Summarise a long transcript into a short note the agent can keep instead.
 
-    Pure string-in/string-out so it works without a model wired in: it applies
-    the website's summary *contract* (priorities + <summary> tags) as guidance.
-    For an actual LLM compaction, route the conversation through acm-gateway,
-    which calls the real summariser. TODO(acm): optionally call an LLM here.
+    Routes to the gateway's real summariser (``POST /compact``) so this returns a
+    genuine LLM summary — the same code the Cursor stop-hook uses, so there is one
+    source of truth. If the gateway is unreachable or has no API key configured,
+    it falls back to a truncation-based note that is *explicitly labelled* as
+    non-LLM, so the agent never mistakes truncated source text for a summary.
     """
-    head = transcript.strip()
+    text = transcript.strip()
+    if not text:
+        return "(nothing to compact — empty transcript)"
+
+    try:
+        data = _gw("POST", "/compact", {"text": text, "instructions": instructions})
+    except urllib.error.HTTPError as e:
+        # e.g. 503 when no upstream API key is configured — read the real reason.
+        reason = _http_error_reason(e)
+        return _compact_fallback(text, instructions, reason)
+    except (urllib.error.URLError, OSError):
+        return _compact_fallback(text, instructions, "gateway unreachable")
+
+    summary = data.get("summary") if isinstance(data, dict) else None
+    if summary:
+        return summary
+    reason = (data.get("error") if isinstance(data, dict) else None) or "no summary returned"
+    return _compact_fallback(text, instructions, reason)
+
+
+def _http_error_reason(e: "urllib.error.HTTPError") -> str:
+    """Best-effort human reason from a gateway error response body."""
+    try:
+        payload = json.loads(e.read().decode() or "{}")
+        if isinstance(payload, dict) and payload.get("error"):
+            return str(payload["error"])
+    except Exception:
+        pass
+    return f"gateway error {e.code}"
+
+
+def _compact_fallback(text: str, instructions: str, reason: str) -> str:
+    """Truncation-based note when the real summariser is unavailable.
+
+    Clearly marked so the caller knows this is NOT an LLM summary — it preserves
+    the head of the transcript rather than compressing it."""
+    head = text
     if len(head) > 4000:
         head = head[:4000] + " …[truncated]"
-    note = (
-        "<summary>\n"
-        "Manual compaction requested. Preserve: open tasks, decisions, file "
-        "paths/identifiers, concrete results. Source excerpt below.\n"
+    return (
+        f"<summary note=\"compacted without LLM — {reason}\">\n"
+        "Manual compaction fallback. Preserve: open tasks, decisions, file "
+        "paths/identifiers, concrete results. Source excerpt below (not "
+        "summarised).\n"
         f"{instructions}\n\n{head}\n"
         "</summary>"
     )
-    return note
 
 
 @mcp.tool()
