@@ -17,8 +17,11 @@ import {
   openSettingsPanel,
   openContextWindowPanel,
   setProjectRoot,
+  setGatewayUrl,
+  startEventRelay,
 } from './webview';
 import { GatewayManager, healthy } from './gateway';
+import { ensureGateway } from './bootstrap';
 import { enableRouting, disableRoutingAt, RouteScope } from './claudeRouting';
 
 interface RoutedOwnership {
@@ -127,18 +130,33 @@ async function clearRouting(manual: boolean): Promise<void> {
 async function setupLifecycle(context: vscode.ExtensionContext): Promise<void> {
   const cfg = acmCfg();
   if (cfg.get<boolean>('manageGateway', true)) {
+    // Make the gateway available without the user running anything by hand:
+    // resolve the command, auto-installing the Python tool (and uv) if needed.
+    const resolved = await ensureGateway(
+      cfg.get<string>('gatewayCommand', 'acm-gateway'),
+      _output!,
+    );
+    if (!resolved) {
+      vscode.window.showWarningMessage(
+        'ACM: could not set up the gateway automatically. Install it with ' +
+          '`uv tool install acm-context-management`, or set `acm.gatewayCommand`.',
+      );
+      await applyRouting(false);
+      return;
+    }
     _gateway = new GatewayManager({
-      command: cfg.get<string>('gatewayCommand', 'acm-gateway'),
+      command: resolved.command,
       url: gatewayUrl(),
       output: _output!,
+      env: resolved.env,
     });
     context.subscriptions.push({ dispose: () => _gateway?.dispose() });
     _gateway.onState((s) => _output?.appendLine(`[gateway] state -> ${s}`));
     const state = await _gateway.start();
     if (state === 'failed') {
       vscode.window.showWarningMessage(
-        'ACM: could not start the gateway. Set `acm.gatewayCommand` (it must be on PATH, ' +
-          'e.g. `uv tool install acm-context-management`), or run it yourself.',
+        'ACM: could not start the gateway. Check the ACM Gateway output channel, ' +
+          'or set `acm.gatewayCommand`.',
       );
     }
   }
@@ -152,8 +170,14 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Scope the Chats list to this workspace's project (Claude-Code-style).
   setProjectRoot(workspaceRoot() || '');
+  // Surface the gateway URL in the onboarding flow.
+  setGatewayUrl(gatewayUrl());
 
   registerTools(context, client);
+
+  // Realtime: one SSE connection to the gateway, relayed to every webview so
+  // the panels update the instant a turn flows through (no polling needed).
+  context.subscriptions.push(startEventRelay(client));
 
   // Sidebar placement (Activity Bar -> "ACM" -> Context Management view).
   context.subscriptions.push(

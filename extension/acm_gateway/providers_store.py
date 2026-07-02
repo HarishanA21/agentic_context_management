@@ -36,9 +36,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-_DEFAULT_PATH = Path(
-    os.getenv("ACM_PROVIDERS_PATH", str(Path.home() / ".acm" / "providers.json"))
-)
+from .paths import PROVIDERS_PATH as _DEFAULT_PATH
+from .paths import atomic_write_text
 
 # Default API bases for each OpenAI-compatible provider type.
 _DEFAULT_BASE = {
@@ -80,8 +79,7 @@ class ProviderStore:
             return {"default": None, "providers": {}}
 
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self._data, indent=2))
+        atomic_write_text(self.path, json.dumps(self._data, indent=2))
         try:
             os.chmod(self.path, 0o600)
         except OSError:

@@ -28,6 +28,13 @@ export function setProjectRoot(root: string): void {
   _projectRoot = root || '';
 }
 
+// The gateway base URL, injected as `window.acmGateway` so the onboarding flow
+// can show users exactly what their IDE/agent points at.
+let _gatewayUrl = '';
+export function setGatewayUrl(url: string): void {
+  _gatewayUrl = url || '';
+}
+
 function nonce(): string {
   let s = '';
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -68,6 +75,7 @@ function renderHtml(
     window.acmMount = ${JSON.stringify(mount)};
     window.acmProject = ${JSON.stringify(_projectRoot)};
     window.acmChat = ${JSON.stringify(conv || '')};
+    window.acmGateway = ${JSON.stringify(_gatewayUrl)};
   </script>
   <script nonce="${n}" src="${js}"></script>
 </body>
@@ -79,6 +87,20 @@ async function dispatch(client: AcmClient, method: string, params: any): Promise
   switch (method) {
     case 'status':
       return client.status();
+    case 'savings':
+      return client.savings();
+    case 'savingsReset':
+      return client.savingsReset(p.conv || '');
+    case 'preview':
+      return client.preview(p.conv || '');
+    case 'undoStatus':
+      return client.undoStatus(p.conv || '');
+    case 'undo':
+      return client.undo(p.conv || '');
+    case 'trainingSummary':
+      return client.trainingSummary(!!p.includeModelLabels);
+    case 'trainingExport':
+      return client.trainingExport(!!p.includeModelLabels, p.dir || '');
     case 'getProfile':
       return client.getProfile();
     case 'setPreset':
@@ -109,6 +131,8 @@ async function dispatch(client: AcmClient, method: string, params: any): Promise
       return client.setWindowProfile(p.conv, { name: p.name, body: p.body, clear: p.clear });
     case 'deleteWindow':
       return client.deleteWindow(p.conv);
+    case 'resetWindows':
+      return client.resetWindows();
     case 'messages':
       return client.messages(p.conv || '');
     case 'contextWindow':
@@ -139,12 +163,33 @@ async function dispatch(client: AcmClient, method: string, params: any): Promise
   }
 }
 
+// Every live webview (sidebar, settings panel, chat panels, context-window
+// panel) registers here so the realtime relay can push gateway events to all of
+// them at once. A webview removes itself on dispose via the returned disposer.
+const liveWebviews = new Set<vscode.Webview>();
+
+/**
+ * Open one SSE connection to the gateway and relay each event to every live
+ * webview as an `acm-event` message. The React UIs listen for these and
+ * refresh the affected view immediately — no polling, no Refresh button.
+ * Returns a Disposable that closes the stream.
+ */
+export function startEventRelay(clientFactory: () => AcmClient): vscode.Disposable {
+  const close = clientFactory().events((event) => {
+    for (const wv of liveWebviews) {
+      void wv.postMessage({ type: 'acm-event', event });
+    }
+  });
+  return { dispose: close };
+}
+
 function wireRpc(
   webview: vscode.Webview,
   clientFactory: () => AcmClient,
   extUri: vscode.Uri,
 ): vscode.Disposable {
-  return webview.onDidReceiveMessage(async (msg: any) => {
+  liveWebviews.add(webview);
+  const disposable = webview.onDidReceiveMessage(async (msg: any) => {
     if (!msg) {
       return;
     }
@@ -157,6 +202,17 @@ function wireRpc(
       return;
     }
     try {
+      // Webviews can't use window.confirm(); route confirmation through a
+      // native VS Code modal instead.
+      if (msg.method === 'confirm') {
+        const pick = await vscode.window.showWarningMessage(
+          String(msg.params?.message ?? 'Are you sure?'),
+          { modal: true },
+          'Yes',
+        );
+        void webview.postMessage({ type: 'rpc-result', id: msg.id, ok: true, data: pick === 'Yes' });
+        return;
+      }
       const data = await dispatch(clientFactory(), msg.method, msg.params);
       void webview.postMessage({ type: 'rpc-result', id: msg.id, ok: true, data });
     } catch (e) {
@@ -168,6 +224,12 @@ function wireRpc(
       });
     }
   });
+  return {
+    dispose: () => {
+      liveWebviews.delete(webview);
+      disposable.dispose();
+    },
+  };
 }
 
 /** Sidebar placement (Activity Bar -> webview view). */

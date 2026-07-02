@@ -1,6 +1,8 @@
 import { useEffect, useState, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { rpc, getState, setState, openChat, projectRoot, chatConv } from './bridge';
+import { rpc, getState, setState, openChat, projectRoot, chatConv, useAcmEvents } from './bridge';
+import type { AcmEvent } from './bridge';
+import { Onboarding } from './Onboarding';
 
 type Theme = 'auto' | 'light' | 'dark';
 const THEME_ICON: Record<Theme, string> = { auto: '◐', light: '☀', dark: '☾' };
@@ -11,6 +13,16 @@ const useReload = (): [number, () => void] => {
   const [n, setN] = useState(0);
   return [n, useCallback(() => setN((x) => x + 1), [])];
 };
+// A chat's conversation key is a long hash (e.g. "s7f3a..._c91b2..."). The full
+// string is noise in the UI; this distils it to a short, stable handle like
+// "#c91b2" so each chat has a readable identifier next to its title without two
+// chats ever colliding visually.
+function shortId(conv: string): string {
+  if (!conv) return '#????';
+  const tail = conv.includes('_') ? conv.slice(conv.lastIndexOf('_') + 1) : conv;
+  return '#' + tail.replace(/^c/, '').slice(0, 5);
+}
+
 function rel(ts: number): string {
   if (!ts) return '';
   const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
@@ -36,7 +48,7 @@ function classify(m: any): { cls: string; label: string; context: boolean } {
   return { cls: 'system', label: 'System', context: true };
 }
 
-const TABS = ['Overview', 'Chats', 'Techniques', 'Profiles', 'Providers', 'Memory'];
+const TABS = ['Overview', 'Savings', 'Chats', 'Techniques', 'Profiles', 'Providers', 'Memory', 'Training'];
 
 // Per-label colour for relevance suggestion cards (theme-agnostic alpha fills).
 const LABEL_STYLE: Record<string, { bg: string; fg: string; label: string }> = {
@@ -71,6 +83,14 @@ export function App() {
   const [status, setStatus] = useState<any>(null);
   const [reachable, setReachable] = useState<boolean | null>(null);
   const [theme, setTheme] = useState<Theme>(() => (getState().theme as Theme) || 'auto');
+  // First-run onboarding: show until the user gets started, then never again
+  // (persisted in webview state). They can reopen it from the header.
+  const [onboarded, setOnboarded] = useState<boolean>(() => Boolean(getState().onboarded));
+
+  const finishOnboarding = () => {
+    setOnboarded(true);
+    setState({ onboarded: true });
+  };
 
   const cycleTheme = () => {
     const next = NEXT_THEME[theme];
@@ -86,6 +106,14 @@ export function App() {
     const id = setInterval(poll, 5000);
     return () => clearInterval(id);
   }, [poll]);
+
+  if (!onboarded) {
+    return (
+      <div className="acm" data-theme={theme}>
+        <Onboarding onDone={finishOnboarding} />
+      </div>
+    );
+  }
 
   return (
     <div className="acm" data-theme={theme}>
@@ -125,11 +153,13 @@ export function App() {
 
       <main className="body">
         {tab === 'Overview' && <Overview status={status} reachable={reachable} onRefresh={poll} />}
+        {tab === 'Savings' && <Savings />}
         {tab === 'Chats' && <Chats />}
         {tab === 'Techniques' && <Techniques />}
         {tab === 'Profiles' && <Profiles />}
         {tab === 'Providers' && <Providers />}
         {tab === 'Memory' && <Memory />}
+        {tab === 'Training' && <Training />}
       </main>
     </div>
   );
@@ -169,12 +199,25 @@ function Overview({ status, reachable, onRefresh }: any) {
   const ctx = status.context || {};
   const live = Number(ctx.tokens || 0);
   const saved = Number(ctx.saved_tokens || 0);
+  const notices: any[] = status.notices || [];
   const orig = live + saved;
   const livePct = orig > 0 ? Math.max(2, Math.round((live / orig) * 100)) : 100;
   const savedPct = orig > 0 ? Math.round((saved / orig) * 100) : 0;
 
   return (
     <div>
+      {/* Degraded-mode notices — config gaps that silently weaken ACM */}
+      {notices.length > 0 && (
+        <div className="notices">
+          {notices.map((n: any, i: number) => (
+            <div key={i} className={'notice ' + (n.level === 'error' ? 'error' : 'warn')}>
+              <span className="notice-dot" />
+              <span>{n.message}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Context gauge — the headline number for a context-management tool */}
       <div className="card" style={{ padding: 14 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
@@ -211,6 +254,33 @@ function Overview({ status, reachable, onRefresh }: any) {
         )}
       </div>
 
+      {/* Context budget meter — how close the live chat is to its ceiling.
+          Hidden when the budget is disabled (ACM_CONTEXT_BUDGET=0). */}
+      {Number(ctx.budget || 0) > 0 && (
+        <div className="card" style={{ padding: 12 }}>
+          <div className="row" style={{ justifyContent: 'space-between', alignItems: 'baseline' }}>
+            <span className="muted tiny">Context budget</span>
+            <span className="tiny" style={{ color: ctx.over_warn ? 'var(--warn)' : undefined }}>
+              {fmtTok(live)} / {fmtTok(Number(ctx.budget))} ({Number(ctx.budget_pct || 0)}%)
+            </span>
+          </div>
+          <div style={{ height: 8, borderRadius: 5, overflow: 'hidden', marginTop: 8, background: 'rgba(127,127,127,0.18)' }}>
+            <div
+              style={{
+                width: Math.min(100, Number(ctx.budget_pct || 0)) + '%',
+                height: '100%',
+                background: ctx.over_warn ? 'var(--warn)' : 'var(--accent)',
+              }}
+            />
+          </div>
+          {ctx.over_warn && (
+            <div className="muted tiny" style={{ marginTop: 6 }}>
+              Nearing the window limit — prune or summarize this chat to avoid an overflow.
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Connection / routing details */}
       <h3 className="sec">Gateway</h3>
       <div className="card">
@@ -241,8 +311,9 @@ function Overview({ status, reachable, onRefresh }: any) {
         <ul className="timeline">
           {events.map((e: any, i: number) => (
             <li key={i}>
-              <span className="t">{e.type}</span>
+              <span className={'t' + (e.type === 'notice' ? ' ' + (e.level === 'error' ? 'error' : 'warn') : '')}>{e.type === 'notice' ? (e.step || 'notice') : e.type}</span>
               <span className="muted tiny">
+                {e.type === 'notice' ? e.message : ''}
                 {e.freed_tokens ? `freed ~${e.freed_tokens} tok` : ''}
                 {e.cleared ? ` · cleared ${e.cleared}` : ''}
                 {e.removed ? ` · removed ${e.removed}` : ''}
@@ -266,6 +337,119 @@ function profileLabel(w: any): string {
   return 'default';
 }
 
+// ── Savings ────────────────────────────────────────────────────────────────
+// The receipts: what ACM actually removed from your context, aggregated from the
+// freed_tokens every technique reports. Per-chat and all-time, surviving restarts.
+const TECH_LABEL: Record<string, string> = {
+  visual_method: 'Visual method',
+  tool_result_trimming: 'Tool trimming',
+  image_eviction: 'Image eviction',
+  summarization: 'Summarization',
+  sliding_window: 'Sliding window',
+};
+
+function Savings() {
+  const [data, setData] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [n, reload] = useReload();
+
+  useEffect(() => {
+    rpc('savings').then((d: any) => { setData(d); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, [n]);
+
+  // Every turn frees more tokens — keep the dashboard live.
+  useAcmEvents(useCallback(() => reload(), [reload]));
+
+  const resetAll = async () => {
+    await rpc('savingsReset', {}).catch(() => {});
+    reload();
+  };
+
+  if (loading) return <p className="muted tiny">Loading savings…</p>;
+  const d = data || {};
+  const total = Number(d.total_freed_tokens || 0);
+  const rows: any[] = d.conversations || [];
+  const byTech: Record<string, number> = d.by_technique || {};
+  const cost = Number(d.total_cost_saved || 0);
+  const maxRow = rows.reduce((m, r) => Math.max(m, Number(r.freed_tokens || 0)), 0) || 1;
+
+  if (total === 0) {
+    return (
+      <div>
+        <div className="card" style={{ padding: 14 }}>
+          <div className="muted tiny">Tokens saved so far</div>
+          <div style={{ fontSize: 30, fontWeight: 700, marginTop: 4 }}>0</div>
+          <p className="muted tiny" style={{ marginTop: 8 }}>
+            No savings recorded yet. As techniques trim, evict, and summarise your
+            chats, the tokens they remove are tallied here — per chat and all-time.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {/* Headline: the one number that says what ACM bought you */}
+      <div className="card" style={{ padding: 14 }}>
+        <div className="muted tiny">Tokens saved (all-time)</div>
+        <div style={{ fontSize: 30, fontWeight: 700, marginTop: 4 }}>{fmtTok(total)}</div>
+        <div className="muted tiny" style={{ marginTop: 4 }}>
+          across {d.total_turns || 0} turn{d.total_turns === 1 ? '' : 's'}
+          {cost > 0 ? ` · ~$${cost.toFixed(2)} saved` : ''}
+        </div>
+      </div>
+
+      {/* Where the savings came from */}
+      <h3 className="sec">By technique</h3>
+      <div className="chips">
+        {Object.keys(byTech).length === 0 && <span className="muted tiny">—</span>}
+        {Object.entries(byTech)
+          .sort((a, b) => Number(b[1]) - Number(a[1]))
+          .map(([k, v]) => (
+            <span key={k} className="chip on">
+              {TECH_LABEL[k] || k} · {fmtTok(Number(v))}
+            </span>
+          ))}
+      </div>
+
+      {/* Per-chat leaderboard */}
+      <h3 className="sec">By chat</h3>
+      <ul className="timeline">
+        {rows.map((r: any) => {
+          const freed = Number(r.freed_tokens || 0);
+          const pct = Math.round((freed / maxRow) * 100);
+          return (
+            <li key={r.conversation}>
+              <span
+                className="t"
+                style={{ cursor: 'pointer' }}
+                title={r.conversation}
+                onClick={() => openChat(r.conversation)}
+              >
+                {r.title && r.title !== r.conversation ? r.title : shortId(r.conversation)}
+              </span>
+              <div style={{ height: 6, borderRadius: 4, overflow: 'hidden', background: 'rgba(127,127,127,0.18)', margin: '4px 0' }}>
+                <div style={{ width: pct + '%', height: '100%', background: 'var(--accent)' }} />
+              </div>
+              <span className="muted tiny">
+                {fmtTok(freed)} tok · {r.turns} turn{r.turns === 1 ? '' : 's'}
+                {r.cost_saved > 0 ? ` · ~$${Number(r.cost_saved).toFixed(2)}` : ''}
+                {r.last_ts ? ` · ${rel(r.last_ts)}` : ''}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+
+      <p style={{ marginTop: 12 }}>
+        <button className="btn ghost sm" onClick={resetAll}>Reset savings</button>
+      </p>
+    </div>
+  );
+}
+
 function Chats() {
   const [wins, setWins] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -279,13 +463,29 @@ function Chats() {
     }).catch(() => setLoading(false));
   }, [n]);
 
-  const del = (e: any, id: string) => {
+  // Realtime: any turn or window change refreshes the chats list (live titles,
+  // token counts, and newly-created chats appear without a manual refresh).
+  useAcmEvents(useCallback(() => reload(), [reload]));
+
+  const del = async (e: any, id: string) => {
     e.stopPropagation();
-    if (!window.confirm(
-      'Delete this context window and all its ACM state (drop-list, summaries)? ' +
-      'The chat in your IDE is unaffected.')) return;
+    const ok = await rpc('confirm', {
+      message: 'Delete this context window and all its ACM state (drop-list, summaries)? ' +
+        'The chat in your IDE is unaffected.',
+    });
+    if (!ok) return;
     setBusy(true);
     rpc('deleteWindow', { conv: id }).then(reload).finally(() => setBusy(false));
+  };
+
+  const clearAll = async () => {
+    const ok = await rpc('confirm', {
+      message: 'Clear ALL chats and captured state (context windows, drop-lists, summaries)? ' +
+        'Provider config and memory are unaffected. This cannot be undone.',
+    });
+    if (!ok) return;
+    setBusy(true);
+    rpc('resetWindows', {}).then(reload).finally(() => setBusy(false));
   };
 
   if (loading) return <Loading />;
@@ -303,7 +503,11 @@ function Chats() {
     <div>
       <div className="row" style={{ alignItems: 'baseline', justifyContent: 'space-between' }}>
         <h3 className="sec" style={{ margin: 0 }}>Chats <span className="muted tiny">— this project · click to open</span></h3>
-        <button className="btn sec sm" onClick={reload}>Refresh</button>
+        <span className="row" style={{ gap: 6 }}>
+          <button className="btn sec sm" onClick={reload}>Refresh</button>
+          <button className="btn sec sm ghost" disabled={busy} onClick={clearAll}
+            title="Clear all chats and captured state">Clear all</button>
+        </span>
       </div>
       <p className="muted tiny">Each chat is its own context window with its own techniques. Open one to
         see exactly what's sent to the model and tune that chat's settings.</p>
@@ -314,7 +518,7 @@ function Chats() {
               <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {c.title || 'Untitled chat'}
               </span>
-              <span className="muted tiny" style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)' }}>{c.id}</span>
+              <span className="muted tiny" style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)' }} title={c.id}>{shortId(c.id)}</span>
             </span>
             <span className="meta">
               <span className="badge" title="Active technique profile for this chat">{profileLabel(c)}</span>
@@ -330,6 +534,110 @@ function Chats() {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+// ── Preview (dry-run the pipeline on the next request) ───────────────────────
+// Shows what the pipeline WOULD do to the current context before anything is
+// sent: per-message kept / changed / removed / added, and the token delta. Free
+// and deterministic — the paid summariser call is skipped (reported as pending).
+const STATUS_LABEL: Record<string, string> = {
+  kept: 'kept', changed: 'trimmed', removed: 'removed', added: 'added',
+};
+
+// One-click reversal of the last manual edit (drop / drop-many / restore /
+// summarize) on this chat. The gateway keeps a session undo stack; we just show
+// what's on top and pop it. Hidden entirely when there's nothing to undo.
+function UndoBar({ conv }: { conv: string }) {
+  const [top, setTop] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
+  const [n, reload] = useReload();
+
+  useEffect(() => {
+    rpc('undoStatus', { conv }).then((d: any) => setTop(d?.top || null)).catch(() => setTop(null));
+  }, [conv, n]);
+  // Any drop/restore/summarize elsewhere in the UI changes the stack.
+  useAcmEvents(useCallback(() => reload(), [reload]));
+
+  if (!top) return null;
+
+  const doUndo = () => {
+    setBusy(true);
+    rpc('undo', { conv }).then(() => reload()).finally(() => setBusy(false));
+  };
+
+  return (
+    <div className="row" style={{ alignItems: 'center', gap: 8, marginBottom: 8 }}>
+      <button className="btn sm" disabled={busy} onClick={doUndo}>↩ Undo</button>
+      <span className="muted tiny">{top.label}{top.depth > 1 ? ` · ${top.depth} steps back` : ''}</span>
+    </div>
+  );
+}
+
+function Preview({ conv }: { conv: string }) {
+  const [data, setData] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [n, reload] = useReload();
+
+  useEffect(() => {
+    setLoading(true);
+    rpc('preview', { conv }).then((d: any) => { setData(d); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, [conv, n]);
+
+  useAcmEvents(useCallback(() => reload(), [reload]));
+
+  if (loading) return <p className="muted tiny">Computing preview…</p>;
+  const d = data || {};
+  if (!d.available) {
+    return <p className="muted tiny">{d.reason || 'Preview unavailable.'}</p>;
+  }
+
+  const before = Number(d.before_tokens || 0);
+  const after = Number(d.after_tokens || 0);
+  const freed = Number(d.freed_tokens || 0);
+  const rows: any[] = d.rows || [];
+  const changed = rows.filter((r) => r.status !== 'kept');
+
+  return (
+    <div>
+      <div className="card" style={{ padding: 12 }}>
+        <div className="row" style={{ justifyContent: 'space-between' }}>
+          <span className="muted tiny">If sent now</span>
+          <button className="btn ghost sm" onClick={reload}>Refresh</button>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 4 }}>
+          <span style={{ fontSize: 20, fontWeight: 700 }}>{fmtTok(after)}</span>
+          <span className="muted tiny">
+            tokens {freed > 0 ? `(down from ${fmtTok(before)}, −${fmtTok(freed)})` : '(no change)'}
+          </span>
+        </div>
+        <div className="muted tiny" style={{ marginTop: 2 }}>
+          {d.before_messages} → {d.after_messages} messages
+          {d.summarization_pending ? ' · summarization will run live (needs a model call)' : ''}
+        </div>
+      </div>
+
+      {changed.length === 0 ? (
+        <p className="muted tiny">No mechanical changes — the context is already within limits.</p>
+      ) : (
+        <ul className="timeline">
+          {changed.map((r: any, i: number) => (
+            <li key={r.fp || i}>
+              <span className={'t' + (r.status === 'removed' ? ' error' : r.status === 'added' ? '' : ' warn')}>
+                {r.role} · {STATUS_LABEL[r.status] || r.status}
+              </span>
+              <span className="muted tiny" style={{ display: 'block' }}>{r.preview || '—'}</span>
+              <span className="muted tiny">
+                {r.status === 'changed'
+                  ? `${fmtTok(r.tokens)} → ${fmtTok(r.after_tokens || 0)} tok`
+                  : `${fmtTok(r.tokens)} tok`}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
@@ -364,15 +672,18 @@ export function ChatDetail({ conv }: { conv: string }) {
           <path d="m3 12 9 4.5L21 12M3 16.5l9 4.5 9-4.5" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
         </svg>
         <div style={{ minWidth: 0 }}>
-          <div className="title">{win?.title || 'Chat'}</div>
-          <div className="sub" style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)' }}>{conv}</div>
+          <div className="title">{win?.title || 'Untitled chat'}</div>
+          <div className="sub" style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)' }} title={conv}>{shortId(conv)}</div>
         </div>
       </header>
       <main className="body">
         <div className="two-col">
           <section className="col">
             <h3 className="sec">Context window <span className="muted tiny">— what's sent to the model</span></h3>
+            <UndoBar conv={conv} />
             <ContextWindow conv={conv} />
+            <h3 className="sec" style={{ marginTop: 16 }}>Next request preview <span className="muted tiny">— dry run, nothing sent</span></h3>
+            <Preview conv={conv} />
           </section>
           <section className="col">
             <h3 className="sec">Settings <span className="muted tiny">— this chat only</span></h3>
@@ -1049,6 +1360,93 @@ function Memory() {
   );
 }
 
+// Training data export (relevance feedback → encoder + judge trainer files).
+// Every accept/reject/summarize on a pruning suggestion is logged; this turns
+// that log into the two files the FYP trainers read. Read-only summary first
+// (how much data exists, how often the user overrode the model), then export.
+function Training() {
+  const [sum, setSum] = useState<any>(null);
+  const [incl, setIncl] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [manifest, setManifest] = useState<any>(null);
+  const [n, reload] = useReload();
+
+  useEffect(() => {
+    rpc('trainingSummary', { includeModelLabels: incl }).then(setSum).catch(() => setSum(null));
+  }, [incl, n]);
+
+  const doExport = () => {
+    setBusy(true);
+    rpc('trainingExport', { includeModelLabels: incl })
+      .then((m: any) => { setManifest(m); reload(); })
+      .finally(() => setBusy(false));
+  };
+
+  const s = sum || {};
+  const counts = s.label_counts || {};
+  const gold = Number(s.gold_examples || 0);
+  const pct = Math.round(Number(s.override_rate || 0) * 100);
+
+  return (
+    <div>
+      <p className="muted tiny">
+        Turns your pruning feedback into training data — <code>encoder.jsonl</code> (relevance
+        model) and <code>judge_dpo.jsonl</code> (preference pairs). Data comes from every
+        KEEP/SUMMARIZE/DROP decision you make on suggestions.
+      </p>
+
+      {s.error ? (
+        <p className="muted tiny">Couldn't read logs: {s.error}</p>
+      ) : (
+        <div className="card" style={{ padding: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+            <span style={{ fontSize: 20, fontWeight: 700 }}>{gold}</span>
+            <span className="muted tiny">gold examples (your corrections)</span>
+          </div>
+          <div className="muted tiny" style={{ marginTop: 2 }}>
+            {s.silver_examples || 0} silver · {s.judge_pairs || 0} DPO pairs · {pct}% of
+            comparable episodes overrode the model
+          </div>
+          <div className="row" style={{ gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+            {['KEEP', 'SUMMARIZE', 'DROP'].map((k) => (
+              <span key={k} className="badge tiny">{k}: {counts[k] || 0}</span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <label className="row tiny" style={{ gap: 6, marginTop: 10, alignItems: 'center' }}>
+        <input type="checkbox" checked={incl} onChange={(e) => setIncl(e.target.checked)} />
+        Include model's own labels as silver examples (cold-start, before enough corrections)
+      </label>
+
+      <div className="row" style={{ marginTop: 10 }}>
+        <button className="btn" disabled={busy || gold === 0} onClick={doExport}>
+          {busy ? 'Exporting…' : 'Export training files'}
+        </button>
+        <button className="btn ghost sm" onClick={reload}>Refresh</button>
+      </div>
+      {gold === 0 && (
+        <p className="muted tiny" style={{ marginTop: 6 }}>
+          No corrections logged yet — accept or reject some pruning suggestions first.
+        </p>
+      )}
+
+      {manifest && manifest.ok && (
+        <div className="card tiny" style={{ marginTop: 10 }}>
+          <div>Wrote {manifest.encoder_examples} encoder rows + {manifest.judge_pairs} DPO pairs to:</div>
+          <div style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)', marginTop: 4 }}>
+            {manifest.encoder_path}<br />{manifest.judge_path}
+          </div>
+        </div>
+      )}
+      {manifest && manifest.error && (
+        <p className="muted tiny" style={{ marginTop: 6 }}>Export failed: {manifest.error}</p>
+      )}
+    </div>
+  );
+}
+
 // ── Context Window (the exact payload we forward to the model each call) ──
 // The gateway snapshots this AFTER its technique pipeline runs (drops + trimming
 // + summaries already applied), so it is literally "what the model sees on every
@@ -1321,24 +1719,45 @@ export function ContextWindow({ standalone, conv }: { standalone?: boolean; conv
   const [view, setView] = useState<'proper' | 'raw' | 'tokens'>('proper');
   const [ready, setReady] = useState(!!conv);
 
-  useEffect(() => {
-    // Pinned to one chat (chat detail) — no conversation picker needed.
-    if (conv) { setSel(conv); setReady(true); return; }
+  const loadConvs = useCallback(() => {
     rpc('conversations').then((d: any) => {
       const list = d.conversations || [];
       setConvs(list);
       setSel((cur) => cur || (list[0] ? list[0].key : ''));
     }).catch(() => {}).finally(() => setReady(true));
-  }, [conv]);
+  }, []);
+  useEffect(() => {
+    // Pinned to one chat (chat detail) — no conversation picker needed.
+    if (conv) { setSel(conv); setReady(true); return; }
+    loadConvs();
+  }, [conv, loadConvs]);
 
   const load = useCallback(() => {
     rpc('contextWindow', { conv: sel }).then((d: any) => setData(d)).catch(() => setData(null));
   }, [sel]);
   useEffect(() => {
     load();
-    const id = setInterval(load, 5000);
+    // Slow fallback poll; realtime events below do the heavy lifting.
+    const id = setInterval(load, 15000);
     return () => clearInterval(id);
   }, [load]);
+
+  // When following, the panel tracks whichever chat last sent a turn — so it
+  // always shows the context window for the chat you're actively using in the
+  // IDE. Turned off the moment you pick a chat by hand. Pinned panels (a `conv`
+  // prop, i.e. chat detail) never follow.
+  const [follow, setFollow] = useState(!conv);
+
+  // Realtime: refresh the moment this chat's window changes. Events for other
+  // chats only refresh the picker (titles/token counts), not the open data.
+  const onEvent = useCallback((e: AcmEvent) => {
+    if (!conv) loadConvs();
+    if (!conv && follow && e.type === 'turn' && e.conv) { setSel(e.conv); return; }
+    if (!e.conv || e.conv === sel) load();
+  }, [conv, sel, follow, load, loadConvs]);
+  useAcmEvents(onEvent);
+
+  const pick = useCallback((key: string) => { setFollow(false); setSel(key); }, []);
 
   const a = data ? cwAnalyze(data) : null;
   const has = !!(a && (a.segments.length || a.tools.length));
@@ -1347,13 +1766,16 @@ export function ContextWindow({ standalone, conv }: { standalone?: boolean; conv
   const controls = (
     <>
       <div className="row" style={{ justifyContent: 'space-between' }}>
-        <div className="row" style={{ gap: 6 }}>
+        <div className="row" style={{ gap: 6, alignItems: 'center' }}>
           {!conv && (convs.length > 0 ? (
-            <select value={sel} onChange={(e) => setSel(e.target.value)} style={{ maxWidth: 280 }}>
-              {convs.map((c) => <option key={c.key} value={c.key}>{c.title || c.key}</option>)}
+            <select value={sel} onChange={(e) => pick(e.target.value)} style={{ maxWidth: 280 }}>
+              {convs.map((c) => <option key={c.key} value={c.key}>{(c.title || 'Untitled chat') + ' · ' + shortId(c.key)}</option>)}
             </select>
           ) : <span className="muted tiny">no conversations yet</span>)}
-          <button className="btn sec sm" onClick={load}>Refresh</button>
+          {!conv && (follow
+            ? <span className="badge" title="Tracking whichever chat you're actively using">● following active chat</span>
+            : <button className="btn sec sm" onClick={() => setFollow(true)} title="Track the chat you're actively using">Follow active</button>
+          )}
         </div>
         <div className="row" style={{ gap: 4 }}>
           {views.map(([k, label]) => (
@@ -1394,7 +1816,9 @@ export function ContextWindow({ standalone, conv }: { standalone?: boolean; conv
           </svg>
           <div style={{ minWidth: 0 }}>
             <div className="title">ACM Context Window</div>
-            <div className="sub">what we send to the model each call</div>
+            <div className="sub" title={sel}>
+              {sel ? (convs.find((c) => c.key === sel)?.title || 'Untitled chat') + ' · ' + shortId(sel) : 'what we send to the model each call'}
+            </div>
           </div>
         </header>
         <main className="body">{controls}{inner}</main>

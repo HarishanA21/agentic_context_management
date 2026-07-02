@@ -23,6 +23,7 @@ Endpoints:
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from typing import Any, Dict, List
@@ -54,6 +55,7 @@ from .config import (
     load_visual_cfg,
     user_config_path,
 )
+from . import events
 from .context_windows import ContextWindowStore, in_project
 from .droplist import (
     DropStore,
@@ -65,6 +67,9 @@ from .droplist import (
 )
 from .pipeline import run_pipeline
 from .providers_store import ProviderStore
+from .savings import SavingsLedger
+from . import training_export
+from . import paths
 from .translate import lc_to_openai, openai_to_lc
 from .translate_anthropic import anthropic_to_lc, lc_to_anthropic
 from .upstream import (
@@ -81,6 +86,7 @@ _SETTINGS = Settings.from_env()
 _LAST_EVENTS: List[Dict[str, Any]] = []
 _MEMORY = MemoryStore()
 _DROP = DropStore()
+_SAVINGS = SavingsLedger()
 _PROVIDERS = ProviderStore()
 _WINDOWS = ContextWindowStore()
 
@@ -212,6 +218,50 @@ def _record(events: List[Dict[str, Any]]) -> None:
         print(f"[acm-gateway] fired: {json.dumps(events)[:500]}", flush=True)
 
 
+def _notice(step: str, message: str, level: str = "warn") -> None:
+    """Surface a background failure the same way the pipeline does — retained for
+    /status and pushed live to the UI — so it isn't silently swallowed."""
+    event = {"type": "notice", "level": level, "step": step, "message": message}
+    _record([event])
+    try:
+        events.publish({"type": "turn", "notice": event})
+    except Exception:  # pragma: no cover — never let telemetry break a request
+        pass
+
+
+# Context budget (feature 4): a soft ceiling on the live conversation size so a
+# chat that's about to blow past the model's window is flagged before the turn
+# fails. Configurable — models differ — defaulting to a common 128k window and a
+# warn at 80%. Set ACM_CONTEXT_BUDGET=0 to disable the alert entirely.
+def _context_budget() -> int:
+    try:
+        return int(os.getenv("ACM_CONTEXT_BUDGET", "128000"))
+    except ValueError:
+        return 128000
+
+
+def _budget_warn_frac() -> float:
+    try:
+        f = float(os.getenv("ACM_CONTEXT_BUDGET_WARN", "0.8"))
+    except ValueError:
+        return 0.8
+    return min(max(f, 0.0), 1.0)
+
+
+def _budget_info(live_tok: int) -> Dict[str, Any]:
+    """Budget slice for the /status context block: the ceiling, the fraction
+    used, and whether we've crossed the warn line (0 budget → disabled)."""
+    budget = _context_budget()
+    if budget <= 0:
+        return {"budget": 0, "budget_pct": 0, "over_warn": False}
+    pct = round(live_tok / budget * 100)
+    return {
+        "budget": budget,
+        "budget_pct": pct,
+        "over_warn": live_tok >= budget * _budget_warn_frac(),
+    }
+
+
 @app.get("/status")
 def status() -> Dict[str, Any]:
     profile = load_profile(active_config_path())
@@ -257,9 +307,115 @@ def status() -> Dict[str, Any]:
             "saved_tokens": saved_tok,
             "messages": len(rows),
             "dropped": sum(1 for r in rows if r.get("dropped")),
+            **_budget_info(live_tok),
         },
         "last_events": _LAST_EVENTS[-20:],
+        "notices": _compute_notices(profile),
     }
+
+
+def _compute_notices(profile) -> List[Dict[str, str]]:
+    """Standing degraded-mode warnings for the Overview panel.
+
+    Unlike pipeline notices (per-turn, transient), these describe configuration
+    gaps that persist across turns: no summariser key, or a relevance encoder
+    that fell back to the untrained lexical backend."""
+    notices: List[Dict[str, str]] = []
+    cm = profile.context_management
+
+    # Context budget (feature 4): warn when the live conversation is nearing the
+    # configured ceiling, so the user can prune before a turn overflows.
+    latest = _DROP.latest_conversation() or ""
+    if latest:
+        rows = _DROP.seen(latest)
+        live_tok = sum(int(r.get("tokens", 0)) for r in rows if not r.get("dropped"))
+        info = _budget_info(live_tok)
+        if info["over_warn"]:
+            notices.append(
+                {
+                    "level": "warn",
+                    "step": "context_budget",
+                    "message": (
+                        f"This chat is at {info['budget_pct']}% of the "
+                        f"{info['budget'] // 1000}k context budget. Prune or "
+                        "summarize to avoid overflowing the model's window."
+                    ),
+                }
+            )
+
+    if getattr(cm.summarization, "enabled", False) and not (
+        _SETTINGS.upstream_api_key or _SETTINGS.anthropic_api_key
+    ):
+        notices.append(
+            {
+                "level": "warn",
+                "step": "summarization",
+                "message": "Summarization is on but no upstream API key is configured — it will be skipped. Add one in Providers.",
+            }
+        )
+
+    rel = getattr(cm, "relevance_pruning", None)
+    if rel is not None and getattr(rel, "enabled", False):
+        mode = str(getattr(rel, "mode", "judge"))
+        if mode in ("encoder", "ensemble"):
+            encoder_path = getattr(rel, "encoder_path", None) or _SETTINGS.encoder_path
+            enc = _get_encoder(
+                encoder_path,
+                float(getattr(rel, "drop_threshold", 0.35) or 0.35),
+                float(getattr(rel, "summarize_threshold", 0.6) or 0.6),
+            )
+            if enc is None:
+                notices.append(
+                    {
+                        "level": "error",
+                        "step": "relevance_pruning",
+                        "message": "Relevance encoder could not be loaded — relevance pruning is unavailable.",
+                    }
+                )
+                return notices
+            try:
+                enc._ensure_loaded()
+            except Exception:  # pragma: no cover - defensive
+                pass
+            if getattr(enc, "backend", None) == "lexical":
+                notices.append(
+                    {
+                        "level": "warn",
+                        "step": "relevance_pruning",
+                        "message": "Relevance is using the untrained lexical fallback — suggestions are heuristic. Train or set an encoder model for better accuracy.",
+                    }
+                )
+    return notices
+
+
+@app.get("/savings")
+def savings() -> Dict[str, Any]:
+    """All-time savings receipts: tokens freed, estimated cost, per-chat rows.
+
+    Set ``ACM_COST_PER_MTOK`` (input $ per million tokens) to get a dollar
+    estimate; left at 0 the dashboard shows tokens only."""
+    try:
+        cost = float(os.getenv("ACM_COST_PER_MTOK", "0") or 0)
+    except ValueError:
+        cost = 0.0
+    titles = {c["key"]: c["title"] for c in _DROP.conversations()}
+    return _SAVINGS.summary(cost_per_mtok=cost, titles=titles)
+
+
+@app.post("/savings/reset")
+async def savings_reset(request: Request) -> Dict[str, Any]:
+    """Clear the ledger, or a single conversation with ``{"conversation": key}``."""
+    body: Dict[str, Any] = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    conv = body.get("conversation")
+    if conv:
+        _SAVINGS.forget(conv)
+    else:
+        _SAVINGS.clear_all()
+    return {"ok": True}
 
 
 def _pick_summariser(model: str | None):
@@ -444,6 +600,18 @@ async def memory_clear(request: Request) -> Any:
 # ─── manual message removal (drop-list) ──────────────────────────────────
 
 
+@app.get("/events")
+async def events_stream() -> StreamingResponse:
+    """Realtime push of context-window changes (Server-Sent Events). The VSCode
+    host subscribes here and relays each event to its webviews, so the panels
+    update the instant a turn flows through instead of waiting for a poll."""
+    return StreamingResponse(
+        events.stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/conversations")
 def list_conversations() -> Dict[str, Any]:
     """Conversations the gateway has seen this run, newest first (for the UI)."""
@@ -465,6 +633,102 @@ def context_window(conv: str = "") -> Dict[str, Any]:
     Context Window view. ``conv`` defaults to the latest conversation."""
     key = conv or _DROP.latest_conversation() or ""
     return _DROP.sent(key)
+
+
+def _preview_row(msg) -> Dict[str, Any]:
+    """A message rendered for the preview diff — same shape as the Context view."""
+    from .droplist import _norm_text, _role, fingerprint
+
+    text = _norm_text(getattr(msg, "content", "")).strip().replace("\n", " ")
+    return {
+        "fp": fingerprint(msg),
+        "role": _role(msg),
+        "preview": (text[:120] + "…") if len(text) > 120 else text,
+        "tokens": max(1, len(_norm_text(getattr(msg, "content", ""))) // 4),
+    }
+
+
+@app.get("/preview")
+def preview(conv: str = "") -> Dict[str, Any]:
+    """Dry-run the pipeline on the last-seen context: what the *next* request
+    would look like, and which technique changed each message — without sending
+    anything or spending a paid summariser call.
+
+    We replay the real pipeline (``run_pipeline``) on the last incoming message
+    list with ``summariser=None``, so mechanical techniques (trim / evict /
+    sliding-window / visual) run exactly as they would live; summarization is
+    reported as *pending* rather than executed (it needs a paid LLM call). The
+    before/after message sets are diffed by fingerprint for per-message status."""
+    key = conv or _DROP.latest_conversation() or ""
+    seen = _DROP.seen_full(key)
+    if not seen:
+        return {
+            "conversation": key,
+            "available": False,
+            "reason": "No captured context yet — send a turn through the gateway first.",
+        }
+
+    # Mirror a real turn: strip tombstoned (manually dropped) messages first.
+    before = _apply_droplist(key, list(seen))
+    profile = _resolve_profile(key)
+
+    try:
+        after, events = run_pipeline(
+            before,
+            profile,
+            summariser=None,
+            visual_cfg=load_visual_cfg(active_config_path()),
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        return {"conversation": key, "available": False, "reason": f"preview failed: {e!s}"}
+
+    # The pipeline rewrites/removes by ``.id`` (see _apply_replacements /
+    # _apply_removes), so diff by id for exact per-message status. A message
+    # whose id survives but whose content shrank was rewritten in place (trim /
+    # evict) → "changed"; one whose id is gone → "removed"; a new id in `after`
+    # → "added" (an injected summary note).
+    after_by_id = {getattr(m, "id", None): m for m in after}
+    before_ids = {getattr(m, "id", None) for m in before}
+
+    rows = []
+    for m in before:
+        mid = getattr(m, "id", None)
+        row = _preview_row(m)
+        repl = after_by_id.get(mid)
+        if mid is None or repl is None:
+            row["status"] = "removed"
+        else:
+            new_row = _preview_row(repl)
+            if new_row["tokens"] != row["tokens"] or new_row["preview"] != row["preview"]:
+                row["status"] = "changed"
+                row["after_preview"] = new_row["preview"]
+                row["after_tokens"] = new_row["tokens"]
+            else:
+                row["status"] = "kept"
+        rows.append(row)
+
+    for m in after:
+        if getattr(m, "id", None) not in before_ids:
+            rows.append({**_preview_row(m), "status": "added"})
+
+    summ = getattr(profile.context_management, "summarization", None)
+    summ_pending = bool(summ is not None and getattr(summ, "enabled", False))
+
+    before_tok = sum(_preview_row(m)["tokens"] for m in before)
+    after_tok = sum(_preview_row(m)["tokens"] for m in after)
+
+    return {
+        "conversation": key,
+        "available": True,
+        "before_tokens": before_tok,
+        "after_tokens": after_tok,
+        "freed_tokens": sum(int(e.get("freed_tokens", 0) or 0) for e in events),
+        "before_messages": len(before),
+        "after_messages": len(after),
+        "rows": rows,
+        "events": events,
+        "summarization_pending": summ_pending,
+    }
 
 
 # ─── context windows (one per chat: per-chat profile + lifecycle) ─────────
@@ -558,6 +822,7 @@ async def set_context_window_profile(conv: str, request: Request) -> Any:
             {"error": "provide 'name', 'body', or 'clear'"}, status_code=400
         )
     _record([{"type": "context_window_profile", "conversation": conv}])
+    events.publish({"type": "window", "conv": conv, "action": "profile"})
     return JSONResponse(_window_view(conv, include_profile=True))
 
 
@@ -567,19 +832,34 @@ def delete_context_window(conv: str) -> Any:
     (drop-list, summaries, snapshots)."""
     existed = _WINDOWS.delete(conv)
     _DROP.forget(conv)
+    events.publish({"type": "window", "conv": conv, "action": "delete"})
     return JSONResponse({"ok": True, "deleted": existed, "conversation": conv})
+
+
+@app.post("/context_windows/reset")
+def reset_context_windows() -> Any:
+    """Wipe every chat and all captured state — context windows, drop-lists,
+    summaries, and snapshots. Does not touch provider config or memory."""
+    cleared = _WINDOWS.clear()
+    _DROP.clear_all()
+    events.publish({"type": "window", "conv": "", "action": "reset"})
+    return JSONResponse({"ok": True, "cleared": cleared})
 
 
 @app.post("/context_windows/{conv}/title")
 async def rename_context_window(conv: str, request: Request) -> Any:
     body: Dict[str, Any] = await request.json()
-    return JSONResponse(_WINDOWS.rename(conv, (body.get("title") or "").strip()))
+    row = _WINDOWS.rename(conv, (body.get("title") or "").strip())
+    events.publish({"type": "window", "conv": conv, "action": "rename"})
+    return JSONResponse(row)
 
 
 @app.post("/context_windows/{conv}/pin")
 async def pin_context_window(conv: str, request: Request) -> Any:
     body: Dict[str, Any] = await request.json()
-    return JSONResponse(_WINDOWS.set_pinned(conv, bool(body.get("pinned", True))))
+    row = _WINDOWS.set_pinned(conv, bool(body.get("pinned", True)))
+    events.publish({"type": "window", "conv": conv, "action": "pin"})
+    return JSONResponse(row)
 
 
 @app.get("/messages/text")
@@ -645,7 +925,8 @@ async def drop_message(request: Request) -> Any:
     conv = body.get("conv") or _DROP.latest_conversation()
     if not conv:
         return JSONResponse({"error": "no conversation known yet"}, status_code=400)
-    _DROP.drop(conv, fp)
+    if _DROP.drop(conv, fp):
+        _DROP.push_undo(conv, "drop", "remove 1 message", {"fps": [fp]})
     return JSONResponse({"ok": True, "conversation": conv, "dropped": _DROP.dropped(conv)})
 
 
@@ -660,6 +941,8 @@ async def restore_message(request: Request) -> Any:
     if not conv:
         return JSONResponse({"error": "no conversation known yet"}, status_code=400)
     ok = _DROP.restore(conv, fp)
+    if ok:
+        _DROP.push_undo(conv, "restore", "restore 1 message", {"fp": fp})
     return JSONResponse({"ok": ok, "conversation": conv, "dropped": _DROP.dropped(conv)})
 
 
@@ -674,10 +957,41 @@ async def drop_many(request: Request) -> Any:
     conv = body.get("conv") or _DROP.latest_conversation()
     if not conv:
         return JSONResponse({"error": "no conversation known yet"}, status_code=400)
-    for fp in fps:
-        _DROP.drop(conv, str(fp))
+    newly = [str(fp) for fp in fps if _DROP.drop(conv, str(fp))]
+    if newly:
+        _DROP.push_undo(conv, "drop_many", f"remove {len(newly)} messages", {"fps": newly})
     return JSONResponse(
         {"ok": True, "conversation": conv, "dropped": _DROP.dropped(conv)}
+    )
+
+
+@app.get("/undo")
+async def undo_status(request: Request) -> Any:
+    """Report the action the next undo would reverse for a conversation, so the
+    UI can label the Undo button (or hide it when the stack is empty)."""
+    conv = request.query_params.get("conv") or _DROP.latest_conversation() or ""
+    return JSONResponse({"conversation": conv, "top": _DROP.undo_top(conv) if conv else None})
+
+
+@app.post("/undo")
+async def undo_apply(request: Request) -> Any:
+    """Reverse the most recent manual edit (drop / drop_many / restore /
+    summarize) for a conversation. Body: ``{conv?}``."""
+    body: Dict[str, Any] = await request.json()
+    conv = body.get("conv") or _DROP.latest_conversation()
+    if not conv:
+        return JSONResponse({"error": "no conversation known yet"}, status_code=400)
+    result = _DROP.undo(conv)
+    if result is None:
+        return JSONResponse({"ok": False, "conversation": conv, "reason": "nothing to undo"})
+    return JSONResponse(
+        {
+            "ok": True,
+            "conversation": conv,
+            "undone": result,
+            "dropped": _DROP.dropped(conv),
+            "top": _DROP.undo_top(conv),
+        }
     )
 
 
@@ -775,7 +1089,10 @@ def relevance_suggest(conv: str = "") -> Dict[str, Any]:
                 )
             )
         except Exception as e:  # pragma: no cover - defensive
-            print(f"[acm-gateway] audit log failed: {e!r}", flush=True)
+            _notice(
+                "audit_log",
+                f"couldn't log training data for this suggestion: {e!s}",
+            )
     out: List[Dict[str, Any]] = []
     for s in suggestions:
         member_fps = [
@@ -884,6 +1201,38 @@ async def relevance_summarize(request: Request) -> Any:
     )
 
 
+# Default export dir sits beside the model artifacts the trainers read.
+_TRAIN_EXPORT_DIR = str(paths.TRAINING_EXPORT_DIR)
+
+
+@app.get("/training/summary")
+async def training_summary(request: Request) -> Any:
+    """Counts only — how much training data the feedback/audit logs hold right
+    now, so the UI can show readiness before anyone exports."""
+    incl = request.query_params.get("include_model_labels") in ("1", "true", "yes")
+    try:
+        return JSONResponse(training_export.summary(include_model_labels=incl))
+    except Exception as e:  # pragma: no cover — defensive
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+
+
+@app.post("/training/export")
+async def training_export_endpoint(request: Request) -> Any:
+    """Write encoder.jsonl + judge_dpo.jsonl from the collected feedback. Body:
+    ``{dir?, include_model_labels?}``. Returns the manifest (paths + counts)."""
+    try:
+        body: Dict[str, Any] = await request.json()
+    except Exception:
+        body = {}
+    dest = body.get("dir") or _TRAIN_EXPORT_DIR
+    incl = bool(body.get("include_model_labels"))
+    try:
+        manifest = training_export.export(dest, include_model_labels=incl)
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+    return JSONResponse(manifest)
+
+
 # ─── multi-provider management ───────────────────────────────────────────
 
 
@@ -982,13 +1331,26 @@ async def chat_completions(request: Request) -> Any:
                 _SETTINGS.upstream_base_url, _SETTINGS.upstream_api_key, slug
             )
 
-    new_messages, events = run_pipeline(
+    new_messages, pipeline_events = run_pipeline(
         lc_messages,
         profile,
         summariser=summariser,
         visual_cfg=load_visual_cfg(active_config_path()),
     )
-    _record(events)
+    if profile.context_management.summarization.enabled and summariser is None:
+        pipeline_events.append(
+            {
+                "type": "notice",
+                "level": "warn",
+                "step": "summarization",
+                "message": "Summarization is on but was skipped — no upstream API key configured. Add one in Providers.",
+            }
+        )
+    _record(pipeline_events)
+    try:
+        _SAVINGS.record(conv, pipeline_events)
+    except Exception as e:  # a disk/write failure must never break a live turn
+        _notice("savings", f"couldn't update the savings ledger: {e!s}")
 
     # Rebuild the forwarded body with the rewritten messages.
     body = dict(body)
@@ -1016,6 +1378,7 @@ async def chat_completions(request: Request) -> Any:
         messages=body.get("messages"),
         tools=body.get("tools"),
     )
+    events.publish({"type": "turn", "conv": conv, "project": proj})
     up = GenericUpstream(target.url, target.headers or {})
     if body.get("stream"):
         return StreamingResponse(
@@ -1087,13 +1450,26 @@ async def anthropic_messages(request: Request) -> Any:
                 slug,
             )
 
-    new_messages, events = run_pipeline(
+    new_messages, pipeline_events = run_pipeline(
         lc_messages,
         profile,
         summariser=summariser,
         visual_cfg=load_visual_cfg(active_config_path()),
     )
-    _record(events)
+    if profile.context_management.summarization.enabled and summariser is None:
+        pipeline_events.append(
+            {
+                "type": "notice",
+                "level": "warn",
+                "step": "summarization",
+                "message": "Summarization is on but was skipped — no upstream API key configured. Add one in Providers.",
+            }
+        )
+    _record(pipeline_events)
+    try:
+        _SAVINGS.record(conv, pipeline_events)
+    except Exception as e:  # a disk/write failure must never break a live turn
+        _notice("savings", f"couldn't update the savings ledger: {e!s}")
 
     # Route to a configured Anthropic provider if one is selected, else env,
     # then decide whether to forward the client's own subscription bearer.
@@ -1155,6 +1531,7 @@ async def anthropic_messages(request: Request) -> Any:
         messages=body.get("messages"),
         tools=body.get("tools"),
     )
+    events.publish({"type": "turn", "conv": conv, "project": proj})
 
     # Pass through Claude Code's beta opt-ins: the `anthropic-beta` header and
     # the `?beta=true` endpoint selector. Stripping these makes the upstream 400

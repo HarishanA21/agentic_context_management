@@ -66,6 +66,14 @@ def run_pipeline(
     and trimming steps see the rasterised view.
     """
     events: List[Dict[str, Any]] = []
+
+    def _fail(step: str, e: Exception) -> None:
+        """A technique errored: log it *and* surface it to the UI as a notice."""
+        _warn(step, e)
+        events.append(
+            {"type": "notice", "level": "error", "step": step, "message": f"{step} failed: {e!s}"}
+        )
+
     cm = getattr(profile, "context_management", None)
     if cm is None:
         return messages, events
@@ -89,7 +97,7 @@ def run_pipeline(
                 messages = _apply_replacements(messages, repl)
                 events.append({"type": "visual_method", **info})
         except Exception as e:  # pragma: no cover - defensive
-            _warn("visual_method", e)
+            _fail("visual_method", e)
 
     # 1. tool_result_trimming -------------------------------------------------
     # Once images exist (visual method or image-recall eviction), trimming must
@@ -109,7 +117,7 @@ def run_pipeline(
                 messages = _apply_replacements(messages, repl)
                 events.append({"type": "tool_result_trimming", **info})
         except Exception as e:  # pragma: no cover - defensive
-            _warn("tool_result_trimming", e)
+            _fail("tool_result_trimming", e)
 
     # 2. image eviction (visual recall, accuracy layer) -----------------------
     if ir_evicts:
@@ -122,7 +130,7 @@ def run_pipeline(
                 messages = _apply_replacements(messages, repl)
                 events.append({"type": "image_eviction", **info})
         except Exception as e:  # pragma: no cover - defensive
-            _warn("image_eviction", e)
+            _fail("image_eviction", e)
 
     # 3. summarization --------------------------------------------------------
     summ = getattr(cm, "summarization", None)
@@ -139,7 +147,7 @@ def run_pipeline(
                 messages = [summary_msg] + _apply_removes(messages, removes)
                 events.append({"type": "summarization", **info})
         except Exception as e:  # pragma: no cover - defensive
-            _warn("summarization", e)
+            _fail("summarization", e)
 
     # 4. sliding_window (dumb safety net) ------------------------------------
     sw = getattr(cm, "sliding_window", None)
@@ -150,7 +158,7 @@ def run_pipeline(
                 messages = _apply_removes(messages, removes)
                 events.append({"type": "sliding_window", **info})
         except Exception as e:  # pragma: no cover - defensive
-            _warn("sliding_window", e)
+            _fail("sliding_window", e)
 
     # 5. cache breakpoints (image_recall caching half) ------------------------
     if ir is not None and getattr(ir, "caching_enabled", False):
@@ -164,7 +172,7 @@ def run_pipeline(
             if placed:
                 events.append({"type": "cache_breakpoints", "placed": placed})
         except Exception as e:  # pragma: no cover - defensive
-            _warn("cache_breakpoints", e)
+            _fail("cache_breakpoints", e)
 
     return messages, events
 

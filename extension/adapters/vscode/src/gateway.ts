@@ -18,6 +18,8 @@ export interface GatewayOptions {
   /** Base URL the gateway listens on (e.g. http://127.0.0.1:8807). */
   url: string;
   output: vscode.OutputChannel;
+  /** Environment for spawning the gateway (e.g. an augmented PATH). Defaults to process.env. */
+  env?: NodeJS.ProcessEnv;
 }
 
 const MAX_RESTARTS = 3;
@@ -70,7 +72,7 @@ export class GatewayManager {
     try {
       // shell:true so a bare command, a venv path, or `python -m acm_gateway`
       // all work. Inherit our env so ACM_* (incl. ACM_ANTHROPIC_AUTH_MODE) flow.
-      this.child = spawn(this.opts.command, { shell: true, env: process.env });
+      this.child = spawn(this.opts.command, { shell: true, env: this.opts.env ?? process.env });
     } catch (e) {
       this.log(`spawn failed: ${(e as Error).message}`);
       this.set('failed');

@@ -1,11 +1,33 @@
 {
   "name": "acm-context-management",
-  "displayName": "ACM — Context Management",
-  "description": "Bring the ACM context-management techniques (trimming, summarisation, image-recall, memory) into VSCode via the gateway, Language Model Tools, and a settings panel.",
-  "version": "0.2.2",
-  "publisher": "acm",
+  "displayName": "Context Management - ACM",
+  "description": "Agentic Context Management for VSCode — trim, summarise, recall, and remember context for Copilot and Claude Code via a local gateway, Language Model Tools, and a settings panel.",
+  "version": "0.2.4",
+  "publisher": "Harishan-A",
   "license": "MIT",
   "icon": "media/icon.png",
+  "qna": "marketplace",
+  "keywords": [
+    "context management",
+    "ai",
+    "copilot",
+    "claude",
+    "llm",
+    "memory",
+    "tokens",
+    "mcp"
+  ],
+  "galleryBanner": {
+    "color": "#1e1e2e",
+    "theme": "dark"
+  },
+  "badges": [
+    {
+      "url": "https://img.shields.io/badge/license-MIT-green.svg",
+      "href": "https://github.com/HarishanA21/agentic_context_management/blob/main/LICENSE",
+      "description": "MIT License"
+    }
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/HarishanA21/agentic_context_management.git",
