@@ -25,9 +25,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-_DEFAULT_PATH = Path(
-    os.getenv("ACM_CONTEXT_WINDOWS_PATH", str(Path.home() / ".acm" / "context_windows.json"))
-)
+from .paths import CONTEXT_WINDOWS_PATH as _DEFAULT_PATH
+from .paths import atomic_write_text
 
 # Persisted fields with their defaults — keeps reads tolerant of older files.
 _FIELDS: Dict[str, Any] = {
@@ -76,8 +75,7 @@ class ContextWindowStore:
             return {}
 
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self._data, indent=2))
+        atomic_write_text(self.path, json.dumps(self._data, indent=2))
         try:
             os.chmod(self.path, 0o600)
         except OSError:
