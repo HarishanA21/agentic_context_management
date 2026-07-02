@@ -48,7 +48,7 @@ function classify(m: any): { cls: string; label: string; context: boolean } {
   return { cls: 'system', label: 'System', context: true };
 }
 
-const TABS = ['Overview', 'Chats', 'Techniques', 'Profiles', 'Providers', 'Memory'];
+const TABS = ['Overview', 'Savings', 'Chats', 'Techniques', 'Profiles', 'Providers', 'Memory', 'Training'];
 
 // Per-label colour for relevance suggestion cards (theme-agnostic alpha fills).
 const LABEL_STYLE: Record<string, { bg: string; fg: string; label: string }> = {
@@ -153,11 +153,13 @@ export function App() {
 
       <main className="body">
         {tab === 'Overview' && <Overview status={status} reachable={reachable} onRefresh={poll} />}
+        {tab === 'Savings' && <Savings />}
         {tab === 'Chats' && <Chats />}
         {tab === 'Techniques' && <Techniques />}
         {tab === 'Profiles' && <Profiles />}
         {tab === 'Providers' && <Providers />}
         {tab === 'Memory' && <Memory />}
+        {tab === 'Training' && <Training />}
       </main>
     </div>
   );
@@ -252,6 +254,33 @@ function Overview({ status, reachable, onRefresh }: any) {
         )}
       </div>
 
+      {/* Context budget meter — how close the live chat is to its ceiling.
+          Hidden when the budget is disabled (ACM_CONTEXT_BUDGET=0). */}
+      {Number(ctx.budget || 0) > 0 && (
+        <div className="card" style={{ padding: 12 }}>
+          <div className="row" style={{ justifyContent: 'space-between', alignItems: 'baseline' }}>
+            <span className="muted tiny">Context budget</span>
+            <span className="tiny" style={{ color: ctx.over_warn ? 'var(--warn)' : undefined }}>
+              {fmtTok(live)} / {fmtTok(Number(ctx.budget))} ({Number(ctx.budget_pct || 0)}%)
+            </span>
+          </div>
+          <div style={{ height: 8, borderRadius: 5, overflow: 'hidden', marginTop: 8, background: 'rgba(127,127,127,0.18)' }}>
+            <div
+              style={{
+                width: Math.min(100, Number(ctx.budget_pct || 0)) + '%',
+                height: '100%',
+                background: ctx.over_warn ? 'var(--warn)' : 'var(--accent)',
+              }}
+            />
+          </div>
+          {ctx.over_warn && (
+            <div className="muted tiny" style={{ marginTop: 6 }}>
+              Nearing the window limit — prune or summarize this chat to avoid an overflow.
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Connection / routing details */}
       <h3 className="sec">Gateway</h3>
       <div className="card">
@@ -306,6 +335,119 @@ function profileLabel(w: any): string {
   if (w && w.profile_source === 'preset') return w.profile_name || 'preset';
   if (w && w.profile_source === 'body') return 'custom';
   return 'default';
+}
+
+// ── Savings ────────────────────────────────────────────────────────────────
+// The receipts: what ACM actually removed from your context, aggregated from the
+// freed_tokens every technique reports. Per-chat and all-time, surviving restarts.
+const TECH_LABEL: Record<string, string> = {
+  visual_method: 'Visual method',
+  tool_result_trimming: 'Tool trimming',
+  image_eviction: 'Image eviction',
+  summarization: 'Summarization',
+  sliding_window: 'Sliding window',
+};
+
+function Savings() {
+  const [data, setData] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [n, reload] = useReload();
+
+  useEffect(() => {
+    rpc('savings').then((d: any) => { setData(d); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, [n]);
+
+  // Every turn frees more tokens — keep the dashboard live.
+  useAcmEvents(useCallback(() => reload(), [reload]));
+
+  const resetAll = async () => {
+    await rpc('savingsReset', {}).catch(() => {});
+    reload();
+  };
+
+  if (loading) return <p className="muted tiny">Loading savings…</p>;
+  const d = data || {};
+  const total = Number(d.total_freed_tokens || 0);
+  const rows: any[] = d.conversations || [];
+  const byTech: Record<string, number> = d.by_technique || {};
+  const cost = Number(d.total_cost_saved || 0);
+  const maxRow = rows.reduce((m, r) => Math.max(m, Number(r.freed_tokens || 0)), 0) || 1;
+
+  if (total === 0) {
+    return (
+      <div>
+        <div className="card" style={{ padding: 14 }}>
+          <div className="muted tiny">Tokens saved so far</div>
+          <div style={{ fontSize: 30, fontWeight: 700, marginTop: 4 }}>0</div>
+          <p className="muted tiny" style={{ marginTop: 8 }}>
+            No savings recorded yet. As techniques trim, evict, and summarise your
+            chats, the tokens they remove are tallied here — per chat and all-time.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {/* Headline: the one number that says what ACM bought you */}
+      <div className="card" style={{ padding: 14 }}>
+        <div className="muted tiny">Tokens saved (all-time)</div>
+        <div style={{ fontSize: 30, fontWeight: 700, marginTop: 4 }}>{fmtTok(total)}</div>
+        <div className="muted tiny" style={{ marginTop: 4 }}>
+          across {d.total_turns || 0} turn{d.total_turns === 1 ? '' : 's'}
+          {cost > 0 ? ` · ~$${cost.toFixed(2)} saved` : ''}
+        </div>
+      </div>
+
+      {/* Where the savings came from */}
+      <h3 className="sec">By technique</h3>
+      <div className="chips">
+        {Object.keys(byTech).length === 0 && <span className="muted tiny">—</span>}
+        {Object.entries(byTech)
+          .sort((a, b) => Number(b[1]) - Number(a[1]))
+          .map(([k, v]) => (
+            <span key={k} className="chip on">
+              {TECH_LABEL[k] || k} · {fmtTok(Number(v))}
+            </span>
+          ))}
+      </div>
+
+      {/* Per-chat leaderboard */}
+      <h3 className="sec">By chat</h3>
+      <ul className="timeline">
+        {rows.map((r: any) => {
+          const freed = Number(r.freed_tokens || 0);
+          const pct = Math.round((freed / maxRow) * 100);
+          return (
+            <li key={r.conversation}>
+              <span
+                className="t"
+                style={{ cursor: 'pointer' }}
+                title={r.conversation}
+                onClick={() => openChat(r.conversation)}
+              >
+                {r.title && r.title !== r.conversation ? r.title : shortId(r.conversation)}
+              </span>
+              <div style={{ height: 6, borderRadius: 4, overflow: 'hidden', background: 'rgba(127,127,127,0.18)', margin: '4px 0' }}>
+                <div style={{ width: pct + '%', height: '100%', background: 'var(--accent)' }} />
+              </div>
+              <span className="muted tiny">
+                {fmtTok(freed)} tok · {r.turns} turn{r.turns === 1 ? '' : 's'}
+                {r.cost_saved > 0 ? ` · ~$${Number(r.cost_saved).toFixed(2)}` : ''}
+                {r.last_ts ? ` · ${rel(r.last_ts)}` : ''}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+
+      <p style={{ marginTop: 12 }}>
+        <button className="btn ghost sm" onClick={resetAll}>Reset savings</button>
+      </p>
+    </div>
+  );
 }
 
 function Chats() {
@@ -396,6 +538,110 @@ function Chats() {
   );
 }
 
+// ── Preview (dry-run the pipeline on the next request) ───────────────────────
+// Shows what the pipeline WOULD do to the current context before anything is
+// sent: per-message kept / changed / removed / added, and the token delta. Free
+// and deterministic — the paid summariser call is skipped (reported as pending).
+const STATUS_LABEL: Record<string, string> = {
+  kept: 'kept', changed: 'trimmed', removed: 'removed', added: 'added',
+};
+
+// One-click reversal of the last manual edit (drop / drop-many / restore /
+// summarize) on this chat. The gateway keeps a session undo stack; we just show
+// what's on top and pop it. Hidden entirely when there's nothing to undo.
+function UndoBar({ conv }: { conv: string }) {
+  const [top, setTop] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
+  const [n, reload] = useReload();
+
+  useEffect(() => {
+    rpc('undoStatus', { conv }).then((d: any) => setTop(d?.top || null)).catch(() => setTop(null));
+  }, [conv, n]);
+  // Any drop/restore/summarize elsewhere in the UI changes the stack.
+  useAcmEvents(useCallback(() => reload(), [reload]));
+
+  if (!top) return null;
+
+  const doUndo = () => {
+    setBusy(true);
+    rpc('undo', { conv }).then(() => reload()).finally(() => setBusy(false));
+  };
+
+  return (
+    <div className="row" style={{ alignItems: 'center', gap: 8, marginBottom: 8 }}>
+      <button className="btn sm" disabled={busy} onClick={doUndo}>↩ Undo</button>
+      <span className="muted tiny">{top.label}{top.depth > 1 ? ` · ${top.depth} steps back` : ''}</span>
+    </div>
+  );
+}
+
+function Preview({ conv }: { conv: string }) {
+  const [data, setData] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [n, reload] = useReload();
+
+  useEffect(() => {
+    setLoading(true);
+    rpc('preview', { conv }).then((d: any) => { setData(d); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, [conv, n]);
+
+  useAcmEvents(useCallback(() => reload(), [reload]));
+
+  if (loading) return <p className="muted tiny">Computing preview…</p>;
+  const d = data || {};
+  if (!d.available) {
+    return <p className="muted tiny">{d.reason || 'Preview unavailable.'}</p>;
+  }
+
+  const before = Number(d.before_tokens || 0);
+  const after = Number(d.after_tokens || 0);
+  const freed = Number(d.freed_tokens || 0);
+  const rows: any[] = d.rows || [];
+  const changed = rows.filter((r) => r.status !== 'kept');
+
+  return (
+    <div>
+      <div className="card" style={{ padding: 12 }}>
+        <div className="row" style={{ justifyContent: 'space-between' }}>
+          <span className="muted tiny">If sent now</span>
+          <button className="btn ghost sm" onClick={reload}>Refresh</button>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 4 }}>
+          <span style={{ fontSize: 20, fontWeight: 700 }}>{fmtTok(after)}</span>
+          <span className="muted tiny">
+            tokens {freed > 0 ? `(down from ${fmtTok(before)}, −${fmtTok(freed)})` : '(no change)'}
+          </span>
+        </div>
+        <div className="muted tiny" style={{ marginTop: 2 }}>
+          {d.before_messages} → {d.after_messages} messages
+          {d.summarization_pending ? ' · summarization will run live (needs a model call)' : ''}
+        </div>
+      </div>
+
+      {changed.length === 0 ? (
+        <p className="muted tiny">No mechanical changes — the context is already within limits.</p>
+      ) : (
+        <ul className="timeline">
+          {changed.map((r: any, i: number) => (
+            <li key={r.fp || i}>
+              <span className={'t' + (r.status === 'removed' ? ' error' : r.status === 'added' ? '' : ' warn')}>
+                {r.role} · {STATUS_LABEL[r.status] || r.status}
+              </span>
+              <span className="muted tiny" style={{ display: 'block' }}>{r.preview || '—'}</span>
+              <span className="muted tiny">
+                {r.status === 'changed'
+                  ? `${fmtTok(r.tokens)} → ${fmtTok(r.after_tokens || 0)} tok`
+                  : `${fmtTok(r.tokens)} tok`}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 // ── Chat detail (two columns: context window | per-chat settings) ──────
 export function ChatDetail({ conv }: { conv: string }) {
   const [theme] = useState<Theme>(() => (getState().theme as Theme) || 'auto');
@@ -434,7 +680,10 @@ export function ChatDetail({ conv }: { conv: string }) {
         <div className="two-col">
           <section className="col">
             <h3 className="sec">Context window <span className="muted tiny">— what's sent to the model</span></h3>
+            <UndoBar conv={conv} />
             <ContextWindow conv={conv} />
+            <h3 className="sec" style={{ marginTop: 16 }}>Next request preview <span className="muted tiny">— dry run, nothing sent</span></h3>
+            <Preview conv={conv} />
           </section>
           <section className="col">
             <h3 className="sec">Settings <span className="muted tiny">— this chat only</span></h3>
@@ -1107,6 +1356,93 @@ function Memory() {
       <h3 className="sec">{items.length} note{items.length === 1 ? '' : 's'}</h3>
       {items.length === 0 ? <p className="muted tiny">Empty.</p> :
         items.map((it, i) => <div className="card tiny" key={i}>{it}</div>)}
+    </div>
+  );
+}
+
+// Training data export (relevance feedback → encoder + judge trainer files).
+// Every accept/reject/summarize on a pruning suggestion is logged; this turns
+// that log into the two files the FYP trainers read. Read-only summary first
+// (how much data exists, how often the user overrode the model), then export.
+function Training() {
+  const [sum, setSum] = useState<any>(null);
+  const [incl, setIncl] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [manifest, setManifest] = useState<any>(null);
+  const [n, reload] = useReload();
+
+  useEffect(() => {
+    rpc('trainingSummary', { includeModelLabels: incl }).then(setSum).catch(() => setSum(null));
+  }, [incl, n]);
+
+  const doExport = () => {
+    setBusy(true);
+    rpc('trainingExport', { includeModelLabels: incl })
+      .then((m: any) => { setManifest(m); reload(); })
+      .finally(() => setBusy(false));
+  };
+
+  const s = sum || {};
+  const counts = s.label_counts || {};
+  const gold = Number(s.gold_examples || 0);
+  const pct = Math.round(Number(s.override_rate || 0) * 100);
+
+  return (
+    <div>
+      <p className="muted tiny">
+        Turns your pruning feedback into training data — <code>encoder.jsonl</code> (relevance
+        model) and <code>judge_dpo.jsonl</code> (preference pairs). Data comes from every
+        KEEP/SUMMARIZE/DROP decision you make on suggestions.
+      </p>
+
+      {s.error ? (
+        <p className="muted tiny">Couldn't read logs: {s.error}</p>
+      ) : (
+        <div className="card" style={{ padding: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+            <span style={{ fontSize: 20, fontWeight: 700 }}>{gold}</span>
+            <span className="muted tiny">gold examples (your corrections)</span>
+          </div>
+          <div className="muted tiny" style={{ marginTop: 2 }}>
+            {s.silver_examples || 0} silver · {s.judge_pairs || 0} DPO pairs · {pct}% of
+            comparable episodes overrode the model
+          </div>
+          <div className="row" style={{ gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+            {['KEEP', 'SUMMARIZE', 'DROP'].map((k) => (
+              <span key={k} className="badge tiny">{k}: {counts[k] || 0}</span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <label className="row tiny" style={{ gap: 6, marginTop: 10, alignItems: 'center' }}>
+        <input type="checkbox" checked={incl} onChange={(e) => setIncl(e.target.checked)} />
+        Include model's own labels as silver examples (cold-start, before enough corrections)
+      </label>
+
+      <div className="row" style={{ marginTop: 10 }}>
+        <button className="btn" disabled={busy || gold === 0} onClick={doExport}>
+          {busy ? 'Exporting…' : 'Export training files'}
+        </button>
+        <button className="btn ghost sm" onClick={reload}>Refresh</button>
+      </div>
+      {gold === 0 && (
+        <p className="muted tiny" style={{ marginTop: 6 }}>
+          No corrections logged yet — accept or reject some pruning suggestions first.
+        </p>
+      )}
+
+      {manifest && manifest.ok && (
+        <div className="card tiny" style={{ marginTop: 10 }}>
+          <div>Wrote {manifest.encoder_examples} encoder rows + {manifest.judge_pairs} DPO pairs to:</div>
+          <div style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)', marginTop: 4 }}>
+            {manifest.encoder_path}<br />{manifest.judge_path}
+          </div>
+        </div>
+      )}
+      {manifest && manifest.error && (
+        <p className="muted tiny" style={{ marginTop: 6 }}>Export failed: {manifest.error}</p>
+      )}
     </div>
   );
 }

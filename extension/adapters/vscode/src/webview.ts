@@ -87,6 +87,20 @@ async function dispatch(client: AcmClient, method: string, params: any): Promise
   switch (method) {
     case 'status':
       return client.status();
+    case 'savings':
+      return client.savings();
+    case 'savingsReset':
+      return client.savingsReset(p.conv || '');
+    case 'preview':
+      return client.preview(p.conv || '');
+    case 'undoStatus':
+      return client.undoStatus(p.conv || '');
+    case 'undo':
+      return client.undo(p.conv || '');
+    case 'trainingSummary':
+      return client.trainingSummary(!!p.includeModelLabels);
+    case 'trainingExport':
+      return client.trainingExport(!!p.includeModelLabels, p.dir || '');
     case 'getProfile':
       return client.getProfile();
     case 'setPreset':

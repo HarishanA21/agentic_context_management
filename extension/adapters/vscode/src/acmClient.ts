@@ -21,6 +21,9 @@ export interface AcmContext {
   saved_tokens: number;
   messages: number;
   dropped: number;
+  budget?: number;
+  budget_pct?: number;
+  over_warn?: boolean;
 }
 
 export interface AcmStatus {
@@ -81,6 +84,93 @@ export class AcmClient {
     });
   }
 
+  /**
+   * Subscribe to the gateway's realtime event stream (Server-Sent Events).
+   * Calls `onEvent` for each parsed event. Returns a disposer that closes the
+   * connection. The webview can't open a socket itself (its CSP forbids it), so
+   * the host owns this one connection and relays events to its webviews.
+   */
+  events(onEvent: (event: Record<string, unknown>) => void): () => void {
+    const url = new URL('/events', this.baseUrl);
+    let req: http.ClientRequest | undefined;
+    let res: http.IncomingMessage | undefined;
+    let closed = false;
+    let retry: NodeJS.Timeout | undefined;
+
+    const connect = () => {
+      if (closed) {
+        return;
+      }
+      req = http.request(
+        {
+          method: 'GET',
+          hostname: url.hostname,
+          port: url.port,
+          path: url.pathname + url.search,
+          headers: { Accept: 'text/event-stream' },
+        },
+        (r) => {
+          res = r;
+          if ((r.statusCode ?? 500) >= 400) {
+            r.resume();
+            scheduleReconnect();
+            return;
+          }
+          r.setEncoding('utf8');
+          let buf = '';
+          r.on('data', (chunk: string) => {
+            buf += chunk;
+            // SSE frames are separated by a blank line.
+            let sep: number;
+            while ((sep = buf.indexOf('\n\n')) !== -1) {
+              const frame = buf.slice(0, sep);
+              buf = buf.slice(sep + 2);
+              for (const line of frame.split('\n')) {
+                if (!line.startsWith('data:')) {
+                  continue; // skip comments (heartbeats) and other fields
+                }
+                const data = line.slice(5).trim();
+                if (!data) {
+                  continue;
+                }
+                try {
+                  onEvent(JSON.parse(data) as Record<string, unknown>);
+                } catch {
+                  /* ignore malformed frame */
+                }
+              }
+            }
+          });
+          r.on('end', scheduleReconnect);
+          r.on('error', scheduleReconnect);
+        },
+      );
+      req.on('error', scheduleReconnect);
+      req.end();
+    };
+
+    const scheduleReconnect = () => {
+      if (closed || retry) {
+        return;
+      }
+      retry = setTimeout(() => {
+        retry = undefined;
+        connect();
+      }, 2000);
+    };
+
+    connect();
+
+    return () => {
+      closed = true;
+      if (retry) {
+        clearTimeout(retry);
+      }
+      res?.destroy();
+      req?.destroy();
+    };
+  }
+
   status(): Promise<AcmStatus> {
     return this.request<AcmStatus>('GET', '/status');
   }
@@ -112,6 +202,44 @@ export class AcmClient {
 
   compact(text: string): Promise<{ summary: string }> {
     return this.request('POST', '/compact', { text });
+  }
+
+  // ── savings dashboard (aggregated freed tokens) ─────────────────────
+  savings(): Promise<AcmSavings> {
+    return this.request<AcmSavings>('GET', '/savings');
+  }
+
+  // ── preview (dry-run the pipeline on the next request) ──────────────
+  preview(conv = ''): Promise<AcmPreview> {
+    const q = conv ? `?conv=${encodeURIComponent(conv)}` : '';
+    return this.request<AcmPreview>('GET', `/preview${q}`);
+  }
+
+  savingsReset(conv = ''): Promise<{ ok: boolean }> {
+    return this.request('POST', '/savings/reset', conv ? { conversation: conv } : {});
+  }
+
+  // ── training-data export (relevance feedback → trainer files) ───────
+  trainingSummary(includeModelLabels = false): Promise<AcmTrainingSummary> {
+    const q = includeModelLabels ? '?include_model_labels=1' : '';
+    return this.request<AcmTrainingSummary>('GET', `/training/summary${q}`);
+  }
+
+  trainingExport(includeModelLabels = false, dir = ''): Promise<AcmTrainingManifest> {
+    const body: Record<string, unknown> = {};
+    if (includeModelLabels) body.include_model_labels = true;
+    if (dir) body.dir = dir;
+    return this.request<AcmTrainingManifest>('POST', '/training/export', body);
+  }
+
+  // ── undo (reverse the last manual edit) ─────────────────────────────
+  undoStatus(conv = ''): Promise<AcmUndoStatus> {
+    const q = conv ? `?conv=${encodeURIComponent(conv)}` : '';
+    return this.request<AcmUndoStatus>('GET', `/undo${q}`);
+  }
+
+  undo(conv = ''): Promise<AcmUndoResult> {
+    return this.request<AcmUndoResult>('POST', '/undo', conv ? { conv } : {});
   }
 
   // ── manual message removal (drop-list) ──────────────────────────────
@@ -205,6 +333,10 @@ export class AcmClient {
     return this.request('DELETE', `/context_windows/${encodeURIComponent(conv)}`);
   }
 
+  resetWindows(): Promise<{ ok: boolean; cleared: number }> {
+    return this.request('POST', '/context_windows/reset');
+  }
+
   // ── multi-provider ──────────────────────────────────────────────────
   providers(): Promise<{ default: string | null; providers: Record<string, any> }> {
     return this.request('GET', '/providers');
@@ -257,6 +389,86 @@ export interface AcmContextWindow {
   system: unknown;
   messages: any[];
   tools: any[];
+}
+
+export interface AcmSavingsRow {
+  conversation: string;
+  title: string;
+  freed_tokens: number;
+  turns: number;
+  by_technique: Record<string, number>;
+  last_ts: number | null;
+  cost_saved: number;
+}
+
+export interface AcmSavings {
+  total_freed_tokens: number;
+  total_turns: number;
+  total_cost_saved: number;
+  cost_per_mtok: number;
+  by_technique: Record<string, number>;
+  conversations: AcmSavingsRow[];
+}
+
+export interface AcmTrainingSummary {
+  encoder_examples: number;
+  gold_examples: number;
+  silver_examples: number;
+  judge_pairs: number;
+  label_counts: Record<string, number>;
+  override_rate: number;
+  error?: string;
+}
+
+export interface AcmTrainingManifest extends AcmTrainingSummary {
+  ok: boolean;
+  dir: string;
+  encoder_path: string;
+  judge_path: string;
+}
+
+export interface AcmUndoTop {
+  kind: 'drop' | 'drop_many' | 'restore' | 'summarize';
+  label: string;
+  depth: number;
+}
+
+export interface AcmUndoStatus {
+  conversation: string;
+  top: AcmUndoTop | null;
+}
+
+export interface AcmUndoResult {
+  ok: boolean;
+  conversation: string;
+  reason?: string;
+  undone?: { kind: string; label: string };
+  dropped?: string[];
+  top?: AcmUndoTop | null;
+}
+
+export interface AcmPreviewRow {
+  fp: string;
+  role: string;
+  preview: string;
+  tokens: number;
+  status: 'kept' | 'changed' | 'removed' | 'added';
+  after_preview?: string;
+  after_tokens?: number;
+}
+
+export interface AcmPreview {
+  conversation: string;
+  available: boolean;
+  reason?: string;
+  before_tokens?: number;
+  after_tokens?: number;
+  freed_tokens?: number;
+  before_messages?: number;
+  after_messages?: number;
+  rows?: AcmPreviewRow[];
+  events?: any[];
+  summarization_pending?: boolean;
 }
 
 export interface RelevanceSuggestion {

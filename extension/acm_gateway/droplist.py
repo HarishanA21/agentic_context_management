@@ -38,12 +38,9 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-_DEFAULT_PATH = Path(
-    os.getenv("ACM_DROPLIST_PATH", str(Path.home() / ".acm" / "dropped.json"))
-)
-_SUMMARY_PATH = Path(
-    os.getenv("ACM_SUMMARY_PATH", str(Path.home() / ".acm" / "summaries.json"))
-)
+from .paths import DROPLIST_PATH as _DEFAULT_PATH
+from .paths import SUMMARY_PATH as _SUMMARY_PATH
+from .paths import atomic_write_text
 
 
 def _norm_text(content: Any) -> str:
@@ -192,6 +189,10 @@ class DropStore:
         # "what we actually send each call" — distinct from self._seen, which is
         # the INCOMING view captured before the technique pipeline runs.
         self._sent: Dict[str, Dict[str, Any]] = {}
+        # in-memory: conv_key -> stack of reversible actions (most recent last).
+        # Undo is a session affordance over manual edits (drop / drop_many /
+        # restore / summarize); not persisted, so a fresh gateway starts clean.
+        self._undo: Dict[str, List[Dict[str, Any]]] = {}
 
     # ── persistence ──────────────────────────────────────────────────────
     def _load(self) -> Dict[str, List[str]]:
@@ -201,7 +202,7 @@ class DropStore:
             return {}
 
     def _save(self) -> None:
-        self.path.write_text(json.dumps(self._dropped, indent=2))
+        atomic_write_text(self.path, json.dumps(self._dropped, indent=2))
 
     def _load_summaries(self) -> Dict[str, List[str]]:
         try:
@@ -210,7 +211,7 @@ class DropStore:
             return {}
 
     def _save_summaries(self) -> None:
-        self.summary_path.write_text(json.dumps(self._summaries, indent=2))
+        atomic_write_text(self.summary_path, json.dumps(self._summaries, indent=2))
 
     # ── summaries (episode → one injected note) ──────────────────────────
     def summaries(self, conv: str) -> List[str]:
@@ -218,12 +219,18 @@ class DropStore:
 
     def summarize(self, conv: str, member_fps: List[str], summary: str) -> None:
         """Drop the whole episode and remember a summary note to inject in its
-        place on every future request."""
-        for fp in member_fps:
-            self.drop(conv, fp)
+        place on every future request. Records a single undo entry that both
+        removes the injected note and restores the members it newly dropped."""
+        newly = [fp for fp in member_fps if self.drop(conv, fp)]
         bucket = self._summaries.setdefault(conv, [])
         bucket.append(summary)
         self._save_summaries()
+        self.push_undo(
+            conv,
+            "summarize",
+            f"summarize {len(member_fps)} messages",
+            {"summary": summary, "fps": newly},
+        )
 
     def clear_summaries(self, conv: str) -> None:
         if self._summaries.pop(conv, None) is not None:
@@ -255,11 +262,15 @@ class DropStore:
     def is_dropped(self, conv: str, fp: str) -> bool:
         return fp in self._dropped.get(conv, [])
 
-    def drop(self, conv: str, fp: str) -> None:
+    def drop(self, conv: str, fp: str) -> bool:
+        """Tombstone a message. Returns True if it was newly dropped (so callers
+        can record an accurate undo entry), False if it was already dropped."""
         bucket = self._dropped.setdefault(conv, [])
         if fp not in bucket:
             bucket.append(fp)
             self._save()
+            return True
+        return False
 
     def restore(self, conv: str, fp: str) -> bool:
         bucket = self._dropped.get(conv, [])
@@ -270,6 +281,66 @@ class DropStore:
             self._save()
             return True
         return False
+
+    # ── undo (session-only stack of reversible manual edits) ─────────────
+    _UNDO_LIMIT = 25
+
+    def push_undo(self, conv: str, kind: str, label: str, undo: Dict[str, Any]) -> None:
+        """Record a reversible action. `undo` carries exactly what undo() needs
+        to reverse it (see undo() for the per-kind shape). Capped per chat so a
+        long session can't grow the stack without bound."""
+        stack = self._undo.setdefault(conv, [])
+        stack.append({"kind": kind, "label": label, "undo": undo})
+        if len(stack) > self._UNDO_LIMIT:
+            del stack[: -self._UNDO_LIMIT]
+
+    def undo_top(self, conv: str) -> Optional[Dict[str, Any]]:
+        """The label/kind of the action that undo() would reverse next, or None."""
+        stack = self._undo.get(conv, [])
+        if not stack:
+            return None
+        top = stack[-1]
+        return {"kind": top["kind"], "label": top["label"], "depth": len(stack)}
+
+    def undo(self, conv: str) -> Optional[Dict[str, Any]]:
+        """Reverse the most recent recorded action. Returns a small result dict
+        describing what was undone, or None if there is nothing to undo."""
+        stack = self._undo.get(conv, [])
+        if not stack:
+            return None
+        action = stack.pop()
+        if not stack:
+            self._undo.pop(conv, None)
+        kind, u = action["kind"], action["undo"]
+
+        if kind in ("drop", "drop_many"):
+            # Reverse a removal: restore exactly the fps this action dropped
+            # (only those it actually newly-dropped, tracked at record time).
+            for fp in u.get("fps", []):
+                self.restore(conv, fp)
+        elif kind == "restore":
+            # Reverse a restore: drop the fp again.
+            fp = u.get("fp")
+            if fp:
+                self.drop(conv, fp)
+        elif kind == "summarize":
+            # Reverse a summarize: remove the injected note and restore its
+            # members. Remove the specific note (not the whole bucket) so an
+            # older summary on the same chat survives.
+            note = u.get("summary")
+            bucket = self._summaries.get(conv, [])
+            if note in bucket:
+                bucket.remove(note)
+                if not bucket:
+                    self._summaries.pop(conv, None)
+                self._save_summaries()
+            for fp in u.get("fps", []):
+                self.restore(conv, fp)
+
+        return {"kind": kind, "label": action["label"]}
+
+    def clear_undo(self, conv: str) -> None:
+        self._undo.pop(conv, None)
 
     # ── last-seen (for the UI) ───────────────────────────────────────────
     def record_seen(self, conv: str, messages: List[BaseMessage]) -> None:
@@ -406,6 +477,7 @@ class DropStore:
         self._seen.pop(conv, None)
         self._seen_msgs.pop(conv, None)
         self._sent.pop(conv, None)
+        self._undo.pop(conv, None)
         if dropped_changed:
             self._save()
 
@@ -417,6 +489,7 @@ class DropStore:
         self._seen = {}
         self._seen_msgs = {}
         self._sent = {}
+        self._undo = {}
         self._save()
         self._save_summaries()
 
