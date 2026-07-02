@@ -83,9 +83,11 @@ import github_client
 load_dotenv()
 
 DB_URL = os.environ["SUPABASE_DB_URL"]
-SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
-JWKS_URL = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
-_jwks_client = PyJWKClient(JWKS_URL)
+# ── Keycloak auth (replaces Supabase Auth) ───────────────────────────
+KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "http://localhost:8080").rstrip("/")
+KEYCLOAK_REALM = os.environ.get("KEYCLOAK_REALM", "acm")
+JWKS_URL = f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/certs"
+_jwks_client = PyJWKClient(JWKS_URL, cache_jwk_set=True, lifespan=360)
 
 # ── File uploads ────────────────────────────────────────────────────────────
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB per file
@@ -1352,7 +1354,7 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> str:
             token,
             signing_key.key,
             algorithms=["ES256", "RS256"],
-            audience="authenticated",
+            options={"verify_aud": False},  # Keycloak audience varies by client
         )
     except jwt.PyJWTError as e:
         raise HTTPException(401, f"Invalid token: {e}")
@@ -1363,7 +1365,7 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> str:
 
 
 def _verify_jwt(token: str) -> str:
-    """Verify a Supabase JWT and return the subject (user_id).
+    """Verify a Keycloak JWT and return the subject (user_id).
 
     Mirrors `get_current_user` but accepts the raw token directly — used by
     the SSE endpoint, which gets the token via query string because
@@ -1375,7 +1377,7 @@ def _verify_jwt(token: str) -> str:
             token,
             signing_key.key,
             algorithms=["ES256", "RS256"],
-            audience="authenticated",
+            options={"verify_aud": False},  # Keycloak audience varies by client
         )
     except jwt.PyJWTError as e:
         raise HTTPException(401, f"Invalid token: {e}")

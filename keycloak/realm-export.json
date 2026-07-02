@@ -1,0 +1,63 @@
+{
+  "realm": "acm",
+  "displayName": "ACM",
+  "enabled": true,
+  "registrationAllowed": true,
+  "registrationEmailAsUsername": true,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": true,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": true,
+  "accessTokenLifespan": 3600,
+  "refreshTokenMaxReuse": 0,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "clients": [
+    {
+      "clientId": "acm-frontend",
+      "name": "ACM Frontend",
+      "enabled": true,
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:3000/*",
+        "http://localhost:3001/*"
+      ],
+      "webOrigins": [
+        "http://localhost:3000",
+        "http://localhost:3001"
+      ],
+      "attributes": {
+        "access.token.lifespan": "3600",
+        "pkce.code.challenge.method": "S256"
+      },
+      "defaultClientScopes": [
+        "web-origins",
+        "profile",
+        "roles",
+        "email"
+      ],
+      "optionalClientScopes": [
+        "address",
+        "phone",
+        "offline_access",
+        "microprofile-jwt"
+      ]
+    }
+  ],
+  "roles": {
+    "realm": [
+      {
+        "name": "user",
+        "description": "Default ACM user"
+      }
+    ]
+  },
+  "defaultRoles": ["user"],
+  "scopeMappings": [],
+  "clientScopeMappings": {}
+}
