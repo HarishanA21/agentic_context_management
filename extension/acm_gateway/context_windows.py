@@ -135,6 +135,13 @@ class ContextWindowStore:
             return True
         return False
 
+    def clear(self) -> int:
+        """Drop every context window. Returns how many were removed."""
+        n = len(self._data)
+        self._data = {}
+        self._save()
+        return n
+
     # ── profile (per-chat technique override) ────────────────────────────
     def set_profile(
         self, conv: str, *, name: Optional[str] = None, body: Optional[Dict[str, Any]] = None
