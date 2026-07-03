@@ -48,7 +48,7 @@ function classify(m: any): { cls: string; label: string; context: boolean } {
   return { cls: 'system', label: 'System', context: true };
 }
 
-const TABS = ['Overview', 'Savings', 'Chats', 'Techniques', 'Profiles', 'Providers', 'Memory', 'Training'];
+const TABS = ['Overview', 'Savings', 'Chats', 'Techniques', 'Providers', 'Memory', 'Training'];
 
 // Per-label colour for relevance suggestion cards (theme-agnostic alpha fills).
 const LABEL_STYLE: Record<string, { bg: string; fg: string; label: string }> = {
@@ -156,7 +156,6 @@ export function App() {
         {tab === 'Savings' && <Savings />}
         {tab === 'Chats' && <Chats />}
         {tab === 'Techniques' && <Techniques />}
-        {tab === 'Profiles' && <Profiles />}
         {tab === 'Providers' && <Providers />}
         {tab === 'Memory' && <Memory />}
         {tab === 'Training' && <Training />}
@@ -281,50 +280,51 @@ function Overview({ status, reachable, onRefresh }: any) {
         </div>
       )}
 
-      {/* Connection / routing details */}
-      <h3 className="sec">Gateway</h3>
-      <div className="card">
-        <div className="kv">
-          <span className="k">Upstream</span>
-          <span><span className="dot ok" /> <code title={status.upstream}>{hostOf(status.upstream)}</code></span>
-          <span className="k">Default provider</span>
-          <span>{status.providers?.default || <span className="muted">env fallback</span>}{(status.providers?.configured || []).length ? <span className="muted tiny"> · {(status.providers.configured).length} configured</span> : null}</span>
-          <span className="k">Tool surface</span><span>{prettySurface(status.tool_surface)}</span>
-          <span className="k">Config</span>
-          <span className="tiny"><code title={status.config_path}>{String(status.config_path || '').split('/').pop()}</code></span>
-        </div>
-      </div>
-
+      {/* Active techniques — only what's on; the full list lives in the Techniques tab */}
       <h3 className="sec">Active techniques <span className="muted tiny">({activeCount} on)</span></h3>
-      <div className="chips">
-        {Object.entries(tech).map(([k, v]) => (
-          <span key={k} className={'chip ' + (on(v) ? 'on' : 'off')}>
-            <span className={'dot ' + (on(v) ? 'ok' : '')} />{k}{typeof v === 'string' && v !== 'off' ? ': ' + v : ''}
-          </span>
-        ))}
-      </div>
-
-      <h3 className="sec">Recent activity</h3>
-      {events.length === 0 ? (
-        <p className="muted tiny">No edits yet. Route an IDE chat through the gateway to see techniques fire.</p>
+      {activeCount === 0 ? (
+        <p className="muted tiny">Nothing enabled — turn techniques on in the Techniques tab.</p>
       ) : (
-        <ul className="timeline">
-          {events.map((e: any, i: number) => (
-            <li key={i}>
-              <span className={'t' + (e.type === 'notice' ? ' ' + (e.level === 'error' ? 'error' : 'warn') : '')}>{e.type === 'notice' ? (e.step || 'notice') : e.type}</span>
-              <span className="muted tiny">
-                {e.type === 'notice' ? e.message : ''}
-                {e.freed_tokens ? `freed ~${e.freed_tokens} tok` : ''}
-                {e.cleared ? ` · cleared ${e.cleared}` : ''}
-                {e.removed ? ` · removed ${e.removed}` : ''}
-                {e.rasterised ? ` · rasterised ${e.rasterised}` : ''}
-                {e.compacted ? ` · compacted ${e.compacted}` : ''}
-              </span>
-              <span className="muted tiny" style={{ marginLeft: 'auto' }}>{e.ts ? rel(e.ts) : ''}</span>
-            </li>
+        <div className="chips">
+          {Object.entries(tech).filter(([, v]) => on(v)).map(([k, v]) => (
+            <span key={k} className="chip on">
+              <span className="dot ok" />{k}{typeof v === 'string' && v !== 'off' ? ': ' + v : ''}
+            </span>
           ))}
-        </ul>
+        </div>
       )}
+
+      {/* Connection / routing — one compact line, full paths on hover */}
+      <p className="muted tiny" style={{ marginTop: 12 }}>
+        <span className="dot ok" /> <code title={status.upstream}>{hostOf(status.upstream)}</code>
+        {' · '}{status.providers?.default || 'env fallback'}
+        {' · '}{prettySurface(status.tool_surface)}
+        {' · '}<code title={status.config_path}>{String(status.config_path || '').split('/').pop()}</code>
+      </p>
+
+      <details style={{ marginTop: 8 }}>
+        <summary className="muted tiny" style={{ cursor: 'pointer' }}>Recent activity</summary>
+        {events.length === 0 ? (
+          <p className="muted tiny">No edits yet. Route an IDE chat through the gateway to see techniques fire.</p>
+        ) : (
+          <ul className="timeline">
+            {events.map((e: any, i: number) => (
+              <li key={i}>
+                <span className={'t' + (e.type === 'notice' ? ' ' + (e.level === 'error' ? 'error' : 'warn') : '')}>{e.type === 'notice' ? (e.step || 'notice') : e.type}</span>
+                <span className="muted tiny">
+                  {e.type === 'notice' ? e.message : ''}
+                  {e.freed_tokens ? `freed ~${e.freed_tokens} tok` : ''}
+                  {e.cleared ? ` · cleared ${e.cleared}` : ''}
+                  {e.removed ? ` · removed ${e.removed}` : ''}
+                  {e.rasterised ? ` · rasterised ${e.rasterised}` : ''}
+                  {e.compacted ? ` · compacted ${e.compacted}` : ''}
+                </span>
+                <span className="muted tiny" style={{ marginLeft: 'auto' }}>{e.ts ? rel(e.ts) : ''}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </details>
       <p style={{ marginTop: 12 }}><button className="btn sec sm" onClick={onRefresh}>Refresh</button></p>
     </div>
   );
@@ -1106,6 +1106,7 @@ function Techniques({ conv, onChanged }: { conv?: string; onChanged?: () => void
   const perChat = !!conv;
   const [prof, setProf] = useState<any>(null);
   const [vm, setVm] = useState<any>(null); // visual method is a global axis — global tab only
+  const [presets, setPresets] = useState<any[]>([]);
   const [msg, setMsg] = useState('');
   const [n, reload] = useReload();
   useEffect(() => {
@@ -1114,11 +1115,17 @@ function Techniques({ conv, onChanged }: { conv?: string; onChanged?: () => void
     } else {
       rpc('getProfile').then((p: any) => {
         setProf(p.active);
+        setPresets(p.presets || []);
         setVm(p.visual_method || { enabled: false, trigger_tokens: 500, only_tools: [], exclude_tools: [] });
       });
     }
   }, [n, conv]);
   if (!prof) return <Loading />;
+  const applyPreset = async (name: string) => {
+    setMsg('applying ' + name + '…');
+    try { await rpc('setPreset', { name }); setMsg(name + ' applied ✓'); reload(); }
+    catch (e: any) { setMsg('Error: ' + e.message); }
+  };
   const cm = prof.context_management;
   const setCM = (key: string, field: string, value: any) => { const x = clone(prof); x.context_management[key][field] = value; setProf(x); };
   const save = async () => {
@@ -1135,6 +1142,20 @@ function Techniques({ conv, onChanged }: { conv?: string; onChanged?: () => void
       <p className="muted tiny">{perChat
         ? 'Toggle techniques for this chat only. Saved to this context window; the next turn uses them.'
         : 'Toggle techniques the gateway applies by default to every chat. Changes save to your config and take effect on the next request.'}</p>
+      {!perChat && presets.length > 0 && (
+        <details className="card" style={{ marginBottom: 10 }}>
+          <summary><strong>Presets</strong> <span className="muted tiny">— apply a bundle for a use case (overwrites the toggles below)</span></summary>
+          {presets.map((preset: any) => (
+            <div className="row" key={preset.name} style={{ marginTop: 8 }}>
+              <div>
+                <strong>{preset.name}</strong>
+                <div className="desc muted tiny">{preset.summary}</div>
+              </div>
+              <button className="btn sm" style={{ marginLeft: 'auto' }} onClick={() => applyPreset(preset.name)}>Apply</button>
+            </div>
+          ))}
+        </details>
+      )}
       {TECHS.map((t) => (
         <div className="card tech" key={t.key}>
           <Toggle on={!!cm[t.key].enabled} onChange={(v) => setCM(t.key, 'enabled', v)} />
@@ -1228,35 +1249,6 @@ function Techniques({ conv, onChanged }: { conv?: string; onChanged?: () => void
         <button className="btn sec" onClick={reload}>Revert</button>
         <span className="toast">{msg}</span>
       </div>
-    </div>
-  );
-}
-
-// ── Profiles ───────────────────────────────────────────────────────────
-function Profiles() {
-  const [p, setP] = useState<any>(null);
-  const [msg, setMsg] = useState('');
-  const [n, reload] = useReload();
-  useEffect(() => { rpc('getProfile').then(setP); }, [n]);
-  if (!p) return <Loading />;
-  const apply = async (name: string) => {
-    setMsg('applying ' + name + '…');
-    try { await rpc('setPreset', { name }); setMsg(name + ' applied ✓'); reload(); }
-    catch (e: any) { setMsg('Error: ' + e.message); }
-  };
-  return (
-    <div>
-      <p className="muted tiny">Presets bundle techniques for a use case. Applying one overwrites your technique settings (your <code>visual_method</code> choice is kept).</p>
-      {(p.presets || []).map((preset: any) => (
-        <div className="card" key={preset.name}>
-          <div className="row">
-            <strong>{preset.name}</strong>
-            <button className="btn sm" style={{ marginLeft: 'auto' }} onClick={() => apply(preset.name)}>Apply</button>
-          </div>
-          <div className="desc muted tiny" style={{ marginTop: 4 }}>{preset.summary}</div>
-        </div>
-      ))}
-      <p className="toast">{msg}</p>
     </div>
   );
 }
