@@ -50,10 +50,11 @@ Future.md
 PROJECT.md
 
 # Generated extension docs/plans — kept locally, not pushed
+# (extension/README.md is committed — pyproject.toml's readme field needs it
+# in the checkout for the PyPI sdist/wheel build)
 /EXTENSION_PLAN.md
 /extension/PACKAGING.md
 /extension/PRIVATE_DEPLOY.md
-/extension/README.md
 /extension/TESTING.md
 /extension/adapters/claude-code/README.md
 /extension/adapters/cursor/README.md
