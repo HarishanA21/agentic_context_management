@@ -24,6 +24,8 @@ from uuid import UUID
 
 from langchain_core.callbacks import BaseCallbackHandler
 
+from cancel_registry import ChatCancelled, is_cancelled
+
 ENABLED = os.environ.get("AGENT_HOOKS", "1") not in {"0", "false", "False", ""}
 
 
@@ -180,9 +182,17 @@ class EventStreamer(BaseCallbackHandler):
     tool result being recorded.
     """
 
+    # Required so an exception raised inside our hooks (used to unwind a
+    # cancelled turn) actually propagates instead of being swallowed —
+    # langchain_core's callback manager only re-raises when this is set.
+    raise_error = True
+
     def __init__(self, thread_id: str):
         self._thread_id = thread_id
         self._starts: dict[str, float] = {}
+        # Accumulates the current LLM step's streamed text so a cancelled
+        # turn still has something to persist. Reset at each new LLM call.
+        self.last_partial_text = ""
 
     def _publish(self, payload: dict) -> None:
         # Local import — agent_callbacks.py is imported at backend startup
@@ -249,6 +259,9 @@ class EventStreamer(BaseCallbackHandler):
 
     # llm -----------------------------------------------------------------
     def on_chat_model_start(self, *args: Any, **kwargs: Any) -> None:
+        self.last_partial_text = ""
+        if is_cancelled(self._thread_id):
+            raise ChatCancelled()
         self._publish({"type": "llm_started"})
 
     def on_llm_new_token(
@@ -262,6 +275,9 @@ class EventStreamer(BaseCallbackHandler):
         self._publish(
             {"type": "llm_token", "run_id": str(run_id), "text": token}
         )
+        self.last_partial_text += token
+        if is_cancelled(self._thread_id):
+            raise ChatCancelled()
 
     def on_llm_end(self, *args: Any, **kwargs: Any) -> None:
         self._publish({"type": "llm_finished"})

@@ -84,7 +84,26 @@ function loadSession(): Session | null {
 
 // ── Token refresh ──────────────────────────────────────────────────────────
 
+// Keycloak refresh tokens are single-use (refreshTokenMaxReuse: 0). If two
+// requests race in with the same stale-but-not-yet-expired access token
+// (e.g. Promise.all([authFetch(a), authFetch(b)])), each would otherwise
+// call refreshSession() with the same refresh_token — the second call gets
+// invalid_grant, wipes the session via clearSession(), and every request
+// after that loses its Authorization header and 401s. Cache the in-flight
+// promise so concurrent callers share one refresh instead of racing.
+let _refreshInFlight: Promise<Session | null> | null = null
+
 async function refreshSession(refresh_token: string): Promise<Session | null> {
+  if (_refreshInFlight) return _refreshInFlight
+  _refreshInFlight = _doRefresh(refresh_token)
+  try {
+    return await _refreshInFlight
+  } finally {
+    _refreshInFlight = null
+  }
+}
+
+async function _doRefresh(refresh_token: string): Promise<Session | null> {
   try {
     const res = await fetch(TOKEN_ENDPOINT, {
       method: 'POST',
@@ -95,7 +114,7 @@ async function refreshSession(refresh_token: string): Promise<Session | null> {
         refresh_token,
       }),
     })
-    if (!res.ok) { clearSession(); return null }
+    if (!res.ok) { clearSession(); emit('SIGNED_OUT', null); return null }
     const data = await res.json()
     const payload = JSON.parse(atob(data.access_token.split('.')[1]))
     const session = saveSession(data.access_token, data.refresh_token ?? refresh_token, data.expires_in, payload.sub, payload.email)
@@ -103,6 +122,7 @@ async function refreshSession(refresh_token: string): Promise<Session | null> {
     return session
   } catch {
     clearSession()
+    emit('SIGNED_OUT', null)
     return null
   }
 }

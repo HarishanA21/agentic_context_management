@@ -25,6 +25,33 @@ from typing import Any, Dict, List, Optional, Tuple
 from langchain_core.tools import BaseTool
 
 
+def _unwrap_exc(e: BaseException) -> BaseException:
+    """anyio TaskGroups (stdio/HTTP session setup uses them under the hood)
+    wrap the real connection error in an ExceptionGroup — surfacing it as-is
+    just shows "unhandled errors in a TaskGroup (1 sub-exception)" instead of
+    e.g. "the server process exited immediately". Walk down to the first
+    non-group leaf so callers get a readable message.
+
+    ExceptionGroup is a real builtin name on Python 3.11+ — referenced
+    directly (not via `getattr(__builtins__, ...)`, which is unreliable:
+    __builtins__ is the builtins *module* in __main__ but its __dict__ in
+    every other imported module, so that lookup silently returns None here).
+    """
+    try:
+        eg_type: type = ExceptionGroup  # noqa: F821 - builtin on 3.11+
+    except NameError:
+        return e
+    seen = set()
+    current: BaseException = e
+    while isinstance(current, eg_type) and id(current) not in seen:
+        seen.add(id(current))
+        children = getattr(current, "exceptions", None) or ()
+        if not children:
+            break
+        current = children[0]
+    return current
+
+
 # ── Secret encryption ──────────────────────────────────────────────────
 
 
@@ -213,7 +240,8 @@ async def discover_tools_for_row(
             None,
         )
     except Exception as e:
-        return [], f"{type(e).__name__}: {str(e)[:240]}"
+        inner = _unwrap_exc(e)
+        return [], f"{type(inner).__name__}: {str(inner)[:240]}"
 
 
 async def collect_tools_for_user(
@@ -228,9 +256,10 @@ async def collect_tools_for_user(
             tools = await list_tools_for_row(row)
             out.extend(tools)
         except Exception as e:
+            inner = _unwrap_exc(e)
             print(
                 f"[mcp] tool discovery failed for {row.get('name')!r}: "
-                f"{type(e).__name__}: {e}",
+                f"{type(inner).__name__}: {inner}",
                 flush=True,
             )
     return out

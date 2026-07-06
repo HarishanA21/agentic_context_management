@@ -78,15 +78,16 @@ def run_shell(
     # tool call from this point on returns this marker so the agent loop
     # unwinds cleanly. The thread_id is stable across all tool invocations
     # in one chat turn.
-    thread_id = ((config or {}).get("configurable", {}) or {}).get("thread_id")
+    thread_id = ((config or {}).get("configurable", {}) or {}).get("ui_thread_id")
     if thread_id and is_cancelled(str(thread_id)):
         return "Cancelled by user."
 
     ref = get_workspace_ref(config)
     if not ref:
         return (
-            "Error: this chat does not have a sandboxed workspace attached. "
-            "Open or switch to a project session to enable shell access."
+            "Error: no sandboxed workspace is attached to this session yet. "
+            "It may still be provisioning, or provisioning failed — try again "
+            "in a moment."
         )
 
     timeout = max(1, min(int(timeout or 60), 600))
