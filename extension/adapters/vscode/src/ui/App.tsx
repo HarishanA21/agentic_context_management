@@ -948,11 +948,13 @@ function ConvTurnGroup({ turn, conv, onAct }: { turn: ChatTurn; conv: string; on
 // The full transcript for one chat, in the exact order it happened. Fetches the
 // complete message text up front (full=1) so every message renders in place;
 // Remove tombstones it on the gateway so it's stripped from every future turn.
-// Defaults to the grouped (per-turn) view; flip to Raw for the flat list.
+// Defaults to the grouped (per-turn) view; flip to Raw for the flat list or
+// Graph for the per-request context timeline.
 export function Conversation({ conv }: { conv: string }) {
   const [msgs, setMsgs] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
-  const [grouped, setGrouped] = useState(true);
+  const [view, setView] = useState<'grouped' | 'raw' | 'graph'>('grouped');
+  const grouped = view === 'grouped';
   const [n, reload] = useReload();
 
   const load = useCallback(() => {
@@ -983,27 +985,36 @@ export function Conversation({ conv }: { conv: string }) {
           {msgs.length} message{msgs.length === 1 ? '' : 's'} · {kept} in context · {msgs.length - kept} removed
         </span>
         <div className="row" style={{ gap: 4 }}>
-          <button className={'btn sm ' + (grouped ? 'ghost' : '')} onClick={() => setGrouped(false)}>Raw</button>
-          <button className={'btn sm ' + (grouped ? '' : 'ghost')} onClick={() => setGrouped(true)}>Grouped</button>
+          <button className={'btn sm ' + (view === 'grouped' ? '' : 'ghost')} onClick={() => setView('grouped')}>Grouped</button>
+          <button className={'btn sm ' + (view === 'raw' ? '' : 'ghost')} onClick={() => setView('raw')}>Raw</button>
+          <button className={'btn sm ' + (view === 'graph' ? '' : 'ghost')} onClick={() => setView('graph')}>Graph</button>
           <button className="btn ghost sm" onClick={reload}>Refresh</button>
         </div>
       </div>
-      <p className="muted tiny" style={{ marginTop: 4 }}>
-        The whole conversation in order. Remove drops a message from the model on every future
-        turn — it stays visible here (struck through) so you can restore it.
-      </p>
-      <div className="card">
-        {grouped
-          ? groupTurns(msgs).map((t, i) => (
-              <ConvTurnGroup key={t.user?.fp ?? 'turn-' + i} turn={t} conv={conv} onAct={act} />
-            ))
-          : msgs.map((m, i) => <ConvMsg key={m.fp ?? i} m={m} conv={conv} onAct={act} />)}
-      </div>
+      {view === 'graph' ? (
+        <div style={{ marginTop: 8 }}>
+          <CwGraph conv={conv} />
+        </div>
+      ) : (
+        <>
+          <p className="muted tiny" style={{ marginTop: 4 }}>
+            The whole conversation in order. Remove drops a message from the model on every future
+            turn — it stays visible here (struck through) so you can restore it.
+          </p>
+          <div className="card">
+            {grouped
+              ? groupTurns(msgs).map((t, i) => (
+                  <ConvTurnGroup key={t.user?.fp ?? 'turn-' + i} turn={t} conv={conv} onAct={act} />
+                ))
+              : msgs.map((m, i) => <ConvMsg key={m.fp ?? i} m={m} conv={conv} onAct={act} />)}
+          </div>
+        </>
+      )}
     </div>
   );
 }
 
-// ── Chat detail (two columns: context window | per-chat settings) ──────
+// ── Chat detail (two columns: conversation | per-chat settings) ──────
 export function ChatDetail({ conv }: { conv: string }) {
   const [theme] = useState<Theme>(() => (getState().theme as Theme) || 'auto');
   const [win, setWin] = useState<any>(null);
@@ -1038,12 +1049,14 @@ export function ChatDetail({ conv }: { conv: string }) {
         </div>
       </header>
       <main className="body">
-        <div className="one-col">
+        <div className="two-col">
           <section className="col">
             <h3 className="sec">Conversation <span className="muted tiny">— every message, in order · remove any</span></h3>
             <UndoBar conv={conv} />
             <Conversation conv={conv} />
-            <h3 className="sec" style={{ marginTop: 16 }}>Settings <span className="muted tiny">— this chat only</span></h3>
+          </section>
+          <section className="col side">
+            <h3 className="sec">Settings <span className="muted tiny">— this chat only</span></h3>
             <div className="card">
               <div className="row" style={{ alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                 <strong className="tiny">Profile</strong>

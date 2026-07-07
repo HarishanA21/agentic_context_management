@@ -201,10 +201,12 @@ input[type='text'] { min-width: 150px; }
 .cw-md img { max-width: 140px; height: auto; border-radius: 4px; }
 .cw-md table { border-collapse: collapse; } .cw-md td, .cw-md th { border: 1px solid var(--border); padding: 2px 6px; }
 
-/* Two-column chat detail (context window | per-chat settings) */
+/* Two-column chat detail (conversation | per-chat settings) */
 .two-col { display: flex; gap: 18px; align-items: flex-start; }
 .two-col > .col { flex: 1 1 0; min-width: 0; }
-@media (max-width: 880px) { .two-col { flex-direction: column; } }
+/* The settings column stays a fixed-ish rail so the conversation gets the room. */
+.two-col > .col.side { flex: 0 1 380px; min-width: 300px; }
+@media (max-width: 880px) { .two-col { flex-direction: column; } .two-col > .col.side { flex: 1 1 auto; min-width: 0; width: 100%; } }
 
 /* Single-column chat detail: the conversation (in proper format) plus settings,
    rendered once — no duplicate context-window panel. Kept readable on wide

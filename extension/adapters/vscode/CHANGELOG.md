@@ -2,6 +2,19 @@
 
 All notable changes to the Context Management — ACM VSCode extension.
 
+## [0.2.7] - 2026-07-07
+
+### Changed
+- Chat detail is two columns again: the conversation on the left, settings,
+  techniques, and cleanup in a right side rail.
+- Grouped view is the default. Switch to Raw for the flat list.
+
+### Added
+- Graph view is back in the chat detail. A third tab next to Grouped and Raw
+  shows the per request context timeline.
+- Remove and Restore now push a live update event, so every open ACM view
+  refreshes right away when a message is dropped or brought back.
+
 ## [0.2.6] - 2026-07-07
 
 ### Changed

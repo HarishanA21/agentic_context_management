@@ -1011,6 +1011,7 @@ async def drop_message(request: Request) -> Any:
         return JSONResponse({"error": "no conversation known yet"}, status_code=400)
     if _DROP.drop(conv, fp):
         _DROP.push_undo(conv, "drop", "remove 1 message", {"fps": [fp]})
+        events.publish({"type": "window", "conv": conv, "action": "drop"})
     return JSONResponse({"ok": True, "conversation": conv, "dropped": _DROP.dropped(conv)})
 
 
@@ -1027,6 +1028,7 @@ async def restore_message(request: Request) -> Any:
     ok = _DROP.restore(conv, fp)
     if ok:
         _DROP.push_undo(conv, "restore", "restore 1 message", {"fp": fp})
+        events.publish({"type": "window", "conv": conv, "action": "restore"})
     return JSONResponse({"ok": ok, "conversation": conv, "dropped": _DROP.dropped(conv)})
 
 
@@ -1044,6 +1046,7 @@ async def drop_many(request: Request) -> Any:
     newly = [str(fp) for fp in fps if _DROP.drop(conv, str(fp))]
     if newly:
         _DROP.push_undo(conv, "drop_many", f"remove {len(newly)} messages", {"fps": newly})
+        events.publish({"type": "window", "conv": conv, "action": "drop"})
     return JSONResponse(
         {"ok": True, "conversation": conv, "dropped": _DROP.dropped(conv)}
     )
