@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { rpc, getState, setState, openChat, projectRoot, chatConv, useAcmEvents } from './bridge';
 import type { AcmEvent } from './bridge';
@@ -26,10 +26,40 @@ function shortId(conv: string): string {
 function rel(ts: number): string {
   if (!ts) return '';
   const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
-  if (s < 60) return s + 's ago';
-  if (s < 3600) return Math.floor(s / 60) + 'm ago';
-  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
-  return Math.floor(s / 86400) + 'd ago';
+  if (s < 45) return 'just now';
+  if (s < 90) return 'a minute ago';
+  if (s < 3600) return Math.floor(s / 60) + ' min ago';
+  if (s < 5400) return 'an hour ago';
+  if (s < 86400) return Math.floor(s / 3600) + ' hours ago';
+  if (s < 172800) return 'yesterday';
+  return Math.floor(s / 86400) + ' days ago';
+}
+
+// A chat is "active" if it saw traffic recently — the same idea as Claude Code
+// dimming an idle session. Under this window it's live; past it, dormant.
+const ACTIVE_WINDOW_S = 15 * 60;
+
+// Three-state health for a chat's status dot:
+//   'running'  — a turn is generating upstream right now  → green, blinking
+//   'active'   — used within ACTIVE_WINDOW_S, but idle now → yellow
+//   'idle'     — dormant                                   → red, steady
+function chatState(c: any, running: boolean): 'running' | 'active' | 'idle' {
+  if (running) return 'running';
+  const last = Number(c.last_seen || 0);
+  if (last && Date.now() / 1000 - last < ACTIVE_WINDOW_S) return 'active';
+  return 'idle';
+}
+
+// A stable, distinct accent per session so different chats read apart at a
+// glance. We hash the conversation id to a hue on the colour wheel — same id →
+// same colour every render, no palette to run out of.
+function sessionHue(conv: string): number {
+  let h = 0;
+  for (let i = 0; i < conv.length; i++) h = (h * 31 + conv.charCodeAt(i)) >>> 0;
+  return h % 360;
+}
+function sessionColor(conv: string): string {
+  return `hsl(${sessionHue(conv)} 65% 55%)`;
 }
 // Claude Code injects its system prompt, <system-reminder> blocks, agent-type
 // lists and claudeMd as *user*-role messages. Tag those as "Context" so they're
@@ -46,6 +76,74 @@ function classify(m: any): { cls: string; label: string; context: boolean } {
       : { cls: 'user', label: 'User', context: false };
   }
   return { cls: 'system', label: 'System', context: true };
+}
+
+// Claude Code packs a lot into a single user-role message: your actual prompt
+// plus injected context (system reminders, slash-command echoes, the agent-type
+// and skills listings, claudeMd, hook notes). On the Anthropic wire there's no
+// "context" role, so it all arrives as one HumanMessage. We can't split it on
+// the wire (removal is per whole message), but we CAN split it for display so
+// your real prompt stands apart from the noise.
+type CtxPart = { kind: 'prompt' | 'context'; label: string; text: string };
+
+// Well-delimited XML-ish blocks Claude Code injects. One regex, backreference
+// closes the matching tag, so each block is captured individually and in order.
+const CTX_TAG_RE =
+  /<(system-reminder|command-name|command-message|command-args|command-contents|local-command-stdout|local-command-stderr|local-command-caveat)>[\s\S]*?<\/\1>/g;
+function tagLabel(tag: string): string {
+  if (tag === 'system-reminder') return 'System reminder';
+  if (tag.startsWith('command')) return 'Slash command';
+  if (tag === 'local-command-stdout' || tag === 'local-command-stderr') return 'Command output';
+  if (tag === 'local-command-caveat') return 'Caveat';
+  return 'Context';
+}
+// Plain-text (untagged) blocks are recognised by their leading header line.
+const PROSE_CTX: { re: RegExp; label: string }[] = [
+  { re: /^available agent types/i, label: 'Agent types' },
+  { re: /^when (?:using|you launch) the agent tool/i, label: 'Agent types' },
+  { re: /^the following skills are available/i, label: 'Skills' },
+  { re: /^#\s*claudemd/i, label: 'Project instructions' },
+  { re: /^codebase and user instructions/i, label: 'Project instructions' },
+  { re: /^contents of .+memory/i, label: 'Memory notes' },
+  { re: /^userpromptsubmit hook/i, label: 'Hook context' },
+  { re: /^you are claude code/i, label: 'System context' },
+  { re: /^caveat:/i, label: 'Caveat' },
+];
+
+// Break one user-role message's text into ordered, labeled parts. Whatever
+// isn't a recognised context block is treated as your actual prompt.
+function splitUserParts(text: string): CtxPart[] {
+  const parts: CtxPart[] = [];
+  const push = (kind: CtxPart['kind'], label: string, t: string) => {
+    const s = t.trim();
+    if (s) parts.push({ kind, label, text: s });
+  };
+  const emitGap = (gap: string) => {
+    for (const chunk of gap.split(/\n{2,}/)) {
+      const s = chunk.trim();
+      if (!s) continue;
+      const hit = PROSE_CTX.find((p) => p.re.test(s));
+      if (hit) push('context', hit.label, s);
+      else push('prompt', 'Your message', s);
+    }
+  };
+  let last = 0;
+  let m: RegExpExecArray | null;
+  CTX_TAG_RE.lastIndex = 0;
+  while ((m = CTX_TAG_RE.exec(text))) {
+    emitGap(text.slice(last, m.index));
+    push('context', tagLabel(m[1]), m[0]);
+    last = m.index + m[0].length;
+  }
+  emitGap(text.slice(last));
+  // Collapse runs of the same label into one part so the view isn't fragmented.
+  const merged: CtxPart[] = [];
+  for (const p of parts) {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.kind === p.kind && prev.label === p.label) prev.text += '\n\n' + p.text;
+    else merged.push({ ...p });
+  }
+  return merged;
 }
 
 const TABS = ['Overview', 'Savings', 'Chats', 'Techniques', 'Providers', 'Memory', 'Training'];
@@ -455,17 +553,33 @@ function Chats() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [n, reload] = useReload();
+  // Live "generating now" set, kept off the poll path so the green dot flips the
+  // instant the gateway announces it — seeded from each window's `running` flag
+  // (covers a chat already mid-turn when this view mounts).
+  const [running, setRunning] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     rpc('contextWindows', { project: projectRoot }).then((d: any) => {
-      setWins(d.windows || []);
+      const w = d.windows || [];
+      setWins(w);
+      setRunning((prev) => {
+        const next = { ...prev };
+        for (const c of w) if (c.running) next[c.id] = true;
+        return next;
+      });
       setLoading(false);
     }).catch(() => setLoading(false));
   }, [n]);
 
-  // Realtime: any turn or window change refreshes the chats list (live titles,
-  // token counts, and newly-created chats appear without a manual refresh).
-  useAcmEvents(useCallback(() => reload(), [reload]));
+  // Realtime: a `running` event flips one chat's dot without a reload; any other
+  // turn/window change refreshes the list (live titles, token counts, new chats).
+  useAcmEvents(useCallback((e: AcmEvent) => {
+    if (e.type === 'running' && e.conv) {
+      setRunning((prev) => ({ ...prev, [e.conv as string]: !!e.running }));
+      return;
+    }
+    reload();
+  }, [reload]));
 
   const del = async (e: any, id: string) => {
     e.stopPropagation();
@@ -512,13 +626,28 @@ function Chats() {
       <p className="muted tiny">Each chat is its own context window with its own techniques. Open one to
         see exactly what's sent to the model and tune that chat's settings.</p>
       <div className="conv-list">
-        {wins.map((c) => (
-          <div key={c.id} className="conv" onClick={() => openChat(c.id)} title="Open chat detail">
+        {wins.map((c) => {
+          const st = chatState(c, !!running[c.id]);
+          const dotTitle = st === 'running'
+            ? 'Active — generating a response now'
+            : st === 'active'
+            ? 'Active — used recently, idle now'
+            : 'Idle — no recent activity';
+          return (
+          <div
+            key={c.id}
+            className="conv"
+            onClick={() => openChat(c.id)}
+            title="Open chat detail"
+            // Per-session accent: a tinted left rail so different sessions read apart.
+            style={{ borderLeft: `3px solid ${sessionColor(c.id)}` }}
+          >
+            <span className={`sdot ${st}`} title={dotTitle} aria-label={dotTitle} />
             <span className="id" style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
               <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {c.title || 'Untitled chat'}
               </span>
-              <span className="muted tiny" style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)' }} title={c.id}>{shortId(c.id)}</span>
+              <span className="muted tiny" style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)', color: sessionColor(c.id) }} title={c.id}>{shortId(c.id)}</span>
             </span>
             <span className="meta">
               <span className="badge" title="Active technique profile for this chat">{profileLabel(c)}</span>
@@ -532,7 +661,8 @@ function Chats() {
               </div>
             </span>
           </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -642,6 +772,237 @@ function Preview({ conv }: { conv: string }) {
   );
 }
 
+// ── Conversation (the whole chat in real order, each message removable) ──
+// One message block: a clear role header, the full text, and a Remove/Restore
+// button. Long messages fold to the first lines but are NEVER merged with any
+// other message — the point of this view is that each message stands alone so
+// the user can read it and pull it out of the model's context.
+// One collapsible chunk of text with its own sub-label — used to render the
+// individual parts a user turn splits into (your prompt vs. injected context).
+// How much of a message to show before collapsing. Messages default to this
+// short preview with a "Show full message" toggle; the button flips back to
+// "Show less". Kept small so the conversation reads as a scannable list.
+const PREVIEW_CHARS = 280;
+
+function ConvPart({ part }: { part: CtxPart }) {
+  const long = part.text.length > PREVIEW_CHARS;
+  // Default to the short preview ("show less") — expand on demand.
+  const [open, setOpen] = useState(false);
+  const shown = open ? part.text : part.text.slice(0, PREVIEW_CHARS);
+  const isPrompt = part.kind === 'prompt';
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div className="row" style={{ gap: 6, alignItems: 'center', marginBottom: 2 }}>
+        <span className={'badge ' + (isPrompt ? 'user' : 'context')}>{part.label}</span>
+        {!isPrompt && <span className="muted tiny">injected context</span>}
+      </div>
+      <div className="text" style={{ opacity: isPrompt ? 1 : 0.75 }}>
+        {shown || <span className="muted">(empty)</span>}{!open && long ? '…' : ''}
+      </div>
+      {long && (
+        <button className="btn ghost sm" style={{ marginTop: 2 }} onClick={() => setOpen((v) => !v)}>
+          {open ? 'Show less' : 'Show full'}
+        </button>
+      )}
+    </div>
+  );
+}
+
+// Inline image render for a message that carries image block(s) — a tool
+// screenshot or a visual-method rasterised page. Lazy-fetches the data URLs
+// (they're big, so we never load them until the message is on screen) and shows
+// them stacked under the message text, like an image message in a chat client.
+function ConvImages({ m, conv }: { m: any; conv: string }) {
+  const [imgs, setImgs] = useState<string[] | null>(null);
+  const [err, setErr] = useState('');
+  useEffect(() => {
+    let alive = true;
+    rpc('messageImages', { fp: m.fp, conv })
+      .then((d: any) => { if (alive) { setImgs(d.images || []); if (d.error) setErr(d.error); } })
+      .catch((e: any) => { if (alive) setErr(e.message || 'failed'); });
+    return () => { alive = false; };
+  }, [m.fp, conv]);
+
+  if (err) return <div className="muted tiny" style={{ marginTop: 6 }}>Couldn't load image: {err}</div>;
+  if (imgs === null) return <div className="muted tiny" style={{ marginTop: 6 }}><span className="spin" /> loading image…</div>;
+  if (imgs.length === 0) return null;
+  return (
+    <div className="conv-imgs">
+      {imgs.map((src, i) => (
+        <img key={i} src={src} alt={`message image ${i + 1}`} loading="lazy" />
+      ))}
+    </div>
+  );
+}
+
+function ConvMsg({ m, conv, onAct }: { m: any; conv: string; onAct: (method: string, fp: string) => void }) {
+  const r = classify(m);
+  const text = String(m.text ?? m.preview ?? '');
+
+  // User-role turns can bundle your prompt with injected context — split them so
+  // each part is labeled. Assistant/tool/system render as a single block.
+  const parts = r.cls === 'user' || r.cls === 'context' ? splitUserParts(text) : null;
+  const hasPrompt = !!parts && parts.some((p) => p.kind === 'prompt');
+  const hasContext = !!parts && parts.some((p) => p.kind === 'context');
+
+  const HEADER: Record<string, string> = {
+    assistant: 'Assistant message',
+    tool: 'Tool result',
+    system: 'System message',
+  };
+  // Header reflects what the message actually contains once split.
+  const header = parts
+    ? hasPrompt && hasContext
+      ? 'User message + context'
+      : hasPrompt
+        ? 'User message'
+        : 'Injected context'
+    : HEADER[r.cls] || r.label;
+  // A message that's pure injected context reads as context (brown rail).
+  const cls = parts && !hasPrompt && hasContext ? 'context' : r.cls;
+
+  const long = !parts && text.length > PREVIEW_CHARS;
+  // Collapsed by default: show a short preview with a "Show full message" toggle.
+  const [open, setOpen] = useState(false);
+  const shown = open ? text : text.slice(0, PREVIEW_CHARS);
+
+  return (
+    <div className={'msg ' + cls + (m.dropped ? ' dropped' : '')}>
+      <div className="rail" />
+      <div className="content">
+        <div className="head">
+          <span className={'badge ' + cls}>{header}</span>
+          {typeof m.tokens === 'number' && m.tokens > 0 && (
+            <span className="muted tiny">≈{fmtTok(m.tokens)} tok</span>
+          )}
+          {m.dropped && <span className="muted tiny" style={{ color: 'var(--bad, #e06c6c)' }}>removed</span>}
+          <span className="act">
+            {m.dropped
+              ? <button className="btn ghost sm" onClick={() => onAct('restoreMessage', m.fp)}>Restore</button>
+              : <button className="btn sm" onClick={() => { if (confirmDrop()) onAct('dropMessage', m.fp); }}>Remove</button>}
+          </span>
+        </div>
+        {parts ? (
+          <>
+            {parts.map((p, i) => <ConvPart key={i} part={p} />)}
+            {hasContext && (
+              <p className="muted tiny" style={{ marginTop: 6 }}>
+                Removing takes out the whole message (prompt + context together) — that's how Claude Code sends it.
+              </p>
+            )}
+          </>
+        ) : (
+          <>
+            <div className="text">{shown || <span className="muted">(empty)</span>}{!open && long ? '…' : ''}</div>
+            {long && (
+              <button className="btn ghost sm" style={{ marginTop: 4 }} onClick={() => setOpen((v) => !v)}>
+                {open ? 'Show less' : 'Show full message'}
+              </button>
+            )}
+          </>
+        )}
+        {m.has_image && <ConvImages m={m} conv={conv} />}
+      </div>
+    </div>
+  );
+}
+
+// A collapsible turn for the full-text Conversation view: the user prompt (or a
+// "context / system" summary) sits at the top with the turn's token total;
+// expand to read and remove the individual messages, each rendered with the
+// same split-aware ConvMsg block used in the flat view.
+function ConvTurnGroup({ turn, conv, onAct }: { turn: ChatTurn; conv: string; onAct: (m: string, fp: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const total =
+    (turn.user ? (turn.user.tokens || 0) : 0) +
+    turn.children.reduce((a, m) => a + (m.tokens || 0), 0);
+  const count = turn.children.length + (turn.user ? 1 : 0);
+  const isContextGroup = !turn.user;
+  const badgeCls = isContextGroup ? 'context' : 'user';
+  const badgeLabel = isContextGroup ? 'Context' : 'User';
+  // Prefer the real prompt (first prompt part) so injected context never masks
+  // what you actually typed; fall back to the raw text/preview.
+  const headerText = turn.user
+    ? (splitUserParts(String(turn.user.text ?? turn.user.preview ?? '')).find((p) => p.kind === 'prompt')?.text
+        || String(turn.user.text ?? turn.user.preview ?? '(empty)'))
+    : `${turn.children.length} context / system message${turn.children.length === 1 ? '' : 's'}`;
+  return (
+    <div className="turn" style={{ borderBottom: '1px solid var(--vscode-panel-border)', paddingBottom: 6, marginBottom: 6 }}>
+      <div className="row" onClick={() => setOpen((v) => !v)} style={{ cursor: 'pointer', gap: 6 }}>
+        <span className="muted">{open ? '▾' : '▸'}</span>
+        <span className={'badge ' + badgeCls}>{badgeLabel}</span>
+        <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, fontSize: 13 }}>{headerText}</span>
+        <span className="muted tiny" style={{ whiteSpace: 'nowrap' }}>{count} msg</span>
+        <span className="muted tiny" style={{ whiteSpace: 'nowrap' }}>≈{fmtTok(total)} tok</span>
+      </div>
+      {open && (
+        <div style={{ marginTop: 6 }}>
+          {turn.user && <ConvMsg m={turn.user} conv={conv} onAct={onAct} />}
+          {turn.children.map((m, i) => <ConvMsg key={m.fp ?? i} m={m} conv={conv} onAct={onAct} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The full transcript for one chat, in the exact order it happened. Fetches the
+// complete message text up front (full=1) so every message renders in place;
+// Remove tombstones it on the gateway so it's stripped from every future turn.
+// Defaults to the grouped (per-turn) view; flip to Raw for the flat list.
+export function Conversation({ conv }: { conv: string }) {
+  const [msgs, setMsgs] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [grouped, setGrouped] = useState(true);
+  const [n, reload] = useReload();
+
+  const load = useCallback(() => {
+    rpc('messages', { conv, full: true })
+      .then((d: any) => { setMsgs(d.messages || []); })
+      .catch(() => setMsgs([]))
+      .finally(() => setLoading(false));
+  }, [conv]);
+  useEffect(() => { setLoading(true); load(); }, [load, n]);
+  useAcmEvents(useCallback((e: AcmEvent) => { if (!e.conv || e.conv === conv) reload(); }, [conv, reload]));
+
+  const act = (method: string, fp: string) => rpc(method, { fp, conv }).then(reload);
+
+  if (loading) return <p className="muted tiny">Loading conversation…</p>;
+  if (msgs.length === 0) {
+    return (
+      <div className="empty">
+        <p>No messages recorded for this chat yet.</p>
+        <p className="tiny">Send a message through the gateway and the full conversation will appear here.</p>
+      </div>
+    );
+  }
+  const kept = msgs.filter((m) => !m.dropped).length;
+  return (
+    <div>
+      <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+        <span className="muted tiny">
+          {msgs.length} message{msgs.length === 1 ? '' : 's'} · {kept} in context · {msgs.length - kept} removed
+        </span>
+        <div className="row" style={{ gap: 4 }}>
+          <button className={'btn sm ' + (grouped ? 'ghost' : '')} onClick={() => setGrouped(false)}>Raw</button>
+          <button className={'btn sm ' + (grouped ? '' : 'ghost')} onClick={() => setGrouped(true)}>Grouped</button>
+          <button className="btn ghost sm" onClick={reload}>Refresh</button>
+        </div>
+      </div>
+      <p className="muted tiny" style={{ marginTop: 4 }}>
+        The whole conversation in order. Remove drops a message from the model on every future
+        turn — it stays visible here (struck through) so you can restore it.
+      </p>
+      <div className="card">
+        {grouped
+          ? groupTurns(msgs).map((t, i) => (
+              <ConvTurnGroup key={t.user?.fp ?? 'turn-' + i} turn={t} conv={conv} onAct={act} />
+            ))
+          : msgs.map((m, i) => <ConvMsg key={m.fp ?? i} m={m} conv={conv} onAct={act} />)}
+      </div>
+    </div>
+  );
+}
+
 // ── Chat detail (two columns: context window | per-chat settings) ──────
 export function ChatDetail({ conv }: { conv: string }) {
   const [theme] = useState<Theme>(() => (getState().theme as Theme) || 'auto');
@@ -677,16 +1038,12 @@ export function ChatDetail({ conv }: { conv: string }) {
         </div>
       </header>
       <main className="body">
-        <div className="two-col">
+        <div className="one-col">
           <section className="col">
-            <h3 className="sec">Context window <span className="muted tiny">— what's sent to the model</span></h3>
+            <h3 className="sec">Conversation <span className="muted tiny">— every message, in order · remove any</span></h3>
             <UndoBar conv={conv} />
-            <ContextWindow conv={conv} />
-            <h3 className="sec" style={{ marginTop: 16 }}>Next request preview <span className="muted tiny">— dry run, nothing sent</span></h3>
-            <Preview conv={conv} />
-          </section>
-          <section className="col">
-            <h3 className="sec">Settings <span className="muted tiny">— this chat only</span></h3>
+            <Conversation conv={conv} />
+            <h3 className="sec" style={{ marginTop: 16 }}>Settings <span className="muted tiny">— this chat only</span></h3>
             <div className="card">
               <div className="row" style={{ alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                 <strong className="tiny">Profile</strong>
@@ -733,100 +1090,6 @@ function confirmDrop(): boolean {
   return ok;
 }
 
-// One transcript row: role badge, preview, remove/restore, and — for tool
-// results — a "View image" toggle that shows the visual-method page render.
-function MsgRow({ m, conv, onAct }: { m: any; conv: string; onAct: (method: string, fp: string) => void }) {
-  const r = classify(m);
-  const [imgs, setImgs] = useState<string[] | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState('');
-  const [full, setFull] = useState<string | null>(null); // expanded full text
-  const [fullBusy, setFullBusy] = useState(false);
-  const isTool = String(m.role || '').toLowerCase() === 'tool';
-  const truncated = String(m.preview || '').endsWith('…');
-
-  const viewImages = async () => {
-    if (imgs) { setImgs(null); return; } // toggle closed
-    setBusy(true); setErr('');
-    try {
-      const d: any = await rpc('messageImages', { fp: m.fp, conv });
-      if (d?.error) setErr(d.error);
-      const list = d.images || [];
-      setImgs(list);
-      if (list.length === 0 && !d?.error) setErr('output too small to rasterise');
-    } catch (e: any) {
-      setErr(e.message || 'failed');
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const toggleFull = async () => {
-    if (full !== null) { setFull(null); return; } // collapse
-    setFullBusy(true);
-    try {
-      const d: any = await rpc('messageText', { fp: m.fp, conv });
-      setFull(d?.text || m.preview || '');
-    } catch {
-      setFull(m.preview || '');
-    } finally {
-      setFullBusy(false);
-    }
-  };
-
-  return (
-    <div className={'msg ' + r.cls + (m.dropped ? ' dropped' : '')}>
-      <div className="rail" />
-      <div className="content">
-        <div className="head">
-          <span className={'badge ' + r.cls}>{r.label}</span>
-          <span className="muted tiny"><code>{m.fp}</code></span>
-          {m.dropped && <span className="muted tiny" style={{ color: 'var(--bad, #e06c6c)' }}>removed</span>}
-          <span className="act">
-            {isTool && (
-              <button className="btn ghost sm" onClick={viewImages}>
-                {busy ? '…' : imgs ? 'Hide' : '🖼 View'}
-              </button>
-            )}
-            {m.dropped
-              ? <button className="btn ghost sm" onClick={() => onAct('restoreMessage', m.fp)}>Restore</button>
-              : <button className="btn ghost sm" onClick={() => { if (confirmDrop()) onAct('dropMessage', m.fp); }}>Remove</button>}
-          </span>
-        </div>
-        {/* click to expand the full message (rows only store a short preview) */}
-        <div
-          className="text"
-          style={{ cursor: 'pointer', whiteSpace: full !== null ? 'pre-wrap' : 'normal' }}
-          title={full !== null ? 'Click to collapse' : 'Click to expand full message'}
-          onClick={toggleFull}
-        >
-          {fullBusy
-            ? <span className="muted">loading…</span>
-            : full !== null
-              ? full
-              : (m.preview || <span className="muted">(empty)</span>)}
-        </div>
-        {truncated && (
-          <button className="btn ghost sm" style={{ marginTop: 4 }} onClick={toggleFull}>
-            {fullBusy ? '…' : full !== null ? 'Show less' : 'Show full message'}
-          </button>
-        )}
-        {err && <div className="muted tiny" style={{ marginTop: 4 }}>{err}</div>}
-        {imgs && imgs.length > 0 && (
-          <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {imgs.map((src, i) => (
-              <div key={i} style={{ border: '1px solid var(--vscode-panel-border)', borderRadius: 4, overflow: 'hidden', background: '#fff' }}>
-                <div className="muted tiny" style={{ padding: '2px 6px' }}>page {i + 1}/{imgs.length}</div>
-                <img src={src} alt={'page ' + (i + 1)} style={{ width: '100%', display: 'block' }} />
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 function fmtTok(n: number): string {
   return n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K' : String(n);
 }
@@ -854,38 +1117,6 @@ function groupTurns(msgs: any[]): ChatTurn[] {
   return groups;
 }
 
-// A collapsible turn: user prompt + token total at the top; expand to inspect
-// and remove the assistant/tool messages it produced.
-function TurnGroup({ turn, conv, onAct }: { turn: ChatTurn; conv: string; onAct: (m: string, fp: string) => void }) {
-  const [open, setOpen] = useState(false);
-  const total =
-    (turn.user ? (turn.user.tokens || 0) : 0) +
-    turn.children.reduce((a, m) => a + (m.tokens || 0), 0);
-  const isContextGroup = !turn.user;
-  const badgeCls = isContextGroup ? 'context' : 'user';
-  const badgeLabel = isContextGroup ? 'Context' : 'User';
-  const preview = isContextGroup
-    ? `${turn.children.length} context / system message${turn.children.length === 1 ? '' : 's'}`
-    : turn.user.preview || '(empty)';
-  return (
-    <div className="turn" style={{ borderBottom: '1px solid var(--vscode-panel-border)', paddingBottom: 6, marginBottom: 6 }}>
-      <div className="row" onClick={() => setOpen((v) => !v)} style={{ cursor: 'pointer', gap: 6 }}>
-        <span className="muted">{open ? '▾' : '▸'}</span>
-        <span className={'badge ' + badgeCls}>{badgeLabel}</span>
-        <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, fontSize: 13 }}>{preview}</span>
-        <span className="muted tiny" style={{ whiteSpace: 'nowrap' }}>{turn.children.length} msg</span>
-        <span className="muted tiny" style={{ whiteSpace: 'nowrap' }}>≈{fmtTok(total)} tok</span>
-      </div>
-      {open && (
-        <div style={{ marginTop: 6 }}>
-          {turn.user && <MsgRow m={turn.user} conv={conv} onAct={onAct} />}
-          {turn.children.map((m) => <MsgRow key={m.fp} m={m} conv={conv} onAct={onAct} />)}
-        </div>
-      )}
-    </div>
-  );
-}
-
 // ── Cleanup (task-aware relevance suggestions) ─────────────────────────
 function Cleanup({ conv: fixedConv }: { conv?: string } = {}) {
   const [convs, setConvs] = useState<any[]>([]);
@@ -894,10 +1125,6 @@ function Cleanup({ conv: fixedConv }: { conv?: string } = {}) {
   const [info, setInfo] = useState<any>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
-  // Per-chat (fixedConv) also shows the message-level drop transcript.
-  const [msgs, setMsgs] = useState<any[]>([]);
-  const [raw, setRaw] = useState(true);
-  const [mn, mreload] = useReload();
 
   useEffect(() => {
     if (fixedConv) { setSel(fixedConv); return; }
@@ -907,13 +1134,6 @@ function Cleanup({ conv: fixedConv }: { conv?: string } = {}) {
       setSel((cur) => cur || (list[0] ? list[0].key : ''));
     }).catch(() => {});
   }, [fixedConv]);
-
-  useEffect(() => {
-    if (!fixedConv || !sel) { setMsgs([]); return; }
-    rpc('messages', { conv: sel }).then((d: any) => setMsgs(d.messages || []));
-  }, [fixedConv, sel, mn]);
-
-  const act = (method: string, fp: string) => rpc(method, { fp, conv: sel }).then(mreload);
 
   const analyze = async () => {
     setBusy(true); setErr(''); setSugs(null); setInfo(null);
@@ -1073,30 +1293,6 @@ function Cleanup({ conv: fixedConv }: { conv?: string } = {}) {
         </>
       )}
 
-      {fixedConv && (
-        <>
-          <div className="row" style={{ alignItems: 'center', justifyContent: 'space-between', marginTop: 14 }}>
-            <h3 className="sec" style={{ margin: 0 }}>
-              Messages <span className="muted tiny">— {msgs.length}, in context order</span>
-            </h3>
-            <div className="row" style={{ gap: 4 }}>
-              <button className={'btn sm ' + (raw ? '' : 'ghost')} onClick={() => setRaw(true)}>Raw</button>
-              <button className={'btn sm ' + (raw ? 'ghost' : '')} onClick={() => setRaw(false)}>Grouped</button>
-            </div>
-          </div>
-          <p className="muted tiny" style={{ marginTop: -4 }}>
-            Removing hides a message from the model on every future turn (the IDE still shows it).
-          </p>
-          <div className="card">
-            {msgs.length === 0 ? <p className="muted tiny">No messages recorded for this chat yet.</p> :
-              raw
-                ? msgs.map((m, i) => <MsgRow key={m.fp ?? i} m={m} conv={sel} onAct={act} />)
-                : groupTurns(msgs).map((t, i) => (
-                    <TurnGroup key={t.user?.fp ?? 'turn-' + i} turn={t} conv={sel} onAct={act} />
-                  ))}
-          </div>
-        </>
-      )}
     </div>
   );
 }
@@ -1703,12 +1899,188 @@ function CwTokens({ a }: { a: CwAnalysis }) {
   );
 }
 
+// ── Graph view: animated per-request composition timeline ──────────────────
+type TlBlock = {
+  id: string | null; fp: string; role: string; tokens: number; after_tokens?: number;
+  preview: string; status: 'kept' | 'changed' | 'removed' | 'added'; technique: string;
+};
+type TlTurn = {
+  index: number; ts: number; surface: string; model: string;
+  before_tokens: number; after_tokens: number; new_fps: string[];
+  events: Array<Record<string, any>>; blocks: TlBlock[];
+};
+
+// Role → block class + 1-letter glyph. Human blocks that look like injected
+// context (system reminders, claudeMd, …) render brown like everywhere else.
+function tlRole(b: TlBlock): { cls: string; glyph: string; label: string } {
+  const r = String(b.role || '').toLowerCase();
+  if (r === 'ai' || r === 'assistant') return { cls: 'assistant', glyph: 'A', label: 'Assistant' };
+  if (r === 'tool') return { cls: 'tool', glyph: 'T', label: 'Tool' };
+  if (r === 'human' || r === 'user') {
+    return CONTEXT_RE.test(b.preview || '')
+      ? { cls: 'context', glyph: 'C', label: 'Context' }
+      : { cls: 'user', glyph: 'U', label: 'User' };
+  }
+  return { cls: 'system', glyph: 'S', label: 'System' };
+}
+
+const TL_TECH_LABEL: Record<string, string> = {
+  tool_result_trimming: 'Tool trimming',
+  summarization: 'Summarization',
+  sliding_window: 'Sliding window',
+  image_eviction: 'Image eviction',
+  visual_method: 'Visual method',
+  cache_breakpoints: 'Cache breakpoints',
+  manual_removal: 'Manual removal',
+};
+
+function CwGraph({ conv }: { conv: string }) {
+  const [turns, setTurns] = useState<TlTurn[] | null>(null);
+  const [liveTurn, setLiveTurn] = useState(-1); // turn index to animate
+  const [replayKey, setReplayKey] = useState(0);
+  const [replaying, setReplaying] = useState(false);
+  const [tip, setTip] = useState<{ x: number; y: number; b: TlBlock } | null>(null);
+  const endRef = useRef<HTMLDivElement | null>(null);
+  const newestRef = useRef(-1);
+
+  const load = useCallback(() => {
+    rpc('contextTimeline', { conv, limit: 50 }).then((d: any) => {
+      const list: TlTurn[] = d.turns || [];
+      const newest = list.length ? list[list.length - 1].index : -1;
+      // Animate only when a genuinely new turn arrived after the initial fetch.
+      if (newestRef.current >= 0 && newest !== newestRef.current) setLiveTurn(newest);
+      newestRef.current = newest;
+      setTurns(list);
+    }).catch(() => setTurns([]));
+  }, [conv]);
+  useEffect(() => { newestRef.current = -1; setLiveTurn(-1); load(); }, [load]);
+
+  const onEvent = useCallback((e: AcmEvent) => {
+    if (e.type === 'turn' && (!e.conv || e.conv === conv)) load();
+  }, [conv, load]);
+  useAcmEvents(onEvent);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [turns?.length]);
+
+  const replay = useCallback(() => {
+    setLiveTurn(-1);
+    setReplaying(true);
+    setReplayKey((k) => k + 1);
+  }, []);
+  useEffect(() => {
+    if (!replaying) return;
+    // Long enough for the last staggered row to finish entering.
+    const n = turns?.length || 0;
+    const id = setTimeout(() => setReplaying(false), n * 120 + 1500);
+    return () => clearTimeout(id);
+  }, [replaying, replayKey, turns?.length]);
+
+  if (turns === null) return <Loading />;
+  if (!turns.length) {
+    return (
+      <div className="empty">
+        <p>No requests recorded yet.</p>
+        <p className="tiny">The timeline records every request from now on — send a message in
+          this chat and each call's context will appear here as a row of blocks.</p>
+      </div>
+    );
+  }
+
+  const truncated = turns[0].index > 1;
+  return (
+    <div>
+      <div className="row" style={{ justifyContent: 'space-between', marginBottom: 8 }}>
+        <span className="muted tiny">
+          Each row is one request — blocks are the messages it carried, sized by tokens.
+          {truncated ? ` Showing the last ${turns.length} requests.` : ''}
+        </span>
+        <button className="btn sec sm" onClick={replay} title="Replay the timeline from the first recorded request">▶ Replay</button>
+      </div>
+      <div className={'cwg-rows' + (replaying ? ' replaying' : '')} key={replayKey}>
+        {turns.map((t, ti) => {
+          const techEvents = t.events.filter((e) => e.type !== 'notice' && e.type !== 'cache_breakpoints');
+          const live = t.index === liveTurn;
+          const newFps = new Set(t.new_fps || []);
+          // Stagger only the tail of a huge first row: cap entrance delays.
+          let enterSeq = 0;
+          return (
+            <div key={t.index} style={replaying ? { animationDelay: (ti * 120) + 'ms' } : undefined}
+              className={'cwg-turn' + (live || replaying ? ' live' : '')}>
+              {techEvents.length > 0 && (
+                <div className="cwg-between">
+                  {techEvents.map((e, i) => (
+                    <span key={i} className={'cwg-chip' + (e.type === 'summarization' ? ' summ' : '')}>
+                      ⚙ {TL_TECH_LABEL[String(e.type)] || String(e.type)}
+                      {Number(e.freed_tokens) > 0 ? ` −${fmtTok(Number(e.freed_tokens))} tok` : ''}
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div className="cwg-row">
+                <div className="cwg-gutter">
+                  <div>#{t.index} · {rel(t.ts)}</div>
+                  <div>≈{fmtTok(t.after_tokens)} tok</div>
+                </div>
+                <div className="cwg-strip">
+                  {t.blocks.map((b, bi) => {
+                    const { cls, glyph, label } = tlRole(b);
+                    const removed = b.status === 'removed';
+                    const entering = (live || replaying) && !removed
+                      && (b.status === 'added' || newFps.has(b.fp));
+                    const delay = entering ? Math.min(enterSeq++, 12) * 60 : 0;
+                    const w = removed ? 0.0001 : Math.max(1, b.after_tokens ?? b.tokens);
+                    return (
+                      <div
+                        key={bi}
+                        className={
+                          'cwg-block ' + cls
+                          + (removed ? ' removed' : '')
+                          + (entering ? ' entering' : '')
+                          + (b.status === 'changed' && (live || replaying) ? ' changed live' : '')
+                        }
+                        style={{ flexGrow: w, animationDelay: delay ? delay + 'ms' : undefined }}
+                        onMouseEnter={(ev) => setTip({ x: ev.clientX, y: ev.clientY, b })}
+                        onMouseMove={(ev) => setTip({ x: ev.clientX, y: ev.clientY, b })}
+                        onMouseLeave={() => setTip(null)}
+                      >
+                        {!removed && <span className="cwg-glyph" aria-label={label}>{glyph}</span>}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+        <div ref={endRef} />
+      </div>
+      {tip && (
+        <div className="cwg-tip" style={{ left: Math.min(tip.x + 12, window.innerWidth - 330), top: tip.y + 14 }}>
+          <div className="row" style={{ gap: 6, marginBottom: 4 }}>
+            <span className={'badge ' + tlRole(tip.b).cls}>{tlRole(tip.b).label}</span>
+            <span className="muted tiny">
+              {tip.b.status === 'changed'
+                ? `≈${fmtTok(tip.b.tokens)} → ${fmtTok(tip.b.after_tokens || 0)} tok`
+                : `≈${fmtTok(tip.b.tokens)} tok`}
+              {tip.b.status !== 'kept' ? ` · ${tip.b.status}` : ''}
+              {tip.b.technique ? ` · ${TL_TECH_LABEL[tip.b.technique] || tip.b.technique}` : ''}
+            </span>
+          </div>
+          <div className="tiny" style={{ opacity: 0.85 }}>{tip.b.preview || '(empty)'}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ContextWindow({ standalone, conv }: { standalone?: boolean; conv?: string }) {
   const [theme] = useState<Theme>(() => (getState().theme as Theme) || 'auto');
   const [convs, setConvs] = useState<any[]>([]);
   const [sel, setSel] = useState(conv || '');
   const [data, setData] = useState<any>(null);
-  const [view, setView] = useState<'proper' | 'raw' | 'tokens'>('proper');
+  const [view, setView] = useState<'proper' | 'raw' | 'tokens' | 'graph'>('proper');
   const [ready, setReady] = useState(!!conv);
 
   const loadConvs = useCallback(() => {
@@ -1753,7 +2125,7 @@ export function ContextWindow({ standalone, conv }: { standalone?: boolean; conv
 
   const a = data ? cwAnalyze(data) : null;
   const has = !!(a && (a.segments.length || a.tools.length));
-  const views: [typeof view, string][] = [['proper', 'Proper format'], ['raw', 'Raw'], ['tokens', 'Token usage']];
+  const views: [typeof view, string][] = [['proper', 'Proper format'], ['raw', 'Raw'], ['tokens', 'Token usage'], ['graph', 'Graph']];
 
   const controls = (
     <>
@@ -1788,7 +2160,7 @@ export function ContextWindow({ standalone, conv }: { standalone?: boolean; conv
     </>
   );
 
-  const inner = !ready ? <Loading /> : !has ? (
+  const inner = !ready ? <Loading /> : view === 'graph' ? <CwGraph conv={sel} /> : !has ? (
     <div className="empty">
       <p>No model call captured yet.</p>
       <p className="tiny">Point your IDE's model endpoint at the gateway and send a message —

@@ -141,6 +141,20 @@ input[type='text'] { min-width: 150px; }
 .conv.active { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .conv .id { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; }
 .conv .meta { margin-left: auto; text-align: right; font-size: 10.5px; color: var(--fg-muted); }
+
+/* Per-chat status dot: idle = red (steady), active = yellow, running = green
+   (blinking). Sized to sit inline before the title without shifting layout. */
+.sdot { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; background: var(--system); }
+.sdot.idle { background: var(--bad); }
+.sdot.active { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 22%, transparent); }
+.sdot.running { background: var(--ok); animation: sdot-blink 1s ease-in-out infinite; }
+@keyframes sdot-blink {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent); }
+  50% { opacity: 0.45; box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 0%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sdot.running { animation: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 30%, transparent); }
+}
 .count-badge { background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--fg); border-radius: 999px; padding: 0 7px; font-size: 10px; }
 
 .msg { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
@@ -150,12 +164,23 @@ input[type='text'] { min-width: 150px; }
 .msg.assistant .rail { background: var(--assistant); }
 .msg.tool .rail { background: var(--tool); }
 .msg.system .rail { background: var(--system); }
+.msg.context .rail { background: #8a6d3b; }
 .msg .content { flex: 1; min-width: 0; }
 .msg .head { display: flex; align-items: center; gap: 8px; margin-bottom: 2px; }
 .msg .text { font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .msg.dropped { opacity: 0.5; }
 .msg.dropped .text { text-decoration: line-through; }
 .msg .act { margin-left: auto; }
+
+/* Inline images on a message (tool screenshots / visual-method pages), shown
+   right-aligned like an outgoing chat bubble so they read apart from text. */
+.conv-imgs { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; margin-top: 8px; }
+.conv-imgs img {
+  max-width: 85%; height: auto; border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+}
 
 .empty { text-align: center; padding: 30px 12px; color: var(--fg-muted); font-size: 12px; }
 .banner { background: color-mix(in srgb, var(--bad) 14%, transparent); border: 1px solid color-mix(in srgb, var(--bad) 45%, transparent); padding: 8px 10px; border-radius: 6px; margin: 10px 14px 0; font-size: 12px; }
@@ -180,6 +205,12 @@ input[type='text'] { min-width: 150px; }
 .two-col { display: flex; gap: 18px; align-items: flex-start; }
 .two-col > .col { flex: 1 1 0; min-width: 0; }
 @media (max-width: 880px) { .two-col { flex-direction: column; } }
+
+/* Single-column chat detail: the conversation (in proper format) plus settings,
+   rendered once — no duplicate context-window panel. Kept readable on wide
+   screens by capping the column width. */
+.one-col { display: flex; justify-content: center; }
+.one-col > .col { flex: 1 1 0; min-width: 0; max-width: 900px; }
 
 /* ── onboarding (first-run experience) ─────────────────────────────────── */
 .onb {
@@ -339,3 +370,63 @@ input[type='text'] { min-width: 150px; }
 .notice.error .notice-dot { background: var(--bad); }
 .t.warn { color: var(--warn); }
 .t.error { color: var(--bad); }
+
+/* ── Context graph (Graph view): animated per-request composition timeline ── */
+.cwg-rows { display: flex; flex-direction: column; gap: 3px; }
+.cwg-turn { display: flex; flex-direction: column; gap: 3px; }
+.cwg-row { display: flex; align-items: center; gap: 10px; }
+.cwg-gutter {
+  flex: 0 0 96px; font-size: 10px; line-height: 1.3;
+  color: var(--fg-muted); text-align: right; white-space: nowrap;
+}
+.cwg-strip { flex: 1; display: flex; gap: 3px; min-height: 18px; min-width: 0; }
+.cwg-block {
+  height: 18px; border-radius: 3px; min-width: 8px; max-width: 140px; flex-basis: 0;
+  display: grid; place-items: center; overflow: hidden; cursor: default;
+  transition: flex-grow 0.5s ease, min-width 0.5s ease, opacity 0.5s ease;
+}
+.cwg-glyph { font-size: 9px; font-weight: 700; color: var(--badge-fg); }
+.cwg-block.system { background: var(--system); }
+.cwg-block.user { background: var(--user); }
+.cwg-block.assistant { background: var(--assistant); }
+.cwg-block.tool { background: var(--tool); }
+.cwg-block.context { background: #8a6d3b; }
+/* Removed blocks collapse to a hoverable dashed sliver */
+.cwg-block.removed {
+  opacity: 0.18; min-width: 3px; max-width: 5px;
+  outline: 1px dashed var(--bad); outline-offset: -1px;
+}
+/* Technique chips between rows */
+.cwg-between { display: flex; flex-wrap: wrap; gap: 6px; margin-left: 106px; padding: 1px 0; }
+.cwg-chip {
+  font-size: 9.5px; padding: 1px 8px; border-radius: 999px; color: var(--fg);
+  border: 1px solid color-mix(in srgb, var(--warn) 50%, transparent);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+.cwg-chip.summ {
+  border-color: color-mix(in srgb, #8a6d3b 60%, transparent);
+  background: color-mix(in srgb, #8a6d3b 14%, transparent);
+}
+/* Animations: only the newest (live) turn — or every row during a replay */
+.cwg-turn.live { animation: cwg-row-in 0.35s ease both; }
+.cwg-turn.live .cwg-block.entering { animation: cwg-block-in 0.4s ease both; }
+.cwg-turn.live .cwg-block.changed.live { animation: cwg-pulse 1.2s ease 2; }
+@keyframes cwg-row-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes cwg-block-in {
+  from { transform: scaleX(0); transform-origin: left; opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+@keyframes cwg-pulse {
+  0%, 100% { box-shadow: none; }
+  50% { box-shadow: 0 0 10px color-mix(in srgb, var(--warn) 60%, transparent); }
+}
+/* Hover tooltip */
+.cwg-tip {
+  position: fixed; z-index: 30; max-width: 320px; pointer-events: none;
+  font-size: 11px; line-height: 1.4; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: 7px;
+  background: var(--bg-elev); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+}

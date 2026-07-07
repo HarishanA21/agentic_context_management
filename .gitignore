@@ -52,12 +52,13 @@ PROJECT.md
 # Generated extension docs/plans — kept locally, not pushed
 # (extension/README.md is committed — pyproject.toml's readme field needs it
 # in the checkout for the PyPI sdist/wheel build)
+# (the vscode README.md and CHANGELOG.md are committed too — CI builds and
+# publishes the .vsix from a fresh checkout, so they must be tracked to show
+# on the Marketplace and Open VSX pages)
 /EXTENSION_PLAN.md
 /extension/PACKAGING.md
 /extension/PRIVATE_DEPLOY.md
 /extension/TESTING.md
 /extension/adapters/claude-code/README.md
 /extension/adapters/cursor/README.md
-/extension/adapters/vscode/README.md
-/extension/adapters/vscode/CHANGELOG.md
 /extension/adapters/vscode/UI_PLAN.md

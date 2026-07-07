@@ -247,8 +247,14 @@ export class AcmClient {
     return this.request('GET', '/conversations');
   }
 
-  messages(conv = ''): Promise<{ conversation: string; messages: AcmMessageRow[] }> {
-    return this.request('GET', '/messages?conv=' + encodeURIComponent(conv));
+  messages(
+    conv = '',
+    full = false,
+  ): Promise<{ conversation: string; messages: AcmMessageRow[] }> {
+    return this.request(
+      'GET',
+      '/messages?conv=' + encodeURIComponent(conv) + (full ? '&full=1' : ''),
+    );
   }
 
   // The exact payload last forwarded upstream (post-pipeline) for a conversation.
@@ -256,6 +262,14 @@ export class AcmClient {
     return this.request<AcmContextWindow>(
       'GET',
       '/context_window?conv=' + encodeURIComponent(conv),
+    );
+  }
+
+  // Per-request composition history (Graph view): one entry per proxied turn.
+  contextTimeline(conv = '', limit = 50): Promise<AcmContextTimeline> {
+    return this.request<AcmContextTimeline>(
+      'GET',
+      '/context_timeline?conv=' + encodeURIComponent(conv) + '&limit=' + limit,
     );
   }
 
@@ -361,6 +375,14 @@ export interface AcmMessageRow {
   preview: string;
   tool_call_id: string;
   dropped: boolean;
+  tokens?: number;
+  // True when the message carries image block(s) — a tool screenshot or a
+  // visual-method rasterised page. The conversation view fetches and renders
+  // these inline via messageImages(fp).
+  has_image?: boolean;
+  // Present only when the row was fetched with full=1 — the complete message
+  // text, so the conversation view can render in order without a per-row fetch.
+  text?: string;
 }
 
 // One chat's context window: its effective profile + live stats.
@@ -389,6 +411,37 @@ export interface AcmContextWindow {
   system: unknown;
   messages: any[];
   tools: any[];
+}
+
+// One message block in a timeline turn (Graph view). `tokens` is the block's
+// size before the pipeline ran; `after_tokens` is set when status is 'changed'.
+export interface AcmTimelineBlock {
+  id: string | null;
+  fp: string;
+  role: string; // system | human | ai | tool
+  tokens: number;
+  after_tokens?: number;
+  preview: string;
+  status: 'kept' | 'changed' | 'removed' | 'added';
+  technique: string; // '' when kept
+}
+
+export interface AcmTimelineTurn {
+  index: number;
+  ts: number;
+  surface: string;
+  model: string;
+  before_tokens: number;
+  after_tokens: number;
+  new_fps: string[]; // fps new since the previous turn (the growth blocks)
+  events: Array<Record<string, unknown>>;
+  blocks: AcmTimelineBlock[];
+}
+
+export interface AcmContextTimeline {
+  conversation: string;
+  limit: number;
+  turns: AcmTimelineTurn[];
 }
 
 export interface AcmSavingsRow {

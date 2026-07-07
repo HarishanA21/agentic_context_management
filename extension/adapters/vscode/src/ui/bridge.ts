@@ -12,7 +12,7 @@ const pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) =>
 // Realtime events relayed from the gateway by the host (see startEventRelay in
 // webview.ts). Views subscribe via useAcmEvents to refresh the instant a turn
 // flows through, instead of polling.
-export type AcmEvent = { type: string; conv?: string; project?: string; action?: string };
+export type AcmEvent = { type: string; conv?: string; project?: string; action?: string; running?: boolean };
 const eventListeners = new Set<(event: AcmEvent) => void>();
 
 window.addEventListener('message', (e: MessageEvent) => {

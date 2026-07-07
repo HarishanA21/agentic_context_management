@@ -43,6 +43,17 @@ from .paths import SUMMARY_PATH as _SUMMARY_PATH
 from .paths import atomic_write_text
 
 
+def _has_image(content: Any) -> bool:
+    """True when a message carries at least one image block — used to flag rows
+    the UI can render inline (tool screenshots / visual-method page images)."""
+    if isinstance(content, list):
+        return any(
+            isinstance(b, dict) and b.get("type") in {"image", "image_url"}
+            for b in content
+        )
+    return False
+
+
 def _norm_text(content: Any) -> str:
     """Flatten a message's content to plain text for hashing/preview. Image
     blocks become a compact marker so base64 never bloats the fingerprint."""
@@ -97,11 +108,15 @@ def _stable_for_key(text: str) -> str:
     return _VOLATILE_RE.sub("", text)
 
 
-# Claude Code stamps `metadata.user_id` with a `session_<uuid>` segment that is
-# constant across the turns of one chat. We use it to *namespace* the
-# conversation key so two chats that happen to open with the same first message
-# don't share a window — while the prefix hash still distinguishes chats within
-# one session (a new chat = a new first message = a new hash).
+# Claude Code stamps `metadata.user_id` with a JSON blob that carries a
+# `session_id` constant across the turns of one chat — e.g.
+# ``{"device_id":"…","account_uuid":"…","session_id":"58fda58c-…"}``. We read
+# that session id to *namespace* the conversation key, so every request of one
+# Claude Code session (the main turn plus its auxiliary title / topic / quota
+# calls, which each carry a different prefix) resolves to a single window.
+#
+# The regex is a fallback for a bare ``session_<uuid>`` form some clients send;
+# the JSON path above is what Claude Code actually emits today.
 _SESSION_RE = re.compile(r"session[_-]([0-9a-fA-F][0-9a-fA-F-]{6,})")
 
 
@@ -131,15 +146,39 @@ def project_path(messages: List[BaseMessage]) -> str:
 
 def session_namespace(body: Optional[Dict[str, Any]]) -> Optional[str]:
     """Stable per-chat namespace from the request's Claude Code metadata, or
-    None when absent (then the prefix hash stands alone — today's behaviour)."""
+    None when absent (then the prefix hash stands alone).
+
+    Claude Code sends ``metadata.user_id`` as a JSON string
+    (``{"device_id":…,"account_uuid":…,"session_id":"<uuid>"}``); the session id
+    is constant for every request of one chat, including the auxiliary
+    title/topic/quota calls. We prefer that parsed ``session_id`` and fall back
+    to a ``session_<uuid>`` regex only for other client shapes."""
     if not isinstance(body, dict):
         return None
     meta = body.get("metadata")
     uid = meta.get("user_id") if isinstance(meta, dict) else None
     if not isinstance(uid, str):
         return None
-    m = _SESSION_RE.search(uid)
-    return "s" + m.group(1).replace("-", "")[:24] if m else None
+
+    # Preferred: user_id is a JSON blob with an explicit session_id.
+    sid: Optional[str] = None
+    if "{" in uid:
+        try:
+            parsed = json.loads(uid)
+            cand = parsed.get("session_id") if isinstance(parsed, dict) else None
+            if isinstance(cand, str) and cand.strip():
+                sid = cand.strip()
+        except (json.JSONDecodeError, ValueError):
+            sid = None
+
+    # Fallback: a bare ``session_<uuid>`` segment somewhere in the string.
+    if sid is None:
+        m = _SESSION_RE.search(uid)
+        sid = m.group(1) if m else None
+
+    if not sid:
+        return None
+    return "s" + re.sub(r"[^0-9a-fA-F]", "", sid)[:24]
 
 
 def conversation_key(
@@ -147,24 +186,28 @@ def conversation_key(
     explicit: Optional[str] = None,
     namespace: Optional[str] = None,
 ) -> str:
-    """Identify the conversation. Prefer an explicit id from the client; else
-    hash the settled prefix (first system + first non-system message) with the
-    per-turn billing header stripped, so it stays stable across a session. A
-    ``namespace`` (e.g. the Claude Code session id) is prepended when available,
-    so identical openings in different chats resolve to different windows."""
+    """Identify the conversation. Prefer an explicit id from the client; else,
+    when Claude Code gives us a stable session id (``namespace``), key on that
+    ALONE — it uniquely and stably identifies the chat for its whole lifetime,
+    so we never let the churning prefix (the date, ``<system-reminder>`` git
+    block, or a rotating cache token that slips past ``_stable_for_key``) mint a
+    second window for one session. Only when no session id is present do we fall
+    back to hashing the settled prefix (first system + first non-system message,
+    per-turn billing header stripped)."""
     if explicit:
         return explicit.strip()[:64]
+    if namespace:
+        ns = re.sub(r"[^A-Za-z0-9_-]", "", namespace)[:32]
+        if ns:
+            # One session id → one context window, full stop. The prefix is
+            # deliberately excluded from the key here (see docstring).
+            return ns
     system = next((m for m in messages if isinstance(m, SystemMessage)), None)
     first = next((m for m in messages if not isinstance(m, SystemMessage)), None)
     basis = _stable_for_key(_norm_text(getattr(system, "content", ""))) + "␟" + (
         _norm_text(getattr(first, "content", ""))
     )
-    base = "c_" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:14]
-    if namespace:
-        ns = re.sub(r"[^A-Za-z0-9_-]", "", namespace)[:32]
-        if ns:
-            return f"{ns}_{base}"
-    return base
+    return "c_" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:14]
 
 
 class DropStore:
@@ -347,7 +390,8 @@ class DropStore:
         rows = []
         for m in messages:
             fp = fingerprint(m)
-            full = _norm_text(getattr(m, "content", ""))
+            content = getattr(m, "content", "")
+            full = _norm_text(content)
             preview = full.strip().replace("\n", " ")
             rows.append(
                 {
@@ -356,6 +400,9 @@ class DropStore:
                     "preview": (preview[:120] + "…") if len(preview) > 120 else preview,
                     "tool_call_id": getattr(m, "tool_call_id", "") or "",
                     "dropped": self.is_dropped(conv, fp),
+                    # Flags a message the UI can render inline as image(s) — a
+                    # tool screenshot or a visual-method rasterised page.
+                    "has_image": _has_image(content),
                     # Each message's OWN size (counted once) — a ~4 chars/token
                     # estimate. Summed for the context HUD; never per-call totals.
                     "tokens": max(1, len(full) // 4) if full else 0,
@@ -364,14 +411,23 @@ class DropStore:
         self._seen[conv] = {"ts": time.time(), "messages": rows}
         self._seen_msgs[conv] = list(messages)
 
-    def seen(self, conv: str) -> List[Dict[str, Any]]:
+    def seen(self, conv: str, full: bool = False) -> List[Dict[str, Any]]:
         # Recompute `dropped` against the LIVE drop-list on every read — the
         # cached rows freeze it at record time, so without this a freshly
         # dropped/restored message wouldn't reflect until the next turn (the UI
         # would look like Remove did nothing).
         rows = self._seen.get(conv, {}).get("messages", [])
         live = set(self._dropped.get(conv, []))
-        return [{**r, "dropped": r.get("fp") in live} for r in rows]
+        out = [{**r, "dropped": r.get("fp") in live} for r in rows]
+        if full:
+            # Attach each message's complete text so a UI can render the whole
+            # conversation in order without a per-message round-trip. Rows are
+            # 1:1 with the cached BaseMessage list, so we zip by index.
+            msgs = self._seen_msgs.get(conv, [])
+            for i, row in enumerate(out):
+                if i < len(msgs):
+                    row["text"] = _norm_text(getattr(msgs[i], "content", ""))
+        return out
 
     def context_tokens(self, conv: str) -> int:
         """Estimated tokens currently in this conversation's context — the sum

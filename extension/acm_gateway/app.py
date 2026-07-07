@@ -26,6 +26,7 @@ import json
 import os
 import re
 import time
+from contextlib import contextmanager
 from typing import Any, Dict, List
 
 import httpx
@@ -66,6 +67,7 @@ from .droplist import (
     session_namespace,
 )
 from .pipeline import run_pipeline
+from .timeline import TimelineStore
 from .providers_store import ProviderStore
 from .savings import SavingsLedger
 from . import training_export
@@ -87,8 +89,57 @@ _LAST_EVENTS: List[Dict[str, Any]] = []
 _MEMORY = MemoryStore()
 _DROP = DropStore()
 _SAVINGS = SavingsLedger()
+_TIMELINE = TimelineStore()
 _PROVIDERS = ProviderStore()
 _WINDOWS = ContextWindowStore()
+
+# conv -> count of requests currently in flight for that chat. A chat is
+# "running" (a turn is mid-generation upstream) when its count is > 0. We keep a
+# count, not a bool, so overlapping requests for one chat don't clear each other
+# early. In-memory only — a fresh gateway starts with nothing running.
+_INFLIGHT: Dict[str, int] = {}
+
+
+def _running_convs() -> set:
+    """Chats with at least one request in flight right now."""
+    return {c for c, n in _INFLIGHT.items() if n > 0}
+
+
+def _enter_running(conv: str) -> None:
+    _INFLIGHT[conv] = _INFLIGHT.get(conv, 0) + 1
+    events.publish({"type": "running", "conv": conv, "running": True})
+
+
+def _exit_running(conv: str) -> None:
+    n = _INFLIGHT.get(conv, 0) - 1
+    if n > 0:
+        _INFLIGHT[conv] = n
+    else:
+        _INFLIGHT.pop(conv, None)
+    events.publish({"type": "running", "conv": conv, "running": n > 0})
+
+
+@contextmanager
+def _mark_running(conv: str):
+    """Mark ``conv`` running for a non-streamed upstream turn, announcing the
+    state change on both edges so the UI's status dot flips live."""
+    _enter_running(conv)
+    try:
+        yield
+    finally:
+        _exit_running(conv)
+
+
+async def _running_stream(conv: str, gen):
+    """Wrap an upstream token stream so ``conv`` stays "running" for the whole
+    generation, not just until the handler returns the StreamingResponse. The
+    state clears when the stream is exhausted or the client disconnects."""
+    _enter_running(conv)
+    try:
+        async for chunk in gen:
+            yield chunk
+    finally:
+        _exit_running(conv)
 
 
 def _env_openai() -> tuple:
@@ -108,6 +159,20 @@ def _resolve(model: str, request: Request):
         env_openai=_env_openai(),
         env_anthropic=_env_anthropic(),
     )
+
+
+def _is_probe(body: Dict[str, Any]) -> bool:
+    """True for a measurement probe rather than a real conversation turn.
+
+    Claude Code fires many token-counting probes per session — single-message,
+    no system, ``max_tokens=1``, never generating output — and each carries its
+    own throwaway ``session_id``. Registering a context window for them spawns a
+    junk "count"/"quota" chat alongside the real one (the "typing HI made 2
+    sessions" report). We forward these verbatim and track no ACM state for
+    them: a probe must also never be rewritten, or the count it measures would
+    be wrong."""
+    mt = body.get("max_tokens")
+    return isinstance(mt, int) and mt <= 1
 
 
 def _conv_key(request: Request, messages, body: Dict[str, Any] | None = None) -> str:
@@ -619,11 +684,13 @@ def list_conversations() -> Dict[str, Any]:
 
 
 @app.get("/messages")
-def list_messages(conv: str = "") -> Dict[str, Any]:
+def list_messages(conv: str = "", full: int = 0) -> Dict[str, Any]:
     """Last-seen messages for a conversation: fingerprint, role, preview, and
-    whether each is currently dropped. ``conv`` defaults to the latest."""
+    whether each is currently dropped. ``conv`` defaults to the latest. Pass
+    ``full=1`` to also include each message's complete text, so a UI can render
+    the whole conversation in order without a per-message fetch."""
     key = conv or _DROP.latest_conversation() or ""
-    return {"conversation": key, "messages": _DROP.seen(key)}
+    return {"conversation": key, "messages": _DROP.seen(key, full=bool(full))}
 
 
 @app.get("/context_window")
@@ -633,6 +700,20 @@ def context_window(conv: str = "") -> Dict[str, Any]:
     Context Window view. ``conv`` defaults to the latest conversation."""
     key = conv or _DROP.latest_conversation() or ""
     return _DROP.sent(key)
+
+
+@app.get("/context_timeline")
+def context_timeline(conv: str = "", limit: int = 50) -> Dict[str, Any]:
+    """Per-request composition history for the Graph view: one entry per proxied
+    turn with the ordered message blocks (role, tokens, diff status, technique)
+    and the pipeline events that fired. In-memory ring — starts empty on gateway
+    restart. ``conv`` defaults to the latest conversation."""
+    key = conv or _DROP.latest_conversation() or ""
+    return {
+        "conversation": key,
+        "limit": limit,
+        "turns": _TIMELINE.timeline(key, limit=limit),
+    }
 
 
 def _preview_row(msg) -> Dict[str, Any]:
@@ -746,6 +827,7 @@ def _window_view(conv: str, include_profile: bool = False) -> Dict[str, Any]:
     view = {
         **row,
         "id": conv,
+        "running": conv in _INFLIGHT,
         "title": row.get("title") or _DROP.title(conv),
         # Live stats win while the conversation is in memory this run; else the
         # values mirrored into the registry (so the list survives a restart).
@@ -832,6 +914,7 @@ def delete_context_window(conv: str) -> Any:
     (drop-list, summaries, snapshots)."""
     existed = _WINDOWS.delete(conv)
     _DROP.forget(conv)
+    _TIMELINE.forget(conv)
     events.publish({"type": "window", "conv": conv, "action": "delete"})
     return JSONResponse({"ok": True, "deleted": existed, "conversation": conv})
 
@@ -842,6 +925,7 @@ def reset_context_windows() -> Any:
     summaries, and snapshots. Does not touch provider config or memory."""
     cleared = _WINDOWS.clear()
     _DROP.clear_all()
+    _TIMELINE.clear_all()
     events.publish({"type": "window", "conv": "", "action": "reset"})
     return JSONResponse({"ok": True, "cleared": cleared})
 
@@ -1302,6 +1386,27 @@ async def chat_completions(request: Request) -> Any:
     incoming = body.get("messages", []) or []
     lc_messages = openai_to_lc(incoming)
 
+    # Token-counting probes: forward untouched, register no context window (see
+    # _is_probe). Rewriting one would corrupt the count it measures.
+    if _is_probe(body):
+        target = _resolve(body.get("model", ""), request)
+        if target.kind == "anthropic":
+            return JSONResponse(
+                {"error": f"provider '{target.slug}' is Anthropic-native"},
+                status_code=400,
+            )
+        body = dict(body)
+        body["model"] = target.model
+        up = GenericUpstream(target.url, target.headers or {})
+        try:
+            return JSONResponse(await up.chat(body))
+        except httpx.HTTPStatusError as e:
+            try:
+                payload = e.response.json()
+            except Exception:
+                payload = {"error": {"message": e.response.text[:1000]}}
+            return JSONResponse(payload, status_code=e.response.status_code)
+
     # Resolve the chat (context window) + its per-chat profile before anything,
     # scoped to the project (cwd) the client is running in.
     conv = _conv_key(request, lc_messages, body)
@@ -1311,6 +1416,7 @@ async def chat_completions(request: Request) -> Any:
 
     # Manual removal: strip any tombstoned messages before anything else.
     lc_messages = _apply_droplist(conv, lc_messages)
+    before_msgs = list(lc_messages)
     _WINDOWS.touch(
         conv,
         title=_DROP.title(conv),
@@ -1351,6 +1457,17 @@ async def chat_completions(request: Request) -> Any:
         _SAVINGS.record(conv, pipeline_events)
     except Exception as e:  # a disk/write failure must never break a live turn
         _notice("savings", f"couldn't update the savings ledger: {e!s}")
+    try:
+        _TIMELINE.record(
+            conv,
+            surface="openai",
+            model=body.get("model") or "",
+            before=before_msgs,
+            after=new_messages,
+            events=pipeline_events,
+        )
+    except Exception as e:  # timeline is a viewer — never break a live turn
+        _notice("timeline", f"couldn't record the request timeline: {e!s}")
 
     # Rebuild the forwarded body with the rewritten messages.
     body = dict(body)
@@ -1382,13 +1499,77 @@ async def chat_completions(request: Request) -> Any:
     up = GenericUpstream(target.url, target.headers or {})
     if body.get("stream"):
         return StreamingResponse(
-            up.chat_stream(body), media_type="text/event-stream"
+            _running_stream(conv, up.chat_stream(body)),
+            media_type="text/event-stream",
+        )
+    with _mark_running(conv):
+        try:
+            data = await up.chat(body)
+        except httpx.HTTPStatusError as e:
+            # Surface the upstream's real status + body instead of a bare 500, so
+            # the IDE shows the actual reason (mirrors the /v1/messages path).
+            try:
+                payload = e.response.json()
+            except Exception:
+                payload = {"error": {"message": e.response.text[:1000]}}
+            return JSONResponse(payload, status_code=e.response.status_code)
+    return JSONResponse(data)
+
+
+async def _forward_anthropic_untouched(
+    request: Request, body: Dict[str, Any], orig_system: Any
+) -> Any:
+    """Forward an Anthropic request verbatim — no pipeline, no context window,
+    no ACM state. Used for token-counting probes (see _is_probe). Preserves the
+    OAuth-passthrough / beta-header invariants a real turn honours, so the
+    upstream sees the same request shape it would without the gateway present."""
+    target = _resolve(body.get("model", ""), request)
+    use_passthrough, auth_header = _anthropic_auth_decision(request, target)
+
+    body = dict(body)
+    if use_passthrough:
+        if orig_system is not None:
+            body["system"] = orig_system
+        elif "system" in body:
+            del body["system"]
+    if target.kind == "anthropic":
+        up = AnthropicUpstream(
+            target.base_url, target.api_key, _SETTINGS.anthropic_version
+        )
+        body["model"] = target.model
+    else:
+        up = _anthropic_upstream()
+
+    passthrough_headers = _passthrough_headers(request) if use_passthrough else None
+    beta = request.headers.get("anthropic-beta")
+    if beta and not use_passthrough:
+        beta = ",".join(
+            b.strip()
+            for b in beta.split(",")
+            if b.strip() and not b.strip().startswith("oauth")
+        ) or None
+    beta_query = request.query_params.get("beta") in ("true", "1")
+
+    if body.get("stream"):
+        return StreamingResponse(
+            up.messages_stream(
+                body,
+                beta=beta,
+                beta_query=beta_query,
+                auth_header=auth_header,
+                passthrough_headers=passthrough_headers,
+            ),
+            media_type="text/event-stream",
         )
     try:
-        data = await up.chat(body)
+        data = await up.messages(
+            body,
+            beta=beta,
+            beta_query=beta_query,
+            auth_header=auth_header,
+            passthrough_headers=passthrough_headers,
+        )
     except httpx.HTTPStatusError as e:
-        # Surface the upstream's real status + body instead of a bare 500, so the
-        # IDE shows the actual reason (mirrors the /v1/messages path).
         try:
             payload = e.response.json()
         except Exception:
@@ -1413,6 +1594,14 @@ async def anthropic_messages(request: Request) -> Any:
     orig_system = body.get("system")
     orig_system_ids = {id(m) for m in lc_messages if isinstance(m, SystemMessage)}
 
+    # Token-counting probes (see _is_probe): Claude Code's many single-message,
+    # max_tokens=1 measurement calls, each under a throwaway session_id. Forward
+    # verbatim with the same auth/beta handling as a real turn, but register no
+    # context window and run no pipeline — otherwise every probe spawns a junk
+    # "count"/"quota" chat, and any rewrite would corrupt the count it measures.
+    if _is_probe(body):
+        return await _forward_anthropic_untouched(request, body, orig_system)
+
     # Which chat is this? Resolve its context window + per-chat profile, and
     # auto-create the window on first sight (inheriting the global default),
     # scoped to the project (cwd) Claude Code is running in.
@@ -1423,6 +1612,7 @@ async def anthropic_messages(request: Request) -> Any:
 
     # Manual removal: strip tombstoned messages before the pipeline.
     lc_messages = _apply_droplist(conv, lc_messages)
+    before_msgs = list(lc_messages)
     _WINDOWS.touch(
         conv,
         title=_DROP.title(conv),
@@ -1470,6 +1660,17 @@ async def anthropic_messages(request: Request) -> Any:
         _SAVINGS.record(conv, pipeline_events)
     except Exception as e:  # a disk/write failure must never break a live turn
         _notice("savings", f"couldn't update the savings ledger: {e!s}")
+    try:
+        _TIMELINE.record(
+            conv,
+            surface="anthropic",
+            model=body.get("model") or "",
+            before=before_msgs,
+            after=new_messages,
+            events=pipeline_events,
+        )
+    except Exception as e:  # timeline is a viewer — never break a live turn
+        _notice("timeline", f"couldn't record the request timeline: {e!s}")
 
     # Route to a configured Anthropic provider if one is selected, else env,
     # then decide whether to forward the client's own subscription bearer.
@@ -1549,29 +1750,33 @@ async def anthropic_messages(request: Request) -> Any:
 
     if body.get("stream"):
         return StreamingResponse(
-            up.messages_stream(
+            _running_stream(
+                conv,
+                up.messages_stream(
+                    body,
+                    beta=beta,
+                    beta_query=beta_query,
+                    auth_header=auth_header,
+                    passthrough_headers=passthrough_headers,
+                ),
+            ),
+            media_type="text/event-stream",
+        )
+    with _mark_running(conv):
+        try:
+            data = await up.messages(
                 body,
                 beta=beta,
                 beta_query=beta_query,
                 auth_header=auth_header,
                 passthrough_headers=passthrough_headers,
-            ),
-            media_type="text/event-stream",
-        )
-    try:
-        data = await up.messages(
-            body,
-            beta=beta,
-            beta_query=beta_query,
-            auth_header=auth_header,
-            passthrough_headers=passthrough_headers,
-        )
-    except httpx.HTTPStatusError as e:
-        # Surface the upstream's real status + body instead of a bare 500, so
-        # the IDE stops retrying blindly and shows the actual reason.
-        try:
-            payload = e.response.json()
-        except Exception:
-            payload = {"error": {"message": e.response.text[:1000]}}
-        return JSONResponse(payload, status_code=e.response.status_code)
+            )
+        except httpx.HTTPStatusError as e:
+            # Surface the upstream's real status + body instead of a bare 500, so
+            # the IDE stops retrying blindly and shows the actual reason.
+            try:
+                payload = e.response.json()
+            except Exception:
+                payload = {"error": {"message": e.response.text[:1000]}}
+            return JSONResponse(payload, status_code=e.response.status_code)
     return JSONResponse(data)

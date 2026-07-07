@@ -134,9 +134,11 @@ async function dispatch(client: AcmClient, method: string, params: any): Promise
     case 'resetWindows':
       return client.resetWindows();
     case 'messages':
-      return client.messages(p.conv || '');
+      return client.messages(p.conv || '', !!p.full);
     case 'contextWindow':
       return client.contextWindow(p.conv || '');
+    case 'contextTimeline':
+      return client.contextTimeline(p.conv || '', p.limit || 50);
     case 'dropMessage':
       return client.dropMessage(p.fp, p.conv || '');
     case 'restoreMessage':

@@ -32,6 +32,11 @@ from acm_engine import (
 )
 
 
+def _ids(msgs: List[Any]) -> List[Optional[str]]:
+    """Message ids for event attribution (timeline diffing)."""
+    return [getattr(m, "id", None) for m in msgs]
+
+
 def _apply_replacements(
     messages: List[BaseMessage], replacements: List[BaseMessage]
 ) -> List[BaseMessage]:
@@ -95,7 +100,7 @@ def run_pipeline(
             )
             if repl:
                 messages = _apply_replacements(messages, repl)
-                events.append({"type": "visual_method", **info})
+                events.append({"type": "visual_method", "replaced_ids": _ids(repl), **info})
         except Exception as e:  # pragma: no cover - defensive
             _fail("visual_method", e)
 
@@ -115,7 +120,7 @@ def run_pipeline(
             )
             if repl:
                 messages = _apply_replacements(messages, repl)
-                events.append({"type": "tool_result_trimming", **info})
+                events.append({"type": "tool_result_trimming", "replaced_ids": _ids(repl), **info})
         except Exception as e:  # pragma: no cover - defensive
             _fail("tool_result_trimming", e)
 
@@ -128,7 +133,7 @@ def run_pipeline(
             )
             if repl:
                 messages = _apply_replacements(messages, repl)
-                events.append({"type": "image_eviction", **info})
+                events.append({"type": "image_eviction", "replaced_ids": _ids(repl), **info})
         except Exception as e:  # pragma: no cover - defensive
             _fail("image_eviction", e)
 
@@ -144,8 +149,17 @@ def run_pipeline(
                 instructions=getattr(summ, "instructions", None),
             )
             if summary_msg is not None:
+                if getattr(summary_msg, "id", None) is None:
+                    summary_msg.id = "summ0"
                 messages = [summary_msg] + _apply_removes(messages, removes)
-                events.append({"type": "summarization", **info})
+                events.append(
+                    {
+                        "type": "summarization",
+                        "removed_ids": _ids(removes),
+                        "added_ids": [summary_msg.id],
+                        **info,
+                    }
+                )
         except Exception as e:  # pragma: no cover - defensive
             _fail("summarization", e)
 
@@ -156,7 +170,7 @@ def run_pipeline(
             removes, info = sliding_window_trim(messages, keep_recent=sw.keep_recent)
             if removes:
                 messages = _apply_removes(messages, removes)
-                events.append({"type": "sliding_window", **info})
+                events.append({"type": "sliding_window", "removed_ids": _ids(removes), **info})
         except Exception as e:  # pragma: no cover - defensive
             _fail("sliding_window", e)
 

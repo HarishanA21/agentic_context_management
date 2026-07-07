@@ -1,78 +1,61 @@
-# ACM Extension — context management for any IDE
+# ACM Gateway
 
-This folder is **self-contained**. It turns the context-management engine that
-already powers the website (in [`../backend`](../backend)) into something usable
-from VSCode, Cursor, Antigravity, Claude Code, and Windsurf — **without changing
-a single line of the website's code.**
+ACM keeps your AI assistant's context window small and useful. This package is the **gateway**, a small local service that does the context work. It trims, summarises, and manages what goes to the model on every call.
 
-It reaches the IDEs through three surfaces (see
-[`../EXTENSION_PLAN.md`](../EXTENSION_PLAN.md) for the why):
+The gateway works with VSCode, Cursor, Antigravity, Claude Code, and Windsurf. Your IDE talks to the gateway as if it were the AI. The gateway applies the techniques, then passes the request on to the real provider.
 
-| Folder | Surface | What it is |
-|---|---|---|
-| `acm_gateway/` | **Gateway** | A local OpenAI/Anthropic-compatible proxy. The IDE talks to it as if it were the AI; it applies every technique on the wire, then forwards to the real provider. Full feature parity. |
-| `acm_mcp/` | **MCP** | An MCP server exposing `remember` / `recall` / `compact` / `set_profile` tools. Works in *every* MCP-capable IDE. |
-| `adapters/` | **Hooks + config** | Per-IDE glue: Claude Code hooks, Cursor `mcp.json`, VSCode notes. |
-| `acm_engine/` | — | Thin bridge that imports the techniques from `../backend` so there is **one** source of truth. |
+## Install
 
-## How it reuses the website's engine
-
-`acm_engine/` puts `../backend` on `sys.path` and re-exports the pure technique
-functions (`trim_tool_results`, `summarise_old_messages`,
-`sliding_window_trim`, `evict_stale_images`, `annotate_cache_breakpoints`) plus
-the `Profile` schema. Nothing in `../backend` is edited. The website and the
-extension share the same code; fix a bug once, both benefit.
-
-## Quick start (gateway)
+Use `uv` to install the gateway.
 
 ```bash
-cd extension
-uv venv --python 3.11
-source .venv/bin/activate
-uv pip install -e .
-
-# point it at any OpenAI-compatible upstream (OpenRouter shown)
-export ACM_UPSTREAM_BASE_URL=https://openrouter.ai/api/v1
-export ACM_UPSTREAM_API_KEY=sk-or-v1-...
-
-acm-gateway            # serves http://127.0.0.1:8807
+uv tool install acm-context-management
 ```
 
-Then tell the IDE the AI lives at `http://127.0.0.1:8807/v1` (Cursor: custom
-OpenAI base URL; Claude Code: `ANTHROPIC_BASE_URL`).
+## Run
 
-## Config
+Start the gateway. It serves on `http://127.0.0.1:8807`.
 
-A single [`config/acm.config.example.json`](config/acm.config.example.json)
-holds the active profile (which techniques are on). Copy it to
-`config/acm.config.json` and edit, or set `ACM_CONFIG` to its path. The schema
-is the website's `Profile` model — same presets (`minimal`, `long_chat`,
-`power_research`, `cheap_long`, `visual_recall`).
+```bash
+acm-gateway
+```
 
-## Status
+To use your own API key, set it first.
 
-- **Gateway** — runnable. OpenAI (`/v1/chat/completions`) **and** Anthropic
-  (`/v1/messages`) surfaces; full technique pipeline (trim / summarise / sliding
-  window / image-evict / cache breakpoints / **visual method** — rasterise big
-  tool outputs to images); **manual message removal** (cascade-safe drop-list,
-  persisted to `~/.acm/dropped.json`); **multi-provider routing** (OpenAI /
-  OpenRouter / Google / Azure on the OpenAI surface, Anthropic native; creds in
-  `~/.acm/providers.json`; route by `x-acm-provider` header, `slug/model`
-  prefix, or default — Bedrock via OpenRouter since it needs AWS SigV4); control
-  plane (`/status`, `/profile`, `/memory`, `/compact`, `/conversations`,
-  `/messages*`, `/providers*`).
-- **MCP server** — runnable: memory (`remember`/`recall`), `compact`,
-  `set_profile`/`status`, manual removal (`list_messages`/`drop_message`/
-  `restore_message`), providers (`list_providers`/`add_provider`/
-  `set_default_provider`), **sub-agent** (`spawn_subagent`), and **JIT retrieval**
-  (`find_files`/`read_slice`/`grep_files`).
-- **Claude Code** — gateway + hooks (trim + memory) + MCP. Done.
-- **Cursor** — gateway + hooks (capture + **compact-on-stop**) + MCP. Done.
-- **VSCode** — full extension (Language Model Tools + `@acm` chat participant +
-  webview settings) talking to the gateway; MCP drop-in for Antigravity /
-  Windsurf. TypeScript is written but not yet `tsc`-compiled here (needs
-  `npm install` with `@types/vscode`).
+```bash
+export ACM_UPSTREAM_BASE_URL=https://openrouter.ai/api/v1
+export ACM_UPSTREAM_API_KEY=your_key_here
+acm-gateway
+```
 
-Remaining work is marked with `# TODO(acm)` / `TODO(acm)`: orphan-`tool_use`
-pruning on the Anthropic path, React components in the VSCode webview, and
-auto-starting the gateway from the extension.
+## Point your IDE at the gateway
+
+Tell your IDE the AI lives at `http://127.0.0.1:8807/v1`.
+
+1. **Cursor.** Set a custom OpenAI base URL.
+2. **Claude Code.** Set `ANTHROPIC_BASE_URL`.
+
+## Profiles
+
+A profile decides which techniques are on. Pick one of `minimal`, `long_chat`, `power_research`, `cheap_long`, or `visual_recall`. You can also copy the example config and edit it, or set `ACM_CONFIG` to your own file path.
+
+## What the gateway does
+
+1. **Trim.** Cut old and large tool outputs.
+2. **Summarise.** Compress old turns into a short note.
+3. **Sliding window.** Keep the newest turns and the system prompt.
+4. **Image recall.** Cache or evict old images.
+5. **Visual method.** Turn big tool outputs into an image the model reads.
+6. **Manual removal.** Drop any message by hand. Choices are saved.
+7. **Memory.** Remember and recall notes across sessions.
+8. **Multi provider routing.** Route to OpenAI, OpenRouter, Google, Azure, or Anthropic.
+
+## Links
+
+Repository: https://github.com/HarishanA21/agentic_context_management
+
+Issues: https://github.com/HarishanA21/agentic_context_management/issues
+
+## License
+
+MIT
