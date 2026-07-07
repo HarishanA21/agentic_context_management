@@ -2,6 +2,13 @@
 
 All notable changes to the Context Management — ACM VSCode extension.
 
+## [0.2.8] - 2026-07-07
+
+### Fixed
+- Rebuilt the webview bundle so the two-column chat detail and Graph tab
+  actually ship. 0.2.7 shipped a stale bundle that still rendered a single
+  column.
+
 ## [0.2.7] - 2026-07-07
 
 ### Changed

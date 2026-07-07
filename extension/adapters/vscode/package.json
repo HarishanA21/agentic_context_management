@@ -2,7 +2,7 @@
   "name": "acm-context-management",
   "displayName": "Context Management - ACM",
   "description": "Agentic Context Management for VSCode — trim, summarise, recall, and remember context for Copilot and Claude Code via a local gateway, Language Model Tools, and a settings panel.",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "publisher": "Harishan-A",
   "license": "MIT",
   "icon": "media/icon.png",
