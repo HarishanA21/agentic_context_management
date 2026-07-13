@@ -61,6 +61,11 @@ CONTEXT_WINDOWS_PATH = _path("ACM_CONTEXT_WINDOWS_PATH", "context_windows.json")
 PROVIDERS_PATH = _path("ACM_PROVIDERS_PATH", "providers.json")
 SAVINGS_PATH = _path("ACM_SAVINGS_PATH", "savings.json")
 TRAINING_EXPORT_DIR = _path("ACM_TRAINING_EXPORT_DIR", "training")
+# Real-usage evaluation ledger + the OpenRouter price cache that turns it into $.
+USAGE_PATH = _path("ACM_USAGE_PATH", "usage.json")
+PRICING_CACHE_PATH = _path("ACM_PRICING_CACHE_PATH", "pricing.json")
+# The user's spend cap (daily USD budget + soft/hard enforcement).
+BUDGETS_PATH = _path("ACM_BUDGETS_PATH", "budgets.json")
 
 
 def atomic_write_text(path: Path, text: str) -> None:

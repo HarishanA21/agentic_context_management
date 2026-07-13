@@ -50,12 +50,6 @@ A profile decides which techniques are on. Pick one of `minimal`, `long_chat`, `
 7. **Memory.** Remember and recall notes across sessions.
 8. **Multi provider routing.** Route to OpenAI, OpenRouter, Google, Azure, or Anthropic.
 
-## Links
-
-Repository: https://github.com/HarishanA21/agentic_context_management
-
-Issues: https://github.com/HarishanA21/agentic_context_management/issues
-
 ## License
 
 MIT

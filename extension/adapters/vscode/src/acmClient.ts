@@ -209,6 +209,15 @@ export class AcmClient {
     return this.request<AcmSavings>('GET', '/savings');
   }
 
+  // ── cost attribution + spend budget (real priced usage) ─────────────
+  cost(): Promise<AcmCost> {
+    return this.request<AcmCost>('GET', '/cost');
+  }
+
+  setBudget(body: { daily_usd?: number; hard_stop?: boolean }): Promise<AcmBudget> {
+    return this.request<AcmBudget>('POST', '/budget', body);
+  }
+
   // ── preview (dry-run the pipeline on the next request) ──────────────
   preview(conv = ''): Promise<AcmPreview> {
     const q = conv ? `?conv=${encodeURIComponent(conv)}` : '';
@@ -461,6 +470,54 @@ export interface AcmSavings {
   cost_per_mtok: number;
   by_technique: Record<string, number>;
   conversations: AcmSavingsRow[];
+}
+
+// Live spend-cap state (the daily USD budget + where today's spend stands).
+export interface AcmBudget {
+  daily_usd: number;
+  hard_stop: boolean;
+  warn_frac: number;
+  spent_today: number;
+  pct: number;
+  over: boolean;
+  over_warn: boolean;
+  enabled: boolean;
+}
+
+export interface AcmCostTotals {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cached_tokens: number;
+  cost_usd: number;
+  turns: number;
+}
+
+export interface AcmCostProjectRow {
+  project: string;
+  cost_usd: number;
+  total_tokens: number;
+  turns: number;
+  chats: number;
+}
+
+export interface AcmCostChatRow {
+  conversation: string;
+  title: string;
+  project: string;
+  cost_usd: number;
+  total_tokens: number;
+  turns: number;
+  last_ts: number | null;
+}
+
+// Real priced spend, attributed per project + per chat, plus budget state.
+export interface AcmCost {
+  totals: AcmCostTotals;
+  spent_today: number;
+  projects: AcmCostProjectRow[];
+  conversations: AcmCostChatRow[];
+  budget: AcmBudget;
 }
 
 export interface AcmTrainingSummary {
