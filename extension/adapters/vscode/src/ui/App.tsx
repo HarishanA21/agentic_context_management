@@ -146,7 +146,7 @@ function splitUserParts(text: string): CtxPart[] {
   return merged;
 }
 
-const TABS = ['Overview', 'Savings', 'Chats', 'Techniques', 'Providers', 'Memory', 'Training'];
+const TABS = ['Overview', 'Chats', 'Techniques', 'Providers', 'Memory'];
 
 // Per-label colour for relevance suggestion cards (theme-agnostic alpha fills).
 const LABEL_STYLE: Record<string, { bg: string; fg: string; label: string }> = {
@@ -175,6 +175,19 @@ const TECHS = [
   { key: 'subagent', name: 'Sub-agents', desc: 'Delegate heavy sub-tasks to an isolated agent; only its summary returns to the main chat.', params: [] as string[][] },
   { key: 'jit_tools', name: 'JIT tools', desc: 'Load files on demand (find, grep, read-slice) instead of dumping everything up front.', params: [] as string[][] },
 ];
+
+// The ACM mark: a filled, layered "context stack" glyph. Filled (not just
+// stroked) so it reads clearly at 22px in both light and dark side-bars, and
+// tinted with the accent so it matches the rest of the header chrome.
+function AcmLogo() {
+  return (
+    <svg className="logo" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-label="ACM">
+      <path d="M12 2.5 21.5 7 12 11.5 2.5 7 12 2.5Z" fill="currentColor" opacity="0.95" />
+      <path d="M3 11.4 12 15.7l9-4.3-2-1-7 3.3-7-3.3-2 1Z" fill="currentColor" opacity="0.6" />
+      <path d="M3 15.6 12 19.9l9-4.3-2-1-7 3.3-7-3.3-2 1Z" fill="currentColor" opacity="0.35" />
+    </svg>
+  );
+}
 
 export function App() {
   const [tab, setTab] = useState('Overview');
@@ -216,13 +229,10 @@ export function App() {
   return (
     <div className="acm" data-theme={theme}>
       <header className="hd">
-        <svg className="logo" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <path d="M12 3 3 7.5 12 12l9-4.5L12 3Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
-          <path d="m3 12 9 4.5L21 12M3 16.5l9 4.5 9-4.5" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
-        </svg>
+        <AcmLogo />
         <div style={{ minWidth: 0 }}>
-          <div className="title">ACM Context Management</div>
-          <div className="sub">{status?.upstream || 'local gateway'}</div>
+          <div className="title">ACM</div>
+          <div className="sub">Agentic Context Management</div>
         </div>
         <div className="right">
           <button className="theme-btn" title={`Theme: ${theme} (click to change)`} onClick={cycleTheme}>
@@ -251,12 +261,10 @@ export function App() {
 
       <main className="body">
         {tab === 'Overview' && <Overview status={status} reachable={reachable} onRefresh={poll} />}
-        {tab === 'Savings' && <Savings />}
         {tab === 'Chats' && <Chats />}
         {tab === 'Techniques' && <Techniques />}
         {tab === 'Providers' && <Providers />}
         {tab === 'Memory' && <Memory />}
-        {tab === 'Training' && <Training />}
       </main>
     </div>
   );
@@ -276,154 +284,233 @@ function Loading() {
 }
 
 // ── Overview ───────────────────────────────────────────────────────────
-function prettySurface(s: string): string {
-  if (s === 'ts_code_mode') return 'TS Code Mode';
-  if (s === 'tool_calling') return 'Tool calling';
-  return s || '—';
-}
 function hostOf(url: string): string {
   try { return new URL(url).host; } catch { return url; }
 }
 
+// Money formatter: cents matter at the low end (a few turns cost pennies), so
+// show 3 decimals under $1, 2 above. Always prefixed with $.
+function fmtUsd(n: number): string {
+  const v = Number(n || 0);
+  if (v === 0) return '$0';
+  if (v < 1) return '$' + v.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+  return '$' + v.toFixed(2);
+}
+
+// A short, human name for a project path: its last folder. "(unknown)" and ""
+// (no cwd captured) both read as "Unattributed".
+function projectName(p: string): string {
+  if (!p || p === '(unknown)') return 'Unattributed';
+  return p.replace(/\/+$/, '').split('/').pop() || p;
+}
+
+// The daily spend cap: set a dollar limit and choose whether hitting it pauses
+// new turns (hard) or just warns (soft). This is the control that turns the cost
+// numbers into governance — a runaway agent can't quietly burn the budget.
+function BudgetControl({ budget, onSaved }: { budget: any; onSaved: () => void }) {
+  const [editing, setEditing] = useState(false);
+  const [cap, setCap] = useState(String(budget?.daily_usd || ''));
+  const [hard, setHard] = useState(!!budget?.hard_stop);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setCap(budget?.daily_usd ? String(budget.daily_usd) : '');
+    setHard(!!budget?.hard_stop);
+  }, [budget?.daily_usd, budget?.hard_stop]);
+
+  const save = async (nextCap: number, nextHard: boolean) => {
+    setBusy(true);
+    try {
+      await rpc('setBudget', { daily_usd: nextCap, hard_stop: nextHard });
+      onSaved();
+      setEditing(false);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const enabled = !!budget?.enabled;
+
+  if (!editing) {
+    return (
+      <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', marginTop: 10 }}>
+        <span className="muted tiny">
+          {enabled
+            ? <>Daily cap <strong>{fmtUsd(budget.daily_usd)}</strong> · {budget.hard_stop ? 'pauses turns when reached' : 'warns only'}</>
+            : 'No daily spend cap set'}
+        </span>
+        <button className="btn sec sm" onClick={() => setEditing(true)}>{enabled ? 'Edit cap' : 'Set a cap'}</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="card" style={{ padding: 10, marginTop: 10 }}>
+      <div className="row" style={{ gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <label className="tiny" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          Daily limit&nbsp;$
+          <input type="number" min="0" step="0.5" value={cap} style={{ width: 90 }}
+            onChange={(e) => setCap(e.target.value)} placeholder="0 = off" />
+        </label>
+        <label className="row tiny" style={{ gap: 6, alignItems: 'center' }}>
+          <input type="checkbox" checked={hard} onChange={(e) => setHard(e.target.checked)} />
+          Pause new turns when reached
+        </label>
+      </div>
+      <div className="row" style={{ gap: 6, marginTop: 8 }}>
+        <button className="btn sm" disabled={busy} onClick={() => save(Number(cap) || 0, hard)}>Save</button>
+        <button className="btn ghost sm" disabled={busy} onClick={() => setEditing(false)}>Cancel</button>
+        {Number(cap) > 0 && (
+          <button className="btn ghost sm" disabled={busy} onClick={() => save(0, false)}>Remove cap</button>
+        )}
+      </div>
+      <p className="muted tiny" style={{ marginTop: 6 }}>
+        Spend is measured from real, priced usage per model, reset at local midnight.
+      </p>
+    </div>
+  );
+}
+
+// Overview, rebuilt around the question a developer actually asks daily: "what
+// is my AI costing me, and what is ACM saving me?" Spend + budget lead; the
+// context savings ACM earns come second; a compact status line closes it. No
+// event log, no routing internals — those live in their own tabs.
 function Overview({ status, reachable, onRefresh }: any) {
-  if (reachable === false) return <p className="muted">Gateway offline — start it to see status.</p>;
+  const [cost, setCost] = useState<any>(null);
+  const [savings, setSavings] = useState<any>(null);
+  const [n, reload] = useReload();
+
+  useEffect(() => {
+    rpc('cost').then(setCost).catch(() => setCost(null));
+    rpc('savings').then(setSavings).catch(() => setSavings(null));
+  }, [n]);
+  // Every proxied turn changes spend + savings — keep the dashboard live.
+  useAcmEvents(useCallback(() => reload(), [reload]));
+
+  const refresh = () => { onRefresh?.(); reload(); };
+
+  if (reachable === false) return <p className="muted">Gateway offline — start it to see your spend and savings.</p>;
   if (!status) return <Loading />;
+
   const tech = status.techniques || {};
   const on = (v: any) => v && v !== 'off';
   const activeCount = Object.values(tech).filter(on).length;
-  const events = (status.last_events || []).slice(-12).reverse();
-
-  const ctx = status.context || {};
-  const live = Number(ctx.tokens || 0);
-  const saved = Number(ctx.saved_tokens || 0);
   const notices: any[] = status.notices || [];
-  const orig = live + saved;
-  const livePct = orig > 0 ? Math.max(2, Math.round((live / orig) * 100)) : 100;
-  const savedPct = orig > 0 ? Math.round((saved / orig) * 100) : 0;
+
+  const budget = cost?.budget || {};
+  const totals = cost?.totals || {};
+  const spentToday = Number(cost?.spent_today || 0);
+  const allTime = Number(totals.cost_usd || 0);
+  const projects: any[] = (cost?.projects || []).filter((p: any) => Number(p.cost_usd) > 0).slice(0, 6);
+
+  const savedTok = Number(savings?.total_freed_tokens || 0);
+  const savedUsd = Number(savings?.total_cost_saved || 0);
+
+  // Budget bar geometry — only when a cap is set.
+  const capPct = budget.enabled ? Math.min(100, Number(budget.pct || 0)) : 0;
+  const barColor = budget.over ? 'var(--bad, #e06c6c)' : budget.over_warn ? 'var(--warn, #d2a03c)' : 'var(--accent)';
+  const maxProj = projects.reduce((m, p) => Math.max(m, Number(p.cost_usd)), 0) || 1;
 
   return (
     <div>
       {/* Degraded-mode notices — config gaps that silently weaken ACM */}
       {notices.length > 0 && (
         <div className="notices">
-          {notices.map((n: any, i: number) => (
-            <div key={i} className={'notice ' + (n.level === 'error' ? 'error' : 'warn')}>
+          {notices.map((nn: any, i: number) => (
+            <div key={i} className={'notice ' + (nn.level === 'error' ? 'error' : 'warn')}>
               <span className="notice-dot" />
-              <span>{n.message}</span>
+              <span>{nn.message}</span>
             </div>
           ))}
         </div>
       )}
 
-      {/* Context gauge — the headline number for a context-management tool */}
+      {/* Headline: today's spend, against the cap if one is set */}
       <div className="card" style={{ padding: 14 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
           <div style={{ minWidth: 0 }}>
             <div style={{ fontSize: 26, fontWeight: 700, lineHeight: 1.1 }}>
-              {fmtTok(live)}
-              <span className="muted" style={{ fontSize: 13, fontWeight: 400 }}> tokens in context</span>
+              {fmtUsd(spentToday)}
+              <span className="muted" style={{ fontSize: 13, fontWeight: 400 }}> spent today</span>
             </div>
             <div className="muted tiny" style={{ marginTop: 3 }}>
-              {(ctx.messages || 0)} message{(ctx.messages || 0) === 1 ? '' : 's'}
-              {ctx.dropped ? ` · ${ctx.dropped} removed` : ''}
-              {ctx.conversation ? ` · ${ctx.conversation}` : ' · no conversation yet'}
+              {fmtUsd(allTime)} all-time · {Number(totals.turns || 0)} turn{Number(totals.turns) === 1 ? '' : 's'} · {fmtTok(Number(totals.total_tokens || 0))} tokens
             </div>
           </div>
-          {saved > 0 && (
-            <span className="badge context" title="Tokens ACM has trimmed from this conversation">
-              −{fmtTok(saved)} saved
+          {budget.enabled && (
+            <span className="badge" style={{ color: barColor }} title="Today's spend against your daily cap">
+              {budget.pct}% of {fmtUsd(budget.daily_usd)}
             </span>
           )}
         </div>
 
-        {/* live vs saved bar (only meaningful once ACM has trimmed something) */}
-        {saved > 0 && (
+        {budget.enabled && (
           <>
-            <div style={{ display: 'flex', height: 8, borderRadius: 5, overflow: 'hidden', marginTop: 12, background: 'rgba(127,127,127,0.18)' }}>
-              <div style={{ width: livePct + '%', background: 'var(--accent)' }} title={`${fmtTok(live)} live`} />
-              <div style={{ width: savedPct + '%', background: 'rgba(138,109,59,0.8)' }} title={`${fmtTok(saved)} saved`} />
+            <div style={{ height: 8, borderRadius: 5, overflow: 'hidden', marginTop: 12, background: 'rgba(127,127,127,0.18)' }}>
+              <div style={{ width: capPct + '%', height: '100%', background: barColor }} />
             </div>
-            <div className="muted tiny" style={{ display: 'flex', justifyContent: 'space-between', marginTop: 5 }}>
-              <span>● live {fmtTok(live)} ({livePct}%)</span>
-              <span>● saved {fmtTok(saved)} ({savedPct}%)</span>
+            {budget.over && (
+              <div className="tiny" style={{ marginTop: 6, color: 'var(--bad, #e06c6c)' }}>
+                Daily cap reached.{budget.hard_stop ? ' New turns are paused until you raise or clear the cap.' : ' (warning only — turns still run.)'}
+              </div>
+            )}
+          </>
+        )}
+
+        <BudgetControl budget={budget} onSaved={reload} />
+      </div>
+
+      {/* Where the money goes — cost per project */}
+      {projects.length > 0 && (
+        <>
+          <h3 className="sec">Spend by project</h3>
+          <div className="card">
+            {projects.map((p: any) => (
+              <div key={p.project} style={{ marginBottom: 8 }}>
+                <div className="row" style={{ justifyContent: 'space-between' }}>
+                  <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={p.project || 'unattributed'}>
+                    {projectName(p.project)}
+                  </span>
+                  <span className="muted tiny" style={{ whiteSpace: 'nowrap' }}>{fmtUsd(p.cost_usd)} · {p.chats} chat{p.chats === 1 ? '' : 's'}</span>
+                </div>
+                <div style={{ height: 6, borderRadius: 4, overflow: 'hidden', background: 'rgba(127,127,127,0.18)', marginTop: 4 }}>
+                  <div style={{ width: Math.max(2, Math.round((Number(p.cost_usd) / maxProj) * 100)) + '%', height: '100%', background: 'var(--accent)' }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {/* What ACM bought back — context it trimmed (the old Savings tab) */}
+      <h3 className="sec">Context saved by ACM</h3>
+      <div className="card" style={{ padding: 14 }}>
+        {savedTok > 0 ? (
+          <>
+            <div style={{ fontSize: 22, fontWeight: 700 }}>
+              {fmtTok(savedTok)}<span className="muted" style={{ fontSize: 13, fontWeight: 400 }}> tokens trimmed</span>
+            </div>
+            <div className="muted tiny" style={{ marginTop: 3 }}>
+              across {Number(savings?.total_turns || 0)} turn{Number(savings?.total_turns) === 1 ? '' : 's'}
+              {savedUsd > 0 ? ` · ~${fmtUsd(savedUsd)} saved` : ''}
             </div>
           </>
+        ) : (
+          <p className="muted tiny" style={{ margin: 0 }}>
+            Nothing trimmed yet. As techniques compact, evict, and summarise your chats, the tokens
+            they remove — and the money that saves — are tallied here.
+          </p>
         )}
       </div>
 
-      {/* Context budget meter — how close the live chat is to its ceiling.
-          Hidden when the budget is disabled (ACM_CONTEXT_BUDGET=0). */}
-      {Number(ctx.budget || 0) > 0 && (
-        <div className="card" style={{ padding: 12 }}>
-          <div className="row" style={{ justifyContent: 'space-between', alignItems: 'baseline' }}>
-            <span className="muted tiny">Context budget</span>
-            <span className="tiny" style={{ color: ctx.over_warn ? 'var(--warn)' : undefined }}>
-              {fmtTok(live)} / {fmtTok(Number(ctx.budget))} ({Number(ctx.budget_pct || 0)}%)
-            </span>
-          </div>
-          <div style={{ height: 8, borderRadius: 5, overflow: 'hidden', marginTop: 8, background: 'rgba(127,127,127,0.18)' }}>
-            <div
-              style={{
-                width: Math.min(100, Number(ctx.budget_pct || 0)) + '%',
-                height: '100%',
-                background: ctx.over_warn ? 'var(--warn)' : 'var(--accent)',
-              }}
-            />
-          </div>
-          {ctx.over_warn && (
-            <div className="muted tiny" style={{ marginTop: 6 }}>
-              Nearing the window limit — prune or summarize this chat to avoid an overflow.
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Active techniques — only what's on; the full list lives in the Techniques tab */}
-      <h3 className="sec">Active techniques <span className="muted tiny">({activeCount} on)</span></h3>
-      {activeCount === 0 ? (
-        <p className="muted tiny">Nothing enabled — turn techniques on in the Techniques tab.</p>
-      ) : (
-        <div className="chips">
-          {Object.entries(tech).filter(([, v]) => on(v)).map(([k, v]) => (
-            <span key={k} className="chip on">
-              <span className="dot ok" />{k}{typeof v === 'string' && v !== 'off' ? ': ' + v : ''}
-            </span>
-          ))}
-        </div>
-      )}
-
-      {/* Connection / routing — one compact line, full paths on hover */}
+      {/* One compact status line: what's active + routing, no internals dump */}
       <p className="muted tiny" style={{ marginTop: 12 }}>
-        <span className="dot ok" /> <code title={status.upstream}>{hostOf(status.upstream)}</code>
+        <span className="dot ok" /> {activeCount} technique{activeCount === 1 ? '' : 's'} active
         {' · '}{status.providers?.default || 'env fallback'}
-        {' · '}{prettySurface(status.tool_surface)}
-        {' · '}<code title={status.config_path}>{String(status.config_path || '').split('/').pop()}</code>
+        {' · '}<code title={status.upstream}>{hostOf(status.upstream)}</code>
       </p>
 
-      <details style={{ marginTop: 8 }}>
-        <summary className="muted tiny" style={{ cursor: 'pointer' }}>Recent activity</summary>
-        {events.length === 0 ? (
-          <p className="muted tiny">No edits yet. Route an IDE chat through the gateway to see techniques fire.</p>
-        ) : (
-          <ul className="timeline">
-            {events.map((e: any, i: number) => (
-              <li key={i}>
-                <span className={'t' + (e.type === 'notice' ? ' ' + (e.level === 'error' ? 'error' : 'warn') : '')}>{e.type === 'notice' ? (e.step || 'notice') : e.type}</span>
-                <span className="muted tiny">
-                  {e.type === 'notice' ? e.message : ''}
-                  {e.freed_tokens ? `freed ~${e.freed_tokens} tok` : ''}
-                  {e.cleared ? ` · cleared ${e.cleared}` : ''}
-                  {e.removed ? ` · removed ${e.removed}` : ''}
-                  {e.rasterised ? ` · rasterised ${e.rasterised}` : ''}
-                  {e.compacted ? ` · compacted ${e.compacted}` : ''}
-                </span>
-                <span className="muted tiny" style={{ marginLeft: 'auto' }}>{e.ts ? rel(e.ts) : ''}</span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </details>
-      <p style={{ marginTop: 12 }}><button className="btn sec sm" onClick={onRefresh}>Refresh</button></p>
+      <p style={{ marginTop: 10 }}><button className="btn sec sm" onClick={refresh}>Refresh</button></p>
     </div>
   );
 }
@@ -433,119 +520,6 @@ function profileLabel(w: any): string {
   if (w && w.profile_source === 'preset') return w.profile_name || 'preset';
   if (w && w.profile_source === 'body') return 'custom';
   return 'default';
-}
-
-// ── Savings ────────────────────────────────────────────────────────────────
-// The receipts: what ACM actually removed from your context, aggregated from the
-// freed_tokens every technique reports. Per-chat and all-time, surviving restarts.
-const TECH_LABEL: Record<string, string> = {
-  visual_method: 'Visual method',
-  tool_result_trimming: 'Tool trimming',
-  image_eviction: 'Image eviction',
-  summarization: 'Summarization',
-  sliding_window: 'Sliding window',
-};
-
-function Savings() {
-  const [data, setData] = useState<any>(null);
-  const [loading, setLoading] = useState(true);
-  const [n, reload] = useReload();
-
-  useEffect(() => {
-    rpc('savings').then((d: any) => { setData(d); setLoading(false); })
-      .catch(() => setLoading(false));
-  }, [n]);
-
-  // Every turn frees more tokens — keep the dashboard live.
-  useAcmEvents(useCallback(() => reload(), [reload]));
-
-  const resetAll = async () => {
-    await rpc('savingsReset', {}).catch(() => {});
-    reload();
-  };
-
-  if (loading) return <p className="muted tiny">Loading savings…</p>;
-  const d = data || {};
-  const total = Number(d.total_freed_tokens || 0);
-  const rows: any[] = d.conversations || [];
-  const byTech: Record<string, number> = d.by_technique || {};
-  const cost = Number(d.total_cost_saved || 0);
-  const maxRow = rows.reduce((m, r) => Math.max(m, Number(r.freed_tokens || 0)), 0) || 1;
-
-  if (total === 0) {
-    return (
-      <div>
-        <div className="card" style={{ padding: 14 }}>
-          <div className="muted tiny">Tokens saved so far</div>
-          <div style={{ fontSize: 30, fontWeight: 700, marginTop: 4 }}>0</div>
-          <p className="muted tiny" style={{ marginTop: 8 }}>
-            No savings recorded yet. As techniques trim, evict, and summarise your
-            chats, the tokens they remove are tallied here — per chat and all-time.
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div>
-      {/* Headline: the one number that says what ACM bought you */}
-      <div className="card" style={{ padding: 14 }}>
-        <div className="muted tiny">Tokens saved (all-time)</div>
-        <div style={{ fontSize: 30, fontWeight: 700, marginTop: 4 }}>{fmtTok(total)}</div>
-        <div className="muted tiny" style={{ marginTop: 4 }}>
-          across {d.total_turns || 0} turn{d.total_turns === 1 ? '' : 's'}
-          {cost > 0 ? ` · ~$${cost.toFixed(2)} saved` : ''}
-        </div>
-      </div>
-
-      {/* Where the savings came from */}
-      <h3 className="sec">By technique</h3>
-      <div className="chips">
-        {Object.keys(byTech).length === 0 && <span className="muted tiny">—</span>}
-        {Object.entries(byTech)
-          .sort((a, b) => Number(b[1]) - Number(a[1]))
-          .map(([k, v]) => (
-            <span key={k} className="chip on">
-              {TECH_LABEL[k] || k} · {fmtTok(Number(v))}
-            </span>
-          ))}
-      </div>
-
-      {/* Per-chat leaderboard */}
-      <h3 className="sec">By chat</h3>
-      <ul className="timeline">
-        {rows.map((r: any) => {
-          const freed = Number(r.freed_tokens || 0);
-          const pct = Math.round((freed / maxRow) * 100);
-          return (
-            <li key={r.conversation}>
-              <span
-                className="t"
-                style={{ cursor: 'pointer' }}
-                title={r.conversation}
-                onClick={() => openChat(r.conversation)}
-              >
-                {r.title && r.title !== r.conversation ? r.title : shortId(r.conversation)}
-              </span>
-              <div style={{ height: 6, borderRadius: 4, overflow: 'hidden', background: 'rgba(127,127,127,0.18)', margin: '4px 0' }}>
-                <div style={{ width: pct + '%', height: '100%', background: 'var(--accent)' }} />
-              </div>
-              <span className="muted tiny">
-                {fmtTok(freed)} tok · {r.turns} turn{r.turns === 1 ? '' : 's'}
-                {r.cost_saved > 0 ? ` · ~$${Number(r.cost_saved).toFixed(2)}` : ''}
-                {r.last_ts ? ` · ${rel(r.last_ts)}` : ''}
-              </span>
-            </li>
-          );
-        })}
-      </ul>
-
-      <p style={{ marginTop: 12 }}>
-        <button className="btn ghost sm" onClick={resetAll}>Reset savings</button>
-      </p>
-    </div>
-  );
 }
 
 function Chats() {
@@ -1039,10 +1013,7 @@ export function ChatDetail({ conv }: { conv: string }) {
   return (
     <div className="acm" data-theme={theme}>
       <header className="hd">
-        <svg className="logo" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <path d="M12 3 3 7.5 12 12l9-4.5L12 3Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
-          <path d="m3 12 9 4.5L21 12M3 16.5l9 4.5 9-4.5" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
-        </svg>
+        <AcmLogo />
         <div style={{ minWidth: 0 }}>
           <div className="title">{win?.title || 'Untitled chat'}</div>
           <div className="sub" style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)' }} title={conv}>{shortId(conv)}</div>
@@ -1557,93 +1528,6 @@ function Memory() {
       <h3 className="sec">{items.length} note{items.length === 1 ? '' : 's'}</h3>
       {items.length === 0 ? <p className="muted tiny">Empty.</p> :
         items.map((it, i) => <div className="card tiny" key={i}>{it}</div>)}
-    </div>
-  );
-}
-
-// Training data export (relevance feedback → encoder + judge trainer files).
-// Every accept/reject/summarize on a pruning suggestion is logged; this turns
-// that log into the two files the FYP trainers read. Read-only summary first
-// (how much data exists, how often the user overrode the model), then export.
-function Training() {
-  const [sum, setSum] = useState<any>(null);
-  const [incl, setIncl] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [manifest, setManifest] = useState<any>(null);
-  const [n, reload] = useReload();
-
-  useEffect(() => {
-    rpc('trainingSummary', { includeModelLabels: incl }).then(setSum).catch(() => setSum(null));
-  }, [incl, n]);
-
-  const doExport = () => {
-    setBusy(true);
-    rpc('trainingExport', { includeModelLabels: incl })
-      .then((m: any) => { setManifest(m); reload(); })
-      .finally(() => setBusy(false));
-  };
-
-  const s = sum || {};
-  const counts = s.label_counts || {};
-  const gold = Number(s.gold_examples || 0);
-  const pct = Math.round(Number(s.override_rate || 0) * 100);
-
-  return (
-    <div>
-      <p className="muted tiny">
-        Turns your pruning feedback into training data — <code>encoder.jsonl</code> (relevance
-        model) and <code>judge_dpo.jsonl</code> (preference pairs). Data comes from every
-        KEEP/SUMMARIZE/DROP decision you make on suggestions.
-      </p>
-
-      {s.error ? (
-        <p className="muted tiny">Couldn't read logs: {s.error}</p>
-      ) : (
-        <div className="card" style={{ padding: 12 }}>
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
-            <span style={{ fontSize: 20, fontWeight: 700 }}>{gold}</span>
-            <span className="muted tiny">gold examples (your corrections)</span>
-          </div>
-          <div className="muted tiny" style={{ marginTop: 2 }}>
-            {s.silver_examples || 0} silver · {s.judge_pairs || 0} DPO pairs · {pct}% of
-            comparable episodes overrode the model
-          </div>
-          <div className="row" style={{ gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
-            {['KEEP', 'SUMMARIZE', 'DROP'].map((k) => (
-              <span key={k} className="badge tiny">{k}: {counts[k] || 0}</span>
-            ))}
-          </div>
-        </div>
-      )}
-
-      <label className="row tiny" style={{ gap: 6, marginTop: 10, alignItems: 'center' }}>
-        <input type="checkbox" checked={incl} onChange={(e) => setIncl(e.target.checked)} />
-        Include model's own labels as silver examples (cold-start, before enough corrections)
-      </label>
-
-      <div className="row" style={{ marginTop: 10 }}>
-        <button className="btn" disabled={busy || gold === 0} onClick={doExport}>
-          {busy ? 'Exporting…' : 'Export training files'}
-        </button>
-        <button className="btn ghost sm" onClick={reload}>Refresh</button>
-      </div>
-      {gold === 0 && (
-        <p className="muted tiny" style={{ marginTop: 6 }}>
-          No corrections logged yet — accept or reject some pruning suggestions first.
-        </p>
-      )}
-
-      {manifest && manifest.ok && (
-        <div className="card tiny" style={{ marginTop: 10 }}>
-          <div>Wrote {manifest.encoder_examples} encoder rows + {manifest.judge_pairs} DPO pairs to:</div>
-          <div style={{ fontFamily: 'var(--vscode-editor-font-family, monospace)', marginTop: 4 }}>
-            {manifest.encoder_path}<br />{manifest.judge_path}
-          </div>
-        </div>
-      )}
-      {manifest && manifest.error && (
-        <p className="muted tiny" style={{ marginTop: 6 }}>Export failed: {manifest.error}</p>
-      )}
     </div>
   );
 }

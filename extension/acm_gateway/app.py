@@ -69,7 +69,9 @@ from .droplist import (
 from .pipeline import run_pipeline
 from .timeline import TimelineStore
 from .providers_store import ProviderStore
-from .savings import SavingsLedger
+from .savings import SavingsLedger, _SAVING_TYPES
+from .usage import UsageLedger
+from .budgets import BudgetStore, local_day_start
 from . import training_export
 from . import paths
 from .translate import lc_to_openai, openai_to_lc
@@ -89,6 +91,8 @@ _LAST_EVENTS: List[Dict[str, Any]] = []
 _MEMORY = MemoryStore()
 _DROP = DropStore()
 _SAVINGS = SavingsLedger()
+_USAGE = UsageLedger()
+_BUDGET = BudgetStore()
 _TIMELINE = TimelineStore()
 _PROVIDERS = ProviderStore()
 _WINDOWS = ContextWindowStore()
@@ -281,6 +285,29 @@ def _record(events: List[Dict[str, Any]]) -> None:
     _LAST_EVENTS = _LAST_EVENTS[-100:]
     if _SETTINGS.log_events:
         print(f"[acm-gateway] fired: {json.dumps(events)[:500]}", flush=True)
+
+
+def _record_usage(
+    conv: str, *, model: str, surface: str, data: Any, events: List[Dict[str, Any]]
+) -> None:
+    """Record real upstream usage for the eval ledger. Never breaks a live turn.
+
+    ``data`` is the raw (non-stream) provider response JSON; its ``usage`` block
+    is normalized + priced. ``events`` are this turn's pipeline events, from
+    which we lift the technique types (the eval arm) and freed tokens."""
+    try:
+        techniques = [e["type"] for e in events if e.get("type") in _SAVING_TYPES]
+        freed = sum(int(e.get("freed_tokens", 0) or 0) for e in events)
+        _USAGE.record(
+            conv,
+            model=model,
+            surface=surface,
+            raw_usage=(data or {}).get("usage") if isinstance(data, dict) else None,
+            techniques=techniques,
+            freed_tokens=freed,
+        )
+    except Exception as e:  # telemetry must never break a request
+        _notice("usage", f"couldn't record real usage: {e!s}")
 
 
 def _notice(step: str, message: str, level: str = "warn") -> None:
@@ -481,6 +508,108 @@ async def savings_reset(request: Request) -> Dict[str, Any]:
     else:
         _SAVINGS.clear_all()
     return {"ok": True}
+
+
+@app.get("/usage")
+def usage() -> Dict[str, Any]:
+    """Real upstream usage + priced cost per conversation (the eval anchor).
+
+    Unlike ``/savings`` (estimated freed tokens) this reflects the actual tokens
+    the provider billed, from each response's ``usage`` block, priced per-model."""
+    titles = {c["key"]: c["title"] for c in _DROP.conversations()}
+    return _USAGE.summary(titles=titles)
+
+
+@app.post("/usage/reset")
+async def usage_reset(request: Request) -> Dict[str, Any]:
+    """Clear the usage ledger, or one conversation with ``{"conversation": key}``."""
+    body: Dict[str, Any] = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    conv = body.get("conversation")
+    if conv:
+        _USAGE.forget(conv)
+    else:
+        _USAGE.clear_all()
+    return {"ok": True}
+
+
+def _cost_rollup() -> Dict[str, Any]:
+    """Cost attribution + live budget state — the Overview's headline data.
+
+    Joins the usage ledger (real priced cost per chat) to the window registry
+    (titles + the project each chat belongs to) so spend rolls up per project,
+    and layers today's spend against the user's daily cap."""
+    windows = {w["id"]: w for w in _WINDOWS.list()}
+    titles = {cid: (w.get("title") or cid) for cid, w in windows.items()}
+    projects = {cid: w.get("project", "") for cid, w in windows.items()}
+    last_ts = {cid: w.get("last_seen") for cid, w in windows.items()}
+    since = local_day_start()
+    roll = _USAGE.rollup(
+        titles=titles, projects=projects, last_ts=last_ts, since_ts=since
+    )
+    roll["budget"] = _BUDGET.state(roll.get("spent_today", 0.0))
+    return roll
+
+
+@app.get("/cost")
+def cost() -> Dict[str, Any]:
+    """Real priced spend, attributed per project + per chat, with budget state."""
+    return _cost_rollup()
+
+
+@app.get("/budget")
+def get_budget() -> Dict[str, Any]:
+    """The user's spend cap + today's spend against it."""
+    return _BUDGET.state(_USAGE.spent_since(local_day_start()))
+
+
+@app.post("/budget")
+async def set_budget(request: Request) -> Dict[str, Any]:
+    """Update the daily cap / hard-stop switch. Body: ``{daily_usd, hard_stop}``."""
+    body: Dict[str, Any] = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    _BUDGET.set(
+        daily_usd=body.get("daily_usd"),
+        hard_stop=body.get("hard_stop"),
+        warn_frac=body.get("warn_frac"),
+    )
+    return _BUDGET.state(_USAGE.spent_since(local_day_start()))
+
+
+def _budget_block() -> Optional[JSONResponse]:
+    """If a hard daily cap is set and already met, refuse a new turn with 429.
+
+    Enforcement is intentionally coarse: we stop the *next* turn once today's
+    real spend has reached the cap, rather than trying to predict this turn's
+    cost. Soft budgets (hard_stop off) never block — they only colour the UI."""
+    st = _BUDGET.state(_USAGE.spent_since(local_day_start()))
+    if st.get("enabled") and st.get("hard_stop") and st.get("over"):
+        _notice(
+            "budget",
+            f"Daily budget of ${st['daily_usd']:.2f} reached "
+            f"(${st['spent_today']:.2f} spent) — new turns are paused.",
+            level="error",
+        )
+        return JSONResponse(
+            {
+                "error": {
+                    "type": "acm_budget_exceeded",
+                    "message": (
+                        f"ACM daily budget of ${st['daily_usd']:.2f} reached "
+                        f"(${st['spent_today']:.2f} spent today). Raise or clear "
+                        "the cap in the ACM Overview to continue."
+                    ),
+                }
+            },
+            status_code=429,
+        )
+    return None
 
 
 def _pick_summariser(model: str | None):
@@ -1410,6 +1539,11 @@ async def chat_completions(request: Request) -> Any:
                 payload = {"error": {"message": e.response.text[:1000]}}
             return JSONResponse(payload, status_code=e.response.status_code)
 
+    # Hard spend cap: refuse a new turn once today's real spend hits the budget.
+    blocked = _budget_block()
+    if blocked is not None:
+        return blocked
+
     # Resolve the chat (context window) + its per-chat profile before anything,
     # scoped to the project (cwd) the client is running in.
     conv = _conv_key(request, lc_messages, body)
@@ -1516,6 +1650,10 @@ async def chat_completions(request: Request) -> Any:
             except Exception:
                 payload = {"error": {"message": e.response.text[:1000]}}
             return JSONResponse(payload, status_code=e.response.status_code)
+    _record_usage(
+        conv, model=body.get("model", ""), surface="openai",
+        data=data, events=pipeline_events,
+    )
     return JSONResponse(data)
 
 
@@ -1604,6 +1742,11 @@ async def anthropic_messages(request: Request) -> Any:
     # "count"/"quota" chat, and any rewrite would corrupt the count it measures.
     if _is_probe(body):
         return await _forward_anthropic_untouched(request, body, orig_system)
+
+    # Hard spend cap: refuse a new turn once today's real spend hits the budget.
+    blocked = _budget_block()
+    if blocked is not None:
+        return blocked
 
     # Which chat is this? Resolve its context window + per-chat profile, and
     # auto-create the window on first sight (inheriting the global default),
@@ -1782,4 +1925,8 @@ async def anthropic_messages(request: Request) -> Any:
             except Exception:
                 payload = {"error": {"message": e.response.text[:1000]}}
             return JSONResponse(payload, status_code=e.response.status_code)
+    _record_usage(
+        conv, model=body.get("model", ""), surface="anthropic",
+        data=data, events=pipeline_events,
+    )
     return JSONResponse(data)

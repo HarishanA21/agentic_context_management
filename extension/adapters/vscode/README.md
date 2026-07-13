@@ -84,12 +84,6 @@ Want to run the gateway yourself? Set `acm.manageGateway` to `false` and start y
 
 The extension is also on **Open VSX**, so it installs in **Cursor**, **Antigravity**, and **Windsurf**. For any IDE that allows a custom endpoint, point it at `http://127.0.0.1:8807/v1`.
 
-## Links
-
-Repository: https://github.com/HarishanA21/agentic_context_management
-
-Issues: https://github.com/HarishanA21/agentic_context_management/issues
-
 ## License
 
 MIT

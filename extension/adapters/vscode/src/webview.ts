@@ -91,6 +91,10 @@ async function dispatch(client: AcmClient, method: string, params: any): Promise
       return client.savings();
     case 'savingsReset':
       return client.savingsReset(p.conv || '');
+    case 'cost':
+      return client.cost();
+    case 'setBudget':
+      return client.setBudget({ daily_usd: p.daily_usd, hard_stop: p.hard_stop });
     case 'preview':
       return client.preview(p.conv || '');
     case 'undoStatus':
