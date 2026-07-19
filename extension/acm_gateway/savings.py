@@ -14,7 +14,6 @@ never re-derive it from the (lossy, capped) event log."""
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
