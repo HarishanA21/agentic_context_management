@@ -40,6 +40,10 @@ _FIELDS: Dict[str, Any] = {
     "messages": 0,          # last-known message count
     "pinned": False,
     "status": "active",     # "active" | "archived"
+    # Visual-method "after enable" marker: fingerprints of tool messages that
+    # existed when visual method turned on for this chat — those stay text.
+    "visual_before_fps": None,
+    "visual_enabled_at": 0.0,
 }
 
 
@@ -165,6 +169,21 @@ class ContextWindowStore:
             row.pop("profile_body", None)
             self._save()
         return self._row(conv)
+
+    # ── visual-method marker ─────────────────────────────────────────────
+    def set_visual_marker(self, conv: str, fps: List[str]) -> None:
+        """Snapshot which tool messages predate visual method for this chat."""
+        row = self._data.setdefault(conv, {"created_at": _now(), "last_seen": _now()})
+        row["visual_before_fps"] = list(fps)
+        row["visual_enabled_at"] = _now()
+        self._save()
+
+    def clear_visual_marker(self, conv: str) -> None:
+        row = self._data.get(conv)
+        if row is not None and row.get("visual_before_fps") is not None:
+            row["visual_before_fps"] = None
+            row["visual_enabled_at"] = 0.0
+            self._save()
 
     def rename(self, conv: str, title: str) -> Dict[str, Any]:
         row = self._data.setdefault(conv, {"created_at": _now(), "last_seen": _now()})

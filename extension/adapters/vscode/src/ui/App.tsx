@@ -146,7 +146,7 @@ function splitUserParts(text: string): CtxPart[] {
   return merged;
 }
 
-const TABS = ['Overview', 'Chats', 'Techniques', 'Providers', 'Memory'];
+const TABS = ['Chats', 'Savings', 'Techniques', 'Providers', 'Memory'];
 
 // Per-label colour for relevance suggestion cards (theme-agnostic alpha fills).
 const LABEL_STYLE: Record<string, { bg: string; fg: string; label: string }> = {
@@ -190,7 +190,7 @@ function AcmLogo() {
 }
 
 export function App() {
-  const [tab, setTab] = useState('Overview');
+  const [tab, setTab] = useState('Chats');
   const [status, setStatus] = useState<any>(null);
   const [reachable, setReachable] = useState<boolean | null>(null);
   const [theme, setTheme] = useState<Theme>(() => (getState().theme as Theme) || 'auto');
@@ -260,8 +260,8 @@ export function App() {
       </nav>
 
       <main className="body">
-        {tab === 'Overview' && <Overview status={status} reachable={reachable} onRefresh={poll} />}
         {tab === 'Chats' && <Chats />}
+        {tab === 'Savings' && <Savings status={status} reachable={reachable} onRefresh={poll} />}
         {tab === 'Techniques' && <Techniques />}
         {tab === 'Providers' && <Providers />}
         {tab === 'Memory' && <Memory />}
@@ -375,16 +375,26 @@ function BudgetControl({ budget, onSaved }: { budget: any; onSaved: () => void }
 // is my AI costing me, and what is ACM saving me?" Spend + budget lead; the
 // context savings ACM earns come second; a compact status line closes it. No
 // event log, no routing internals — those live in their own tabs.
-function Overview({ status, reachable, onRefresh }: any) {
-  const [cost, setCost] = useState<any>(null);
+const TECHNIQUE_LABEL: Record<string, string> = {
+  visual_method: 'Visual method',
+  tool_result_trimming: 'Tool result trimming',
+  image_eviction: 'Image eviction',
+  summarization: 'Summarization',
+  sliding_window: 'Sliding window',
+};
+
+function techLabel(t: string): string {
+  return TECHNIQUE_LABEL[t] || t;
+}
+
+function Savings({ status, reachable, onRefresh }: any) {
   const [savings, setSavings] = useState<any>(null);
   const [n, reload] = useReload();
 
   useEffect(() => {
-    rpc('cost').then(setCost).catch(() => setCost(null));
     rpc('savings').then(setSavings).catch(() => setSavings(null));
   }, [n]);
-  // Every proxied turn changes spend + savings — keep the dashboard live.
+  // Every proxied turn changes savings — keep the dashboard live.
   useAcmEvents(useCallback(() => reload(), [reload]));
 
   const refresh = () => { onRefresh?.(); reload(); };
@@ -397,19 +407,9 @@ function Overview({ status, reachable, onRefresh }: any) {
   const activeCount = Object.values(tech).filter(on).length;
   const notices: any[] = status.notices || [];
 
-  const budget = cost?.budget || {};
-  const totals = cost?.totals || {};
-  const spentToday = Number(cost?.spent_today || 0);
-  const allTime = Number(totals.cost_usd || 0);
-  const projects: any[] = (cost?.projects || []).filter((p: any) => Number(p.cost_usd) > 0).slice(0, 6);
-
   const savedTok = Number(savings?.total_freed_tokens || 0);
   const savedUsd = Number(savings?.total_cost_saved || 0);
-
-  // Budget bar geometry — only when a cap is set.
-  const capPct = budget.enabled ? Math.min(100, Number(budget.pct || 0)) : 0;
-  const barColor = budget.over ? 'var(--bad, #e06c6c)' : budget.over_warn ? 'var(--warn, #d2a03c)' : 'var(--accent)';
-  const maxProj = projects.reduce((m, p) => Math.max(m, Number(p.cost_usd)), 0) || 1;
+  const table: any[] = savings?.by_technique_table || [];
 
   return (
     <div>
@@ -425,70 +425,12 @@ function Overview({ status, reachable, onRefresh }: any) {
         </div>
       )}
 
-      {/* Headline: today's spend, against the cap if one is set */}
-      <div className="card" style={{ padding: 14 }}>
-        <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
-          <div style={{ minWidth: 0 }}>
-            <div style={{ fontSize: 26, fontWeight: 700, lineHeight: 1.1 }}>
-              {fmtUsd(spentToday)}
-              <span className="muted" style={{ fontSize: 13, fontWeight: 400 }}> spent today</span>
-            </div>
-            <div className="muted tiny" style={{ marginTop: 3 }}>
-              {fmtUsd(allTime)} all-time · {Number(totals.turns || 0)} turn{Number(totals.turns) === 1 ? '' : 's'} · {fmtTok(Number(totals.total_tokens || 0))} tokens
-            </div>
-          </div>
-          {budget.enabled && (
-            <span className="badge" style={{ color: barColor }} title="Today's spend against your daily cap">
-              {budget.pct}% of {fmtUsd(budget.daily_usd)}
-            </span>
-          )}
-        </div>
-
-        {budget.enabled && (
-          <>
-            <div style={{ height: 8, borderRadius: 5, overflow: 'hidden', marginTop: 12, background: 'rgba(127,127,127,0.18)' }}>
-              <div style={{ width: capPct + '%', height: '100%', background: barColor }} />
-            </div>
-            {budget.over && (
-              <div className="tiny" style={{ marginTop: 6, color: 'var(--bad, #e06c6c)' }}>
-                Daily cap reached.{budget.hard_stop ? ' New turns are paused until you raise or clear the cap.' : ' (warning only — turns still run.)'}
-              </div>
-            )}
-          </>
-        )}
-
-        <BudgetControl budget={budget} onSaved={reload} />
-      </div>
-
-      {/* Where the money goes — cost per project */}
-      {projects.length > 0 && (
-        <>
-          <h3 className="sec">Spend by project</h3>
-          <div className="card">
-            {projects.map((p: any) => (
-              <div key={p.project} style={{ marginBottom: 8 }}>
-                <div className="row" style={{ justifyContent: 'space-between' }}>
-                  <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={p.project || 'unattributed'}>
-                    {projectName(p.project)}
-                  </span>
-                  <span className="muted tiny" style={{ whiteSpace: 'nowrap' }}>{fmtUsd(p.cost_usd)} · {p.chats} chat{p.chats === 1 ? '' : 's'}</span>
-                </div>
-                <div style={{ height: 6, borderRadius: 4, overflow: 'hidden', background: 'rgba(127,127,127,0.18)', marginTop: 4 }}>
-                  <div style={{ width: Math.max(2, Math.round((Number(p.cost_usd) / maxProj) * 100)) + '%', height: '100%', background: 'var(--accent)' }} />
-                </div>
-              </div>
-            ))}
-          </div>
-        </>
-      )}
-
-      {/* What ACM bought back — context it trimmed (the old Savings tab) */}
-      <h3 className="sec">Context saved by ACM</h3>
+      {/* Total saving, front and center */}
       <div className="card" style={{ padding: 14 }}>
         {savedTok > 0 ? (
           <>
-            <div style={{ fontSize: 22, fontWeight: 700 }}>
-              {fmtTok(savedTok)}<span className="muted" style={{ fontSize: 13, fontWeight: 400 }}> tokens trimmed</span>
+            <div style={{ fontSize: 26, fontWeight: 700, lineHeight: 1.1 }}>
+              {fmtTok(savedTok)}<span className="muted" style={{ fontSize: 13, fontWeight: 400 }}> tokens saved</span>
             </div>
             <div className="muted tiny" style={{ marginTop: 3 }}>
               across {Number(savings?.total_turns || 0)} turn{Number(savings?.total_turns) === 1 ? '' : 's'}
@@ -497,11 +439,74 @@ function Overview({ status, reachable, onRefresh }: any) {
           </>
         ) : (
           <p className="muted tiny" style={{ margin: 0 }}>
-            Nothing trimmed yet. As techniques compact, evict, and summarise your chats, the tokens
-            they remove — and the money that saves — are tallied here.
+            Nothing saved yet. As techniques compact, evict, rasterise, and summarise your chats, the
+            tokens they remove — and the money that saves — are tallied here.
           </p>
         )}
       </div>
+
+      {/* Technique | Before ACM | After ACM */}
+      {table.length > 0 && (
+        <>
+          <h3 className="sec">By technique</h3>
+          <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr>
+                  <th style={{ textAlign: 'left', padding: '8px 12px', fontSize: 12, color: 'var(--muted, #888)', fontWeight: 500 }}>Technique</th>
+                  <th style={{ textAlign: 'right', padding: '8px 12px', fontSize: 12, color: 'var(--muted, #888)', fontWeight: 500 }}>Before ACM</th>
+                  <th style={{ textAlign: 'right', padding: '8px 12px', fontSize: 12, color: 'var(--muted, #888)', fontWeight: 500 }}>After ACM</th>
+                </tr>
+              </thead>
+              <tbody>
+                {table.map((r: any) => (
+                  <tr key={r.technique} style={{ borderTop: '1px solid rgba(127,127,127,0.18)' }}>
+                    <td style={{ padding: '8px 12px' }}>{techLabel(r.technique)}</td>
+                    <td style={{ padding: '8px 12px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{fmtTok(r.before_tokens)}</td>
+                    <td style={{ padding: '8px 12px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: 'var(--accent)' }}>{fmtTok(r.after_tokens)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      {/* Visual method: with/without comparison — tool-result text the model
+          would have read vs the refs text kept next to the rendered pages. */}
+      {Number(savings?.visual_method?.before_tokens || 0) > 0 && (() => {
+        const vb = Number(savings.visual_method.before_tokens || 0);
+        const va = Number(savings.visual_method.after_tokens || 0);
+        const vs = Math.max(0, vb - va);
+        const pct = vb > 0 ? Math.round((vs / vb) * 100) : 0;
+        return (
+          <>
+            <h3 className="sec">Visual method — token comparison</h3>
+            <div className="card" style={{ padding: 14 }}>
+              <div style={{ display: 'flex', gap: 24, alignItems: 'baseline', flexWrap: 'wrap' }}>
+                <div>
+                  <div className="muted tiny">Without visual method</div>
+                  <div style={{ fontSize: 20, fontWeight: 700 }}>{fmtTok(vb)}<span className="muted" style={{ fontSize: 12, fontWeight: 400 }}> tokens</span></div>
+                </div>
+                <div>
+                  <div className="muted tiny">With visual method</div>
+                  <div style={{ fontSize: 20, fontWeight: 700 }}>{fmtTok(va)}<span className="muted" style={{ fontSize: 12, fontWeight: 400 }}> tokens</span></div>
+                </div>
+                <div>
+                  <div className="muted tiny">Saved</div>
+                  <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--accent)' }}>{fmtTok(vs)} · {pct}%</div>
+                </div>
+              </div>
+              <div style={{ height: 6, borderRadius: 4, overflow: 'hidden', background: 'rgba(127,127,127,0.18)', marginTop: 10 }}>
+                <div style={{ width: Math.max(2, 100 - pct) + '%', height: '100%', background: 'var(--accent)' }} />
+              </div>
+              <p className="muted tiny" style={{ margin: '8px 0 0' }}>
+                Tool-result text tokens sent as rendered pages instead. Image vision cost is billed separately by the provider.
+              </p>
+            </div>
+          </>
+        );
+      })()}
 
       {/* One compact status line: what's active + routing, no internals dump */}
       <p className="muted tiny" style={{ marginTop: 12 }}>
@@ -1285,7 +1290,7 @@ function Cleanup({ conv: fixedConv }: { conv?: string } = {}) {
 function Techniques({ conv, onChanged }: { conv?: string; onChanged?: () => void } = {}) {
   const perChat = !!conv;
   const [prof, setProf] = useState<any>(null);
-  const [vm, setVm] = useState<any>(null); // visual method is a global axis — global tab only
+  const [vm, setVm] = useState<any>(null); // legacy top-level visual_method block, mirrored on global save
   const [presets, setPresets] = useState<any[]>([]);
   const [msg, setMsg] = useState('');
   const [n, reload] = useReload();
@@ -1312,7 +1317,15 @@ function Techniques({ conv, onChanged }: { conv?: string; onChanged?: () => void
     setMsg('saving…');
     try {
       if (perChat) { await rpc('setWindowProfile', { conv, body: prof }); onChanged?.(); }
-      else { await rpc('setProfileBody', { body: prof, visual_method: vm }); }
+      else {
+        // Mirror the profile's visual_method into the legacy top-level block so
+        // older consumers of the gateway config stay in sync.
+        const pvm = prof.context_management?.visual_method;
+        const legacy = pvm
+          ? { ...(vm || {}), enabled: !!pvm.enabled, trigger_tokens: Number(pvm.threshold_tokens ?? 500) }
+          : vm;
+        await rpc('setProfileBody', { body: prof, visual_method: legacy });
+      }
       setMsg('Saved ✓');
     }
     catch (e: any) { setMsg('Error: ' + e.message); }
@@ -1335,6 +1348,22 @@ function Techniques({ conv, onChanged }: { conv?: string; onChanged?: () => void
             </div>
           ))}
         </details>
+      )}
+      {cm.visual_method && (
+        <div className="card tech">
+          <Toggle on={!!cm.visual_method.enabled} onChange={(v) => setCM('visual_method', 'enabled', v)} />
+          <div className="meta">
+            <div className="name">Visual method</div>
+            <div className="desc">Render big tool outputs as an image the model reads, keeping URLs &amp; citations as text. Only tool calls made after enabling are converted; earlier ones stay text.</div>
+            {cm.visual_method.enabled && (
+              <div className="params">
+                <label className="field">Trigger (tokens)
+                  <input type="number" value={cm.visual_method.threshold_tokens ?? 500} onChange={(e) => setCM('visual_method', 'threshold_tokens', Number(e.target.value))} />
+                </label>
+              </div>
+            )}
+          </div>
+        </div>
       )}
       {TECHS.map((t) => (
         <div className="card tech" key={t.key}>
@@ -1405,23 +1434,6 @@ function Techniques({ conv, onChanged }: { conv?: string; onChanged?: () => void
             )}
           </div>
         </div>
-      )}
-
-      {!perChat && vm && (
-      <div className="card tech">
-        <Toggle on={!!vm.enabled} onChange={(v) => setVm({ ...vm, enabled: v })} />
-        <div className="meta">
-          <div className="name">Visual method</div>
-          <div className="desc">Render big tool outputs as an image the model reads, keeping URLs &amp; citations as text. Best for noisy, image-friendly outputs.</div>
-          {vm.enabled && (
-            <div className="params">
-              <label className="field">Trigger (tokens)
-                <input type="number" value={vm.trigger_tokens} onChange={(e) => setVm({ ...vm, trigger_tokens: Number(e.target.value) })} />
-              </label>
-            </div>
-          )}
-        </div>
-      </div>
       )}
 
       <div className="row" style={{ marginTop: 12 }}>
@@ -1555,6 +1567,31 @@ const CW_BADGE: Record<CwCat, string> = {
 // Same ~4-chars/token estimate the HUD / Overview / gateway use, kept consistent.
 const estTok = (s: string): number => (s && s.trim() ? Math.max(1, Math.ceil(s.length / 4)) : 0);
 
+// Collect image data URLs out of provider-shaped content — both the OpenAI
+// `image_url` shape and the Anthropic `image`/`source` shape (incl. inside
+// tool_result inner content). Used to render visual-method pages inline.
+function cwImages(content: any): string[] {
+  const out: string[] = [];
+  const walk = (c: any) => {
+    if (!Array.isArray(c)) return;
+    for (const b of c) {
+      if (!b || typeof b !== 'object') continue;
+      if (b.type === 'image_url') {
+        const u = typeof b.image_url === 'string' ? b.image_url : b.image_url?.url;
+        if (u) out.push(u);
+      } else if (b.type === 'image' && b.source) {
+        const s = b.source;
+        if (s.type === 'base64' && s.data) out.push(`data:${s.media_type || 'image/png'};base64,${s.data}`);
+        else if (s.type === 'url' && s.url) out.push(s.url);
+      } else if (b.type === 'tool_result') {
+        walk(b.content);
+      }
+    }
+  };
+  walk(content);
+  return out;
+}
+
 // Flatten provider-shaped content (string | block[]) to plain text/markdown.
 function cwFlatten(content: any): string {
   if (content == null) return '';
@@ -1581,8 +1618,8 @@ function cwFlatten(content: any): string {
 // which may be followed by a blank line — plus the bullet list under it).
 const CW_SKILLS_RE = /The following skills are available[^\n]*\n+(?:[ \t]*-[^\n]*\n?)+/;
 
-type CwSeg = { cat: CwCat; label: string; text: string; tokens: number };
-type CwRaw = { label: string; cls: string; text: string };
+type CwSeg = { cat: CwCat; label: string; text: string; tokens: number; images?: string[] };
+type CwRaw = { label: string; cls: string; text: string; images?: string[] };
 type CwAnalysis = {
   segments: CwSeg[];
   raw: CwRaw[];
@@ -1605,8 +1642,9 @@ function cwAnalyze(data: any): CwAnalysis {
     if (m) { skills += (skills ? '\n\n' : '') + m[0].trim(); return text.replace(m[0], '').trim(); }
     return text;
   };
-  const pushSeg = (cat: CwCat, label: string, text: string) => {
-    if (text && text.trim()) segments.push({ cat, label, text, tokens: estTok(text) });
+  const pushSeg = (cat: CwCat, label: string, text: string, images?: string[]) => {
+    if ((text && text.trim()) || images?.length)
+      segments.push({ cat, label, text, tokens: estTok(text), images });
   };
 
   // Anthropic: the system prompt is a separate field, not a message.
@@ -1626,8 +1664,9 @@ function cwAnalyze(data: any): CwAnalysis {
       // Anthropic returns tool results on a user-role message — treat as tool.
       const isToolResult = Array.isArray(m.content) && m.content.some((b: any) => b && b.type === 'tool_result');
       if (isToolResult) {
-        pushSeg('tool', 'Tool result', full);
-        raw.push({ label: 'Tool', cls: 'tool', text: full });
+        const imgs = cwImages(m.content);
+        pushSeg('tool', 'Tool result', full, imgs.length ? imgs : undefined);
+        raw.push({ label: 'Tool', cls: 'tool', text: full, images: imgs.length ? imgs : undefined });
       } else {
         const ctx = CONTEXT_RE.test(full);
         pushSeg(ctx ? 'context' : 'user', ctx ? 'Injected context' : 'User', ctx ? harvestSkills(full) : full);
@@ -1657,8 +1696,9 @@ function cwAnalyze(data: any): CwAnalysis {
       const rawText = [thinking.trim() && ('> 🧠 ' + thinking.trim().replace(/\n/g, '\n> ')), say.trim()].filter(Boolean).join('\n\n') || full;
       raw.push({ label: 'Assistant', cls: 'assistant', text: rawText });
     } else if (role === 'tool') {
-      pushSeg('tool', 'Tool result', full);
-      raw.push({ label: 'Tool', cls: 'tool', text: full });
+      const imgs = cwImages(m.content);
+      pushSeg('tool', 'Tool result', full, imgs.length ? imgs : undefined);
+      raw.push({ label: 'Tool', cls: 'tool', text: full, images: imgs.length ? imgs : undefined });
     } else {
       pushSeg('context', role || 'Other', full);
       raw.push({ label: role || 'Other', cls: 'system', text: full });
@@ -1691,7 +1731,7 @@ function CwMd({ text }: { text: string }) {
 
 // One collapsible message/segment block; long blocks (e.g. the system prompt)
 // can be folded for navigation but default to fully expanded ("show fully").
-function CwBlock({ label, cls, tokens, text }: { label: string; cls: string; tokens?: number; text: string }) {
+function CwBlock({ label, cls, tokens, text, images }: { label: string; cls: string; tokens?: number; text: string; images?: string[] }) {
   const [open, setOpen] = useState(true);
   const long = text.length > 1500;
   return (
@@ -1701,9 +1741,15 @@ function CwBlock({ label, cls, tokens, text }: { label: string; cls: string; tok
         <div className="head">
           <span className={'badge ' + cls}>{label}</span>
           {typeof tokens === 'number' ? <span className="muted tiny">≈{fmtTok(tokens)} tok</span> : null}
+          {images?.length ? <span className="muted tiny">{images.length} page{images.length === 1 ? '' : 's'} (visual)</span> : null}
           {long ? <button className="btn ghost sm act" onClick={() => setOpen((v) => !v)}>{open ? 'Collapse' : 'Expand'}</button> : null}
         </div>
         {open ? <CwMd text={text} /> : <div className="muted tiny">{text.slice(0, 160)}…</div>}
+        {open && images?.length ? (
+          <div className="conv-imgs">
+            {images.map((src, i) => <img key={i} src={src} alt={'tool result page ' + (i + 1)} />)}
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -1737,7 +1783,7 @@ function CwProper({ a }: { a: CwAnalysis }) {
       <div key={sec.cat}>
         <h3 className="sec">{sec.title} <span className="muted tiny">· {segs.length} · ≈{fmtTok(tok)} tok</span></h3>
         <div className="card">
-          {segs.map((s, i) => <CwBlock key={i} label={s.label} cls={CW_BADGE[s.cat]} tokens={s.tokens} text={s.text} />)}
+          {segs.map((s, i) => <CwBlock key={i} label={s.label} cls={CW_BADGE[s.cat]} tokens={s.tokens} text={s.text} images={s.images} />)}
         </div>
       </div>
     );
@@ -1748,7 +1794,7 @@ function CwProper({ a }: { a: CwAnalysis }) {
 function CwRawView({ a }: { a: CwAnalysis }) {
   return (
     <div className="card">
-      {a.raw.map((m, i) => <CwBlock key={i} label={m.label} cls={m.cls} text={m.text} />)}
+      {a.raw.map((m, i) => <CwBlock key={i} label={m.label} cls={m.cls} text={m.text} images={m.images} />)}
       {a.tools.length ? (
         <div className="msg system">
           <div className="rail" />

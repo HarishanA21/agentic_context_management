@@ -53,6 +53,27 @@ def _apply_removes(
     return [m for m in messages if getattr(m, "id", None) not in dead]
 
 
+def _est_tokens(messages: List[Any]) -> int:
+    """Rough whole-list token estimate for the Savings "before/after" table.
+
+    Mirrors the ``len(text) // 4`` heuristic used elsewhere in the gateway
+    (``visualizer._estimate_tokens``); an image block counts as a flat 400
+    chars so techniques that swap text for images aren't scored as free.
+    """
+    total = 0
+    for m in messages:
+        content = getattr(m, "content", "")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    total += len(str(b.get("text", "")))
+                elif isinstance(b, dict) and b.get("type") in ("image_url", "image"):
+                    total += 400
+    return max(0, total // 4)
+
+
 def run_pipeline(
     messages: List[BaseMessage],
     profile: Profile,
@@ -97,6 +118,7 @@ def run_pipeline(
                 trigger_tokens=int(visual_cfg.get("trigger_tokens", 500) or 500),
                 only_tools=set(visual_cfg.get("only_tools") or []),
                 exclude_tools=set(visual_cfg.get("exclude_tools") or []),
+                skip_fps=visual_cfg.get("skip_fps") or None,
             )
             if repl:
                 messages = _apply_replacements(messages, repl)
@@ -111,6 +133,7 @@ def run_pipeline(
     trim = getattr(cm, "tool_result_trimming", None)
     if trim is not None and getattr(trim, "enabled", False):
         try:
+            before_tok = _est_tokens(messages)
             repl, info = trim_tool_results(
                 messages,
                 trigger_tokens=trim.trigger_tokens,
@@ -120,20 +143,39 @@ def run_pipeline(
             )
             if repl:
                 messages = _apply_replacements(messages, repl)
-                events.append({"type": "tool_result_trimming", "replaced_ids": _ids(repl), **info})
+                after_tok = _est_tokens(messages)
+                events.append(
+                    {
+                        "type": "tool_result_trimming",
+                        "replaced_ids": _ids(repl),
+                        "before_tokens": before_tok,
+                        "after_tokens": after_tok,
+                        **info,
+                    }
+                )
         except Exception as e:  # pragma: no cover - defensive
             _fail("tool_result_trimming", e)
 
     # 2. image eviction (visual recall, accuracy layer) -----------------------
     if ir_evicts:
         try:
+            before_tok = _est_tokens(messages)
             repl, info = evict_stale_images(
                 messages,
                 keep_recent_images=int(getattr(ir, "keep_recent_images", 3) or 3),
             )
             if repl:
                 messages = _apply_replacements(messages, repl)
-                events.append({"type": "image_eviction", "replaced_ids": _ids(repl), **info})
+                after_tok = _est_tokens(messages)
+                events.append(
+                    {
+                        "type": "image_eviction",
+                        "replaced_ids": _ids(repl),
+                        "before_tokens": before_tok,
+                        "after_tokens": after_tok,
+                        **info,
+                    }
+                )
         except Exception as e:  # pragma: no cover - defensive
             _fail("image_eviction", e)
 
@@ -141,6 +183,7 @@ def run_pipeline(
     summ = getattr(cm, "summarization", None)
     if summ is not None and getattr(summ, "enabled", False) and summariser is not None:
         try:
+            before_tok = _est_tokens(messages)
             removes, summary_msg, info = summarise_old_messages(
                 messages,
                 trigger_tokens=summ.trigger_tokens,
@@ -152,11 +195,14 @@ def run_pipeline(
                 if getattr(summary_msg, "id", None) is None:
                     summary_msg.id = "summ0"
                 messages = [summary_msg] + _apply_removes(messages, removes)
+                after_tok = _est_tokens(messages)
                 events.append(
                     {
                         "type": "summarization",
                         "removed_ids": _ids(removes),
                         "added_ids": [summary_msg.id],
+                        "before_tokens": before_tok,
+                        "after_tokens": after_tok,
                         **info,
                     }
                 )
@@ -167,10 +213,20 @@ def run_pipeline(
     sw = getattr(cm, "sliding_window", None)
     if sw is not None and getattr(sw, "enabled", False):
         try:
+            before_tok = _est_tokens(messages)
             removes, info = sliding_window_trim(messages, keep_recent=sw.keep_recent)
             if removes:
                 messages = _apply_removes(messages, removes)
-                events.append({"type": "sliding_window", "removed_ids": _ids(removes), **info})
+                after_tok = _est_tokens(messages)
+                events.append(
+                    {
+                        "type": "sliding_window",
+                        "removed_ids": _ids(removes),
+                        "before_tokens": before_tok,
+                        "after_tokens": after_tok,
+                        **info,
+                    }
+                )
         except Exception as e:  # pragma: no cover - defensive
             _fail("sliding_window", e)
 

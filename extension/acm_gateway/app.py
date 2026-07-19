@@ -33,7 +33,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from acm_engine import (
     BUILTIN_PRESETS,
@@ -209,6 +209,58 @@ def _resolve_profile(conv: str):
     return load_profile(active_config_path())
 
 
+def _visual_cfg_for(profile) -> Dict[str, Any]:
+    """The visual-method config for a resolved profile. The Profile block
+    (``context_management.visual_method``, per-chat capable) is authoritative —
+    the UI mirrors it into the legacy top-level gateway block on global save,
+    so the legacy block is only consulted when the profile has no block at all
+    (old hand-written configs). Note the naming skew: the Profile block says
+    ``threshold_tokens``, the gateway pipeline expects ``trigger_tokens``."""
+    vm = getattr(getattr(profile, "context_management", None), "visual_method", None)
+    if vm is None:
+        return load_visual_cfg(active_config_path())
+    return {
+        "enabled": bool(getattr(vm, "enabled", False)),
+        "trigger_tokens": int(getattr(vm, "threshold_tokens", 500) or 500),
+        "only_tools": list(getattr(vm, "only_tools", None) or []),
+        "exclude_tools": list(getattr(vm, "exclude_tools", None) or []),
+    }
+
+
+def _visual_cfg_with_marker(conv: str, profile, lc_messages) -> Dict[str, Any]:
+    """Marker-aware visual config for a live turn. On the first turn where
+    visual method is on for this chat, snapshot the fingerprints of the tool
+    messages already present — those are grandfathered as text; only tool calls
+    made *after* enabling get rasterised. Turning the technique off clears the
+    marker so a re-enable re-snapshots."""
+    vcfg = _visual_cfg_for(profile)
+    row = _WINDOWS.get(conv) or {}
+    if vcfg.get("enabled"):
+        fps = row.get("visual_before_fps")
+        if fps is None:
+            fps = [fingerprint(m) for m in lc_messages if isinstance(m, ToolMessage)]
+            _WINDOWS.set_visual_marker(conv, fps)
+        return {**vcfg, "skip_fps": set(fps)}
+    if row.get("visual_before_fps") is not None:
+        _WINDOWS.clear_visual_marker(conv)
+    return vcfg
+
+
+def _mark_visualized(conv: str, before_msgs, pipeline_events) -> None:
+    """Map this turn's visual_method replacements back to the pre-pipeline
+    messages' fingerprints so the transcript view can flag them image-bearing."""
+    ev = next((e for e in pipeline_events if e.get("type") == "visual_method"), None)
+    if not ev:
+        return
+    by_id = {getattr(m, "id", None): m for m in before_msgs}
+    fps = [
+        fingerprint(by_id[i])
+        for i in ev.get("replaced_ids", [])
+        if i is not None and i in by_id
+    ]
+    _DROP.mark_visualized(conv, fps)
+
+
 def _apply_droplist(conv: str, messages):
     """Record the current view for the UI, then strip dropped messages."""
     _DROP.record_seen(conv, messages)
@@ -369,7 +421,7 @@ def status() -> Dict[str, Any]:
         "relevance_pruning": getattr(
             getattr(cm, "relevance_pruning", None), "enabled", False
         ),
-        "visual_method": bool(load_visual_cfg(active_config_path()).get("enabled")),
+        "visual_method": bool(_visual_cfg_for(profile).get("enabled")),
     }
     prov = _PROVIDERS.list(mask=True)
     latest = _DROP.latest_conversation() or ""
@@ -882,12 +934,19 @@ def preview(conv: str = "") -> Dict[str, Any]:
     before = _apply_droplist(key, list(seen))
     profile = _resolve_profile(key)
 
+    # Preview is a dry run: honour the existing after-enable marker but never
+    # set or clear it here.
+    vcfg = _visual_cfg_for(profile)
+    marker = (_WINDOWS.get(key) or {}).get("visual_before_fps")
+    if vcfg.get("enabled") and marker is not None:
+        vcfg = {**vcfg, "skip_fps": set(marker)}
+
     try:
         after, events = run_pipeline(
             before,
             profile,
             summariser=None,
-            visual_cfg=load_visual_cfg(active_config_path()),
+            visual_cfg=vcfg,
         )
     except Exception as e:  # pragma: no cover - defensive
         return {"conversation": key, "available": False, "reason": f"preview failed: {e!s}"}
@@ -981,6 +1040,7 @@ def _window_view(conv: str, include_profile: bool = False) -> Dict[str, Any]:
             "relevance_pruning": getattr(
                 getattr(cm, "relevance_pruning", None), "enabled", False
             ),
+            "visual_method": bool(_visual_cfg_for(eff).get("enabled")),
         },
     }
     if include_profile:
@@ -1578,8 +1638,9 @@ async def chat_completions(request: Request) -> Any:
         lc_messages,
         profile,
         summariser=summariser,
-        visual_cfg=load_visual_cfg(active_config_path()),
+        visual_cfg=_visual_cfg_with_marker(conv, profile, lc_messages),
     )
+    _mark_visualized(conv, before_msgs, pipeline_events)
     if profile.context_management.summarization.enabled and summariser is None:
         pipeline_events.append(
             {
@@ -1790,8 +1851,9 @@ async def anthropic_messages(request: Request) -> Any:
         lc_messages,
         profile,
         summariser=summariser,
-        visual_cfg=load_visual_cfg(active_config_path()),
+        visual_cfg=_visual_cfg_with_marker(conv, profile, lc_messages),
     )
+    _mark_visualized(conv, before_msgs, pipeline_events)
     if profile.context_management.summarization.enabled and summariser is None:
         pipeline_events.append(
             {
