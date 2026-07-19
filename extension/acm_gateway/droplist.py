@@ -236,6 +236,10 @@ class DropStore:
         # Undo is a session affordance over manual edits (drop / drop_many /
         # restore / summarize); not persisted, so a fresh gateway starts clean.
         self._undo: Dict[str, List[Dict[str, Any]]] = {}
+        # in-memory: conv_key -> fingerprints of tool messages the pipeline has
+        # rasterised (visual method). The `seen` rows are built from the
+        # pre-pipeline (text) view, so this flags them as image-bearing on read.
+        self._visualized: Dict[str, set] = {}
 
     # ── persistence ──────────────────────────────────────────────────────
     def _load(self) -> Dict[str, List[str]]:
@@ -418,7 +422,15 @@ class DropStore:
         # would look like Remove did nothing).
         rows = self._seen.get(conv, {}).get("messages", [])
         live = set(self._dropped.get(conv, []))
-        out = [{**r, "dropped": r.get("fp") in live} for r in rows]
+        viz = self._visualized.get(conv, set())
+        out = [
+            {
+                **r,
+                "dropped": r.get("fp") in live,
+                "has_image": bool(r.get("has_image")) or r.get("fp") in viz,
+            }
+            for r in rows
+        ]
         if full:
             # Attach each message's complete text so a UI can render the whole
             # conversation in order without a per-message round-trip. Rows are
@@ -481,6 +493,12 @@ class DropStore:
             }
         return {"conversation": conv, **snap}
 
+    def mark_visualized(self, conv: str, fps: List[str]) -> None:
+        """Flag tool messages the pipeline rasterised this turn, so `seen` rows
+        report them image-bearing even though the incoming view was text."""
+        if fps:
+            self._visualized.setdefault(conv, set()).update(fps)
+
     # Markers for messages that are injected context, not a real user prompt —
     # used to pick a human-readable conversation title.
     _CTX_MARKERS = (
@@ -534,6 +552,7 @@ class DropStore:
         self._seen_msgs.pop(conv, None)
         self._sent.pop(conv, None)
         self._undo.pop(conv, None)
+        self._visualized.pop(conv, None)
         if dropped_changed:
             self._save()
 
@@ -546,6 +565,7 @@ class DropStore:
         self._seen_msgs = {}
         self._sent = {}
         self._undo = {}
+        self._visualized = {}
         self._save()
         self._save_summaries()
 

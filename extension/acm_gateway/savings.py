@@ -14,7 +14,6 @@ never re-derive it from the (lossy, capped) event log."""
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -64,6 +63,13 @@ class SavingsLedger:
             return 0
 
         by_type: Dict[str, int] = {}
+        # Per-technique before/after tokens for the Savings table (Technique |
+        # Before ACM | After ACM). Visual method also keeps its dedicated
+        # vis_before/vis_after pair for the token-comparison card.
+        before_by_type: Dict[str, int] = {}
+        after_by_type: Dict[str, int] = {}
+        vis_before = 0
+        vis_after = 0
         for e in events:
             t = e.get("type")
             if t not in _SAVING_TYPES:
@@ -71,9 +77,17 @@ class SavingsLedger:
             freed = int(e.get("freed_tokens", 0) or 0)
             if freed > 0:
                 by_type[t] = by_type.get(t, 0) + freed
+            bt = int(e.get("before_tokens", 0) or 0)
+            at = int(e.get("after_tokens", 0) or 0)
+            if bt > 0 or at > 0:
+                before_by_type[t] = before_by_type.get(t, 0) + bt
+                after_by_type[t] = after_by_type.get(t, 0) + at
+            if t == "visual_method":
+                vis_before += bt
+                vis_after += at
 
         added = sum(by_type.values())
-        if added == 0:
+        if added == 0 and vis_before == 0 and not before_by_type:
             return 0
 
         stamp = time.time()
@@ -86,6 +100,19 @@ class SavingsLedger:
         conv_rec["last_ts"] = stamp
         for t, n in by_type.items():
             conv_rec["by_technique"][t] = conv_rec["by_technique"].get(t, 0) + n
+        if vis_before > 0:
+            conv_rec["visual_before_tokens"] = (
+                int(conv_rec.get("visual_before_tokens", 0)) + vis_before
+            )
+            conv_rec["visual_after_tokens"] = (
+                int(conv_rec.get("visual_after_tokens", 0)) + vis_after
+            )
+        if before_by_type:
+            bbt = conv_rec.setdefault("before_by_technique", {})
+            abt = conv_rec.setdefault("after_by_technique", {})
+            for t in before_by_type:
+                bbt[t] = int(bbt.get(t, 0)) + before_by_type[t]
+                abt[t] = int(abt.get(t, 0)) + after_by_type.get(t, 0)
 
         self._save()
         return added
@@ -115,10 +142,18 @@ class SavingsLedger:
 
         total_freed = sum(int(c.get("freed_tokens", 0)) for c in convs.values())
         total_turns = sum(int(c.get("turns", 0)) for c in convs.values())
+        vis_before = sum(int(c.get("visual_before_tokens", 0)) for c in convs.values())
+        vis_after = sum(int(c.get("visual_after_tokens", 0)) for c in convs.values())
         by_technique: Dict[str, int] = {}
+        before_by_technique: Dict[str, int] = {}
+        after_by_technique: Dict[str, int] = {}
         for c in convs.values():
             for t, n in c.get("by_technique", {}).items():
                 by_technique[t] = by_technique.get(t, 0) + int(n)
+            for t, n in c.get("before_by_technique", {}).items():
+                before_by_technique[t] = before_by_technique.get(t, 0) + int(n)
+            for t, n in c.get("after_by_technique", {}).items():
+                after_by_technique[t] = after_by_technique.get(t, 0) + int(n)
 
         rows = []
         for key, c in convs.items():
@@ -142,6 +177,33 @@ class SavingsLedger:
             "total_cost_saved": _cost(total_freed, cost_per_mtok),
             "cost_per_mtok": cost_per_mtok,
             "by_technique": by_technique,
+            # With/without visual method: tool-result text tokens the model
+            # would have read as text vs the refs text it reads alongside the
+            # rendered images. Persisted, so it survives gateway restarts.
+            "visual_method": {
+                "before_tokens": vis_before,
+                "after_tokens": vis_after,
+                "saved_tokens": max(0, vis_before - vis_after),
+                "cost_saved": _cost(max(0, vis_before - vis_after), cost_per_mtok),
+            },
+            # Per-technique before/after tokens for the Savings table
+            # (Technique | Before ACM | After ACM). Only techniques that have
+            # actually fired at least once appear here.
+            "by_technique_table": [
+                {
+                    "technique": t,
+                    "before_tokens": before_by_technique.get(t, 0),
+                    "after_tokens": after_by_technique.get(t, 0),
+                    "saved_tokens": max(
+                        0, before_by_technique.get(t, 0) - after_by_technique.get(t, 0)
+                    ),
+                }
+                for t in sorted(
+                    set(before_by_technique) | set(after_by_technique),
+                    key=lambda k: before_by_technique.get(k, 0),
+                    reverse=True,
+                )
+            ],
             "conversations": rows,
         }
 

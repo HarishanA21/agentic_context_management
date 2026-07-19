@@ -2,6 +2,35 @@
 
 All notable changes to the Context Management — ACM VSCode extension.
 
+## [0.3.0] - 2026-07-19
+
+### Added
+- Visual method is now a first-class technique. It leads the Techniques list —
+  both the global tab and the per-chat section — and can be enabled for a single
+  chat without touching the others.
+- Rasterised tool results now render as images where you read them: the new
+  two-column page images show inline in the Conversation view and in the Context
+  Window (Proper and Raw), instead of the old `[image]` placeholder.
+- New **Savings** tab leads with the total tokens saved, then a clear
+  **Technique | Before ACM | After ACM** table showing how many tokens each
+  technique took in versus what it left behind. Includes the "Visual method —
+  token comparison" card (tool-result tokens without visual method vs. with it,
+  plus amount and percentage saved). All figures persist across gateway
+  restarts.
+
+### Changed
+- Reworked the tabs: **Chats** is now first and **Savings** second; the old
+  Overview tab is gone, its savings content folded into Savings.
+- Every technique now reports before/after token counts (not just visual
+  method), so the Savings table covers trimming, summarisation, image eviction,
+  and sliding window too.
+- Only tool calls made *after* enabling visual method are converted to images;
+  results already in the chat when you turn it on stay as text. Turning the
+  technique off and on again re-snapshots from that point.
+- Visual method now follows the per-chat profile (`context_management.
+  visual_method`); the legacy top-level config block is still honoured as a
+  fallback for older hand-written configs.
+
 ## [0.2.8] - 2026-07-07
 
 ### Fixed
