@@ -26,13 +26,14 @@ import json
 import os
 import re
 import time
+from contextlib import contextmanager
 from typing import Any, Dict, List
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from acm_engine import (
     BUILTIN_PRESETS,
@@ -66,8 +67,11 @@ from .droplist import (
     session_namespace,
 )
 from .pipeline import run_pipeline
+from .timeline import TimelineStore
 from .providers_store import ProviderStore
-from .savings import SavingsLedger
+from .savings import SavingsLedger, _SAVING_TYPES
+from .usage import UsageLedger
+from .budgets import BudgetStore, local_day_start
 from . import training_export
 from . import paths
 from .translate import lc_to_openai, openai_to_lc
@@ -87,8 +91,59 @@ _LAST_EVENTS: List[Dict[str, Any]] = []
 _MEMORY = MemoryStore()
 _DROP = DropStore()
 _SAVINGS = SavingsLedger()
+_USAGE = UsageLedger()
+_BUDGET = BudgetStore()
+_TIMELINE = TimelineStore()
 _PROVIDERS = ProviderStore()
 _WINDOWS = ContextWindowStore()
+
+# conv -> count of requests currently in flight for that chat. A chat is
+# "running" (a turn is mid-generation upstream) when its count is > 0. We keep a
+# count, not a bool, so overlapping requests for one chat don't clear each other
+# early. In-memory only — a fresh gateway starts with nothing running.
+_INFLIGHT: Dict[str, int] = {}
+
+
+def _running_convs() -> set:
+    """Chats with at least one request in flight right now."""
+    return {c for c, n in _INFLIGHT.items() if n > 0}
+
+
+def _enter_running(conv: str) -> None:
+    _INFLIGHT[conv] = _INFLIGHT.get(conv, 0) + 1
+    events.publish({"type": "running", "conv": conv, "running": True})
+
+
+def _exit_running(conv: str) -> None:
+    n = _INFLIGHT.get(conv, 0) - 1
+    if n > 0:
+        _INFLIGHT[conv] = n
+    else:
+        _INFLIGHT.pop(conv, None)
+    events.publish({"type": "running", "conv": conv, "running": n > 0})
+
+
+@contextmanager
+def _mark_running(conv: str):
+    """Mark ``conv`` running for a non-streamed upstream turn, announcing the
+    state change on both edges so the UI's status dot flips live."""
+    _enter_running(conv)
+    try:
+        yield
+    finally:
+        _exit_running(conv)
+
+
+async def _running_stream(conv: str, gen):
+    """Wrap an upstream token stream so ``conv`` stays "running" for the whole
+    generation, not just until the handler returns the StreamingResponse. The
+    state clears when the stream is exhausted or the client disconnects."""
+    _enter_running(conv)
+    try:
+        async for chunk in gen:
+            yield chunk
+    finally:
+        _exit_running(conv)
 
 
 def _env_openai() -> tuple:
@@ -108,6 +163,20 @@ def _resolve(model: str, request: Request):
         env_openai=_env_openai(),
         env_anthropic=_env_anthropic(),
     )
+
+
+def _is_probe(body: Dict[str, Any]) -> bool:
+    """True for a measurement probe rather than a real conversation turn.
+
+    Claude Code fires many token-counting probes per session — single-message,
+    no system, ``max_tokens=1``, never generating output — and each carries its
+    own throwaway ``session_id``. Registering a context window for them spawns a
+    junk "count"/"quota" chat alongside the real one (the "typing HI made 2
+    sessions" report). We forward these verbatim and track no ACM state for
+    them: a probe must also never be rewritten, or the count it measures would
+    be wrong."""
+    mt = body.get("max_tokens")
+    return isinstance(mt, int) and mt <= 1
 
 
 def _conv_key(request: Request, messages, body: Dict[str, Any] | None = None) -> str:
@@ -138,6 +207,58 @@ def _resolve_profile(conv: str):
                 except Exception:  # pragma: no cover - defensive
                     pass
     return load_profile(active_config_path())
+
+
+def _visual_cfg_for(profile) -> Dict[str, Any]:
+    """The visual-method config for a resolved profile. The Profile block
+    (``context_management.visual_method``, per-chat capable) is authoritative —
+    the UI mirrors it into the legacy top-level gateway block on global save,
+    so the legacy block is only consulted when the profile has no block at all
+    (old hand-written configs). Note the naming skew: the Profile block says
+    ``threshold_tokens``, the gateway pipeline expects ``trigger_tokens``."""
+    vm = getattr(getattr(profile, "context_management", None), "visual_method", None)
+    if vm is None:
+        return load_visual_cfg(active_config_path())
+    return {
+        "enabled": bool(getattr(vm, "enabled", False)),
+        "trigger_tokens": int(getattr(vm, "threshold_tokens", 500) or 500),
+        "only_tools": list(getattr(vm, "only_tools", None) or []),
+        "exclude_tools": list(getattr(vm, "exclude_tools", None) or []),
+    }
+
+
+def _visual_cfg_with_marker(conv: str, profile, lc_messages) -> Dict[str, Any]:
+    """Marker-aware visual config for a live turn. On the first turn where
+    visual method is on for this chat, snapshot the fingerprints of the tool
+    messages already present — those are grandfathered as text; only tool calls
+    made *after* enabling get rasterised. Turning the technique off clears the
+    marker so a re-enable re-snapshots."""
+    vcfg = _visual_cfg_for(profile)
+    row = _WINDOWS.get(conv) or {}
+    if vcfg.get("enabled"):
+        fps = row.get("visual_before_fps")
+        if fps is None:
+            fps = [fingerprint(m) for m in lc_messages if isinstance(m, ToolMessage)]
+            _WINDOWS.set_visual_marker(conv, fps)
+        return {**vcfg, "skip_fps": set(fps)}
+    if row.get("visual_before_fps") is not None:
+        _WINDOWS.clear_visual_marker(conv)
+    return vcfg
+
+
+def _mark_visualized(conv: str, before_msgs, pipeline_events) -> None:
+    """Map this turn's visual_method replacements back to the pre-pipeline
+    messages' fingerprints so the transcript view can flag them image-bearing."""
+    ev = next((e for e in pipeline_events if e.get("type") == "visual_method"), None)
+    if not ev:
+        return
+    by_id = {getattr(m, "id", None): m for m in before_msgs}
+    fps = [
+        fingerprint(by_id[i])
+        for i in ev.get("replaced_ids", [])
+        if i is not None and i in by_id
+    ]
+    _DROP.mark_visualized(conv, fps)
 
 
 def _apply_droplist(conv: str, messages):
@@ -218,6 +339,29 @@ def _record(events: List[Dict[str, Any]]) -> None:
         print(f"[acm-gateway] fired: {json.dumps(events)[:500]}", flush=True)
 
 
+def _record_usage(
+    conv: str, *, model: str, surface: str, data: Any, events: List[Dict[str, Any]]
+) -> None:
+    """Record real upstream usage for the eval ledger. Never breaks a live turn.
+
+    ``data`` is the raw (non-stream) provider response JSON; its ``usage`` block
+    is normalized + priced. ``events`` are this turn's pipeline events, from
+    which we lift the technique types (the eval arm) and freed tokens."""
+    try:
+        techniques = [e["type"] for e in events if e.get("type") in _SAVING_TYPES]
+        freed = sum(int(e.get("freed_tokens", 0) or 0) for e in events)
+        _USAGE.record(
+            conv,
+            model=model,
+            surface=surface,
+            raw_usage=(data or {}).get("usage") if isinstance(data, dict) else None,
+            techniques=techniques,
+            freed_tokens=freed,
+        )
+    except Exception as e:  # telemetry must never break a request
+        _notice("usage", f"couldn't record real usage: {e!s}")
+
+
 def _notice(step: str, message: str, level: str = "warn") -> None:
     """Surface a background failure the same way the pipeline does — retained for
     /status and pushed live to the UI — so it isn't silently swallowed."""
@@ -277,7 +421,7 @@ def status() -> Dict[str, Any]:
         "relevance_pruning": getattr(
             getattr(cm, "relevance_pruning", None), "enabled", False
         ),
-        "visual_method": bool(load_visual_cfg(active_config_path()).get("enabled")),
+        "visual_method": bool(_visual_cfg_for(profile).get("enabled")),
     }
     prov = _PROVIDERS.list(mask=True)
     latest = _DROP.latest_conversation() or ""
@@ -416,6 +560,108 @@ async def savings_reset(request: Request) -> Dict[str, Any]:
     else:
         _SAVINGS.clear_all()
     return {"ok": True}
+
+
+@app.get("/usage")
+def usage() -> Dict[str, Any]:
+    """Real upstream usage + priced cost per conversation (the eval anchor).
+
+    Unlike ``/savings`` (estimated freed tokens) this reflects the actual tokens
+    the provider billed, from each response's ``usage`` block, priced per-model."""
+    titles = {c["key"]: c["title"] for c in _DROP.conversations()}
+    return _USAGE.summary(titles=titles)
+
+
+@app.post("/usage/reset")
+async def usage_reset(request: Request) -> Dict[str, Any]:
+    """Clear the usage ledger, or one conversation with ``{"conversation": key}``."""
+    body: Dict[str, Any] = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    conv = body.get("conversation")
+    if conv:
+        _USAGE.forget(conv)
+    else:
+        _USAGE.clear_all()
+    return {"ok": True}
+
+
+def _cost_rollup() -> Dict[str, Any]:
+    """Cost attribution + live budget state — the Overview's headline data.
+
+    Joins the usage ledger (real priced cost per chat) to the window registry
+    (titles + the project each chat belongs to) so spend rolls up per project,
+    and layers today's spend against the user's daily cap."""
+    windows = {w["id"]: w for w in _WINDOWS.list()}
+    titles = {cid: (w.get("title") or cid) for cid, w in windows.items()}
+    projects = {cid: w.get("project", "") for cid, w in windows.items()}
+    last_ts = {cid: w.get("last_seen") for cid, w in windows.items()}
+    since = local_day_start()
+    roll = _USAGE.rollup(
+        titles=titles, projects=projects, last_ts=last_ts, since_ts=since
+    )
+    roll["budget"] = _BUDGET.state(roll.get("spent_today", 0.0))
+    return roll
+
+
+@app.get("/cost")
+def cost() -> Dict[str, Any]:
+    """Real priced spend, attributed per project + per chat, with budget state."""
+    return _cost_rollup()
+
+
+@app.get("/budget")
+def get_budget() -> Dict[str, Any]:
+    """The user's spend cap + today's spend against it."""
+    return _BUDGET.state(_USAGE.spent_since(local_day_start()))
+
+
+@app.post("/budget")
+async def set_budget(request: Request) -> Dict[str, Any]:
+    """Update the daily cap / hard-stop switch. Body: ``{daily_usd, hard_stop}``."""
+    body: Dict[str, Any] = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    _BUDGET.set(
+        daily_usd=body.get("daily_usd"),
+        hard_stop=body.get("hard_stop"),
+        warn_frac=body.get("warn_frac"),
+    )
+    return _BUDGET.state(_USAGE.spent_since(local_day_start()))
+
+
+def _budget_block() -> Optional[JSONResponse]:
+    """If a hard daily cap is set and already met, refuse a new turn with 429.
+
+    Enforcement is intentionally coarse: we stop the *next* turn once today's
+    real spend has reached the cap, rather than trying to predict this turn's
+    cost. Soft budgets (hard_stop off) never block — they only colour the UI."""
+    st = _BUDGET.state(_USAGE.spent_since(local_day_start()))
+    if st.get("enabled") and st.get("hard_stop") and st.get("over"):
+        _notice(
+            "budget",
+            f"Daily budget of ${st['daily_usd']:.2f} reached "
+            f"(${st['spent_today']:.2f} spent) — new turns are paused.",
+            level="error",
+        )
+        return JSONResponse(
+            {
+                "error": {
+                    "type": "acm_budget_exceeded",
+                    "message": (
+                        f"ACM daily budget of ${st['daily_usd']:.2f} reached "
+                        f"(${st['spent_today']:.2f} spent today). Raise or clear "
+                        "the cap in the ACM Overview to continue."
+                    ),
+                }
+            },
+            status_code=429,
+        )
+    return None
 
 
 def _pick_summariser(model: str | None):
@@ -619,11 +865,13 @@ def list_conversations() -> Dict[str, Any]:
 
 
 @app.get("/messages")
-def list_messages(conv: str = "") -> Dict[str, Any]:
+def list_messages(conv: str = "", full: int = 0) -> Dict[str, Any]:
     """Last-seen messages for a conversation: fingerprint, role, preview, and
-    whether each is currently dropped. ``conv`` defaults to the latest."""
+    whether each is currently dropped. ``conv`` defaults to the latest. Pass
+    ``full=1`` to also include each message's complete text, so a UI can render
+    the whole conversation in order without a per-message fetch."""
     key = conv or _DROP.latest_conversation() or ""
-    return {"conversation": key, "messages": _DROP.seen(key)}
+    return {"conversation": key, "messages": _DROP.seen(key, full=bool(full))}
 
 
 @app.get("/context_window")
@@ -633,6 +881,20 @@ def context_window(conv: str = "") -> Dict[str, Any]:
     Context Window view. ``conv`` defaults to the latest conversation."""
     key = conv or _DROP.latest_conversation() or ""
     return _DROP.sent(key)
+
+
+@app.get("/context_timeline")
+def context_timeline(conv: str = "", limit: int = 50) -> Dict[str, Any]:
+    """Per-request composition history for the Graph view: one entry per proxied
+    turn with the ordered message blocks (role, tokens, diff status, technique)
+    and the pipeline events that fired. In-memory ring — starts empty on gateway
+    restart. ``conv`` defaults to the latest conversation."""
+    key = conv or _DROP.latest_conversation() or ""
+    return {
+        "conversation": key,
+        "limit": limit,
+        "turns": _TIMELINE.timeline(key, limit=limit),
+    }
 
 
 def _preview_row(msg) -> Dict[str, Any]:
@@ -672,12 +934,19 @@ def preview(conv: str = "") -> Dict[str, Any]:
     before = _apply_droplist(key, list(seen))
     profile = _resolve_profile(key)
 
+    # Preview is a dry run: honour the existing after-enable marker but never
+    # set or clear it here.
+    vcfg = _visual_cfg_for(profile)
+    marker = (_WINDOWS.get(key) or {}).get("visual_before_fps")
+    if vcfg.get("enabled") and marker is not None:
+        vcfg = {**vcfg, "skip_fps": set(marker)}
+
     try:
         after, events = run_pipeline(
             before,
             profile,
             summariser=None,
-            visual_cfg=load_visual_cfg(active_config_path()),
+            visual_cfg=vcfg,
         )
     except Exception as e:  # pragma: no cover - defensive
         return {"conversation": key, "available": False, "reason": f"preview failed: {e!s}"}
@@ -746,6 +1015,7 @@ def _window_view(conv: str, include_profile: bool = False) -> Dict[str, Any]:
     view = {
         **row,
         "id": conv,
+        "running": conv in _INFLIGHT,
         "title": row.get("title") or _DROP.title(conv),
         # Live stats win while the conversation is in memory this run; else the
         # values mirrored into the registry (so the list survives a restart).
@@ -770,6 +1040,7 @@ def _window_view(conv: str, include_profile: bool = False) -> Dict[str, Any]:
             "relevance_pruning": getattr(
                 getattr(cm, "relevance_pruning", None), "enabled", False
             ),
+            "visual_method": bool(_visual_cfg_for(eff).get("enabled")),
         },
     }
     if include_profile:
@@ -832,6 +1103,7 @@ def delete_context_window(conv: str) -> Any:
     (drop-list, summaries, snapshots)."""
     existed = _WINDOWS.delete(conv)
     _DROP.forget(conv)
+    _TIMELINE.forget(conv)
     events.publish({"type": "window", "conv": conv, "action": "delete"})
     return JSONResponse({"ok": True, "deleted": existed, "conversation": conv})
 
@@ -842,6 +1114,7 @@ def reset_context_windows() -> Any:
     summaries, and snapshots. Does not touch provider config or memory."""
     cleared = _WINDOWS.clear()
     _DROP.clear_all()
+    _TIMELINE.clear_all()
     events.publish({"type": "window", "conv": "", "action": "reset"})
     return JSONResponse({"ok": True, "cleared": cleared})
 
@@ -927,6 +1200,7 @@ async def drop_message(request: Request) -> Any:
         return JSONResponse({"error": "no conversation known yet"}, status_code=400)
     if _DROP.drop(conv, fp):
         _DROP.push_undo(conv, "drop", "remove 1 message", {"fps": [fp]})
+        events.publish({"type": "window", "conv": conv, "action": "drop"})
     return JSONResponse({"ok": True, "conversation": conv, "dropped": _DROP.dropped(conv)})
 
 
@@ -943,6 +1217,7 @@ async def restore_message(request: Request) -> Any:
     ok = _DROP.restore(conv, fp)
     if ok:
         _DROP.push_undo(conv, "restore", "restore 1 message", {"fp": fp})
+        events.publish({"type": "window", "conv": conv, "action": "restore"})
     return JSONResponse({"ok": ok, "conversation": conv, "dropped": _DROP.dropped(conv)})
 
 
@@ -960,6 +1235,7 @@ async def drop_many(request: Request) -> Any:
     newly = [str(fp) for fp in fps if _DROP.drop(conv, str(fp))]
     if newly:
         _DROP.push_undo(conv, "drop_many", f"remove {len(newly)} messages", {"fps": newly})
+        events.publish({"type": "window", "conv": conv, "action": "drop"})
     return JSONResponse(
         {"ok": True, "conversation": conv, "dropped": _DROP.dropped(conv)}
     )
@@ -1302,6 +1578,32 @@ async def chat_completions(request: Request) -> Any:
     incoming = body.get("messages", []) or []
     lc_messages = openai_to_lc(incoming)
 
+    # Token-counting probes: forward untouched, register no context window (see
+    # _is_probe). Rewriting one would corrupt the count it measures.
+    if _is_probe(body):
+        target = _resolve(body.get("model", ""), request)
+        if target.kind == "anthropic":
+            return JSONResponse(
+                {"error": f"provider '{target.slug}' is Anthropic-native"},
+                status_code=400,
+            )
+        body = dict(body)
+        body["model"] = target.model
+        up = GenericUpstream(target.url, target.headers or {})
+        try:
+            return JSONResponse(await up.chat(body))
+        except httpx.HTTPStatusError as e:
+            try:
+                payload = e.response.json()
+            except Exception:
+                payload = {"error": {"message": e.response.text[:1000]}}
+            return JSONResponse(payload, status_code=e.response.status_code)
+
+    # Hard spend cap: refuse a new turn once today's real spend hits the budget.
+    blocked = _budget_block()
+    if blocked is not None:
+        return blocked
+
     # Resolve the chat (context window) + its per-chat profile before anything,
     # scoped to the project (cwd) the client is running in.
     conv = _conv_key(request, lc_messages, body)
@@ -1311,6 +1613,7 @@ async def chat_completions(request: Request) -> Any:
 
     # Manual removal: strip any tombstoned messages before anything else.
     lc_messages = _apply_droplist(conv, lc_messages)
+    before_msgs = list(lc_messages)
     _WINDOWS.touch(
         conv,
         title=_DROP.title(conv),
@@ -1335,8 +1638,9 @@ async def chat_completions(request: Request) -> Any:
         lc_messages,
         profile,
         summariser=summariser,
-        visual_cfg=load_visual_cfg(active_config_path()),
+        visual_cfg=_visual_cfg_with_marker(conv, profile, lc_messages),
     )
+    _mark_visualized(conv, before_msgs, pipeline_events)
     if profile.context_management.summarization.enabled and summariser is None:
         pipeline_events.append(
             {
@@ -1351,6 +1655,17 @@ async def chat_completions(request: Request) -> Any:
         _SAVINGS.record(conv, pipeline_events)
     except Exception as e:  # a disk/write failure must never break a live turn
         _notice("savings", f"couldn't update the savings ledger: {e!s}")
+    try:
+        _TIMELINE.record(
+            conv,
+            surface="openai",
+            model=body.get("model") or "",
+            before=before_msgs,
+            after=new_messages,
+            events=pipeline_events,
+        )
+    except Exception as e:  # timeline is a viewer — never break a live turn
+        _notice("timeline", f"couldn't record the request timeline: {e!s}")
 
     # Rebuild the forwarded body with the rewritten messages.
     body = dict(body)
@@ -1382,13 +1697,81 @@ async def chat_completions(request: Request) -> Any:
     up = GenericUpstream(target.url, target.headers or {})
     if body.get("stream"):
         return StreamingResponse(
-            up.chat_stream(body), media_type="text/event-stream"
+            _running_stream(conv, up.chat_stream(body)),
+            media_type="text/event-stream",
+        )
+    with _mark_running(conv):
+        try:
+            data = await up.chat(body)
+        except httpx.HTTPStatusError as e:
+            # Surface the upstream's real status + body instead of a bare 500, so
+            # the IDE shows the actual reason (mirrors the /v1/messages path).
+            try:
+                payload = e.response.json()
+            except Exception:
+                payload = {"error": {"message": e.response.text[:1000]}}
+            return JSONResponse(payload, status_code=e.response.status_code)
+    _record_usage(
+        conv, model=body.get("model", ""), surface="openai",
+        data=data, events=pipeline_events,
+    )
+    return JSONResponse(data)
+
+
+async def _forward_anthropic_untouched(
+    request: Request, body: Dict[str, Any], orig_system: Any
+) -> Any:
+    """Forward an Anthropic request verbatim — no pipeline, no context window,
+    no ACM state. Used for token-counting probes (see _is_probe). Preserves the
+    OAuth-passthrough / beta-header invariants a real turn honours, so the
+    upstream sees the same request shape it would without the gateway present."""
+    target = _resolve(body.get("model", ""), request)
+    use_passthrough, auth_header = _anthropic_auth_decision(request, target)
+
+    body = dict(body)
+    if use_passthrough:
+        if orig_system is not None:
+            body["system"] = orig_system
+        elif "system" in body:
+            del body["system"]
+    if target.kind == "anthropic":
+        up = AnthropicUpstream(
+            target.base_url, target.api_key, _SETTINGS.anthropic_version
+        )
+        body["model"] = target.model
+    else:
+        up = _anthropic_upstream()
+
+    passthrough_headers = _passthrough_headers(request) if use_passthrough else None
+    beta = request.headers.get("anthropic-beta")
+    if beta and not use_passthrough:
+        beta = ",".join(
+            b.strip()
+            for b in beta.split(",")
+            if b.strip() and not b.strip().startswith("oauth")
+        ) or None
+    beta_query = request.query_params.get("beta") in ("true", "1")
+
+    if body.get("stream"):
+        return StreamingResponse(
+            up.messages_stream(
+                body,
+                beta=beta,
+                beta_query=beta_query,
+                auth_header=auth_header,
+                passthrough_headers=passthrough_headers,
+            ),
+            media_type="text/event-stream",
         )
     try:
-        data = await up.chat(body)
+        data = await up.messages(
+            body,
+            beta=beta,
+            beta_query=beta_query,
+            auth_header=auth_header,
+            passthrough_headers=passthrough_headers,
+        )
     except httpx.HTTPStatusError as e:
-        # Surface the upstream's real status + body instead of a bare 500, so the
-        # IDE shows the actual reason (mirrors the /v1/messages path).
         try:
             payload = e.response.json()
         except Exception:
@@ -1413,6 +1796,19 @@ async def anthropic_messages(request: Request) -> Any:
     orig_system = body.get("system")
     orig_system_ids = {id(m) for m in lc_messages if isinstance(m, SystemMessage)}
 
+    # Token-counting probes (see _is_probe): Claude Code's many single-message,
+    # max_tokens=1 measurement calls, each under a throwaway session_id. Forward
+    # verbatim with the same auth/beta handling as a real turn, but register no
+    # context window and run no pipeline — otherwise every probe spawns a junk
+    # "count"/"quota" chat, and any rewrite would corrupt the count it measures.
+    if _is_probe(body):
+        return await _forward_anthropic_untouched(request, body, orig_system)
+
+    # Hard spend cap: refuse a new turn once today's real spend hits the budget.
+    blocked = _budget_block()
+    if blocked is not None:
+        return blocked
+
     # Which chat is this? Resolve its context window + per-chat profile, and
     # auto-create the window on first sight (inheriting the global default),
     # scoped to the project (cwd) Claude Code is running in.
@@ -1423,6 +1819,7 @@ async def anthropic_messages(request: Request) -> Any:
 
     # Manual removal: strip tombstoned messages before the pipeline.
     lc_messages = _apply_droplist(conv, lc_messages)
+    before_msgs = list(lc_messages)
     _WINDOWS.touch(
         conv,
         title=_DROP.title(conv),
@@ -1454,8 +1851,9 @@ async def anthropic_messages(request: Request) -> Any:
         lc_messages,
         profile,
         summariser=summariser,
-        visual_cfg=load_visual_cfg(active_config_path()),
+        visual_cfg=_visual_cfg_with_marker(conv, profile, lc_messages),
     )
+    _mark_visualized(conv, before_msgs, pipeline_events)
     if profile.context_management.summarization.enabled and summariser is None:
         pipeline_events.append(
             {
@@ -1470,6 +1868,17 @@ async def anthropic_messages(request: Request) -> Any:
         _SAVINGS.record(conv, pipeline_events)
     except Exception as e:  # a disk/write failure must never break a live turn
         _notice("savings", f"couldn't update the savings ledger: {e!s}")
+    try:
+        _TIMELINE.record(
+            conv,
+            surface="anthropic",
+            model=body.get("model") or "",
+            before=before_msgs,
+            after=new_messages,
+            events=pipeline_events,
+        )
+    except Exception as e:  # timeline is a viewer — never break a live turn
+        _notice("timeline", f"couldn't record the request timeline: {e!s}")
 
     # Route to a configured Anthropic provider if one is selected, else env,
     # then decide whether to forward the client's own subscription bearer.
@@ -1549,29 +1958,37 @@ async def anthropic_messages(request: Request) -> Any:
 
     if body.get("stream"):
         return StreamingResponse(
-            up.messages_stream(
+            _running_stream(
+                conv,
+                up.messages_stream(
+                    body,
+                    beta=beta,
+                    beta_query=beta_query,
+                    auth_header=auth_header,
+                    passthrough_headers=passthrough_headers,
+                ),
+            ),
+            media_type="text/event-stream",
+        )
+    with _mark_running(conv):
+        try:
+            data = await up.messages(
                 body,
                 beta=beta,
                 beta_query=beta_query,
                 auth_header=auth_header,
                 passthrough_headers=passthrough_headers,
-            ),
-            media_type="text/event-stream",
-        )
-    try:
-        data = await up.messages(
-            body,
-            beta=beta,
-            beta_query=beta_query,
-            auth_header=auth_header,
-            passthrough_headers=passthrough_headers,
-        )
-    except httpx.HTTPStatusError as e:
-        # Surface the upstream's real status + body instead of a bare 500, so
-        # the IDE stops retrying blindly and shows the actual reason.
-        try:
-            payload = e.response.json()
-        except Exception:
-            payload = {"error": {"message": e.response.text[:1000]}}
-        return JSONResponse(payload, status_code=e.response.status_code)
+            )
+        except httpx.HTTPStatusError as e:
+            # Surface the upstream's real status + body instead of a bare 500, so
+            # the IDE stops retrying blindly and shows the actual reason.
+            try:
+                payload = e.response.json()
+            except Exception:
+                payload = {"error": {"message": e.response.text[:1000]}}
+            return JSONResponse(payload, status_code=e.response.status_code)
+    _record_usage(
+        conv, model=body.get("model", ""), surface="anthropic",
+        data=data, events=pipeline_events,
+    )
     return JSONResponse(data)

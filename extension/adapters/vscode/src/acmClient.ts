@@ -209,6 +209,15 @@ export class AcmClient {
     return this.request<AcmSavings>('GET', '/savings');
   }
 
+  // ── cost attribution + spend budget (real priced usage) ─────────────
+  cost(): Promise<AcmCost> {
+    return this.request<AcmCost>('GET', '/cost');
+  }
+
+  setBudget(body: { daily_usd?: number; hard_stop?: boolean }): Promise<AcmBudget> {
+    return this.request<AcmBudget>('POST', '/budget', body);
+  }
+
   // ── preview (dry-run the pipeline on the next request) ──────────────
   preview(conv = ''): Promise<AcmPreview> {
     const q = conv ? `?conv=${encodeURIComponent(conv)}` : '';
@@ -247,8 +256,14 @@ export class AcmClient {
     return this.request('GET', '/conversations');
   }
 
-  messages(conv = ''): Promise<{ conversation: string; messages: AcmMessageRow[] }> {
-    return this.request('GET', '/messages?conv=' + encodeURIComponent(conv));
+  messages(
+    conv = '',
+    full = false,
+  ): Promise<{ conversation: string; messages: AcmMessageRow[] }> {
+    return this.request(
+      'GET',
+      '/messages?conv=' + encodeURIComponent(conv) + (full ? '&full=1' : ''),
+    );
   }
 
   // The exact payload last forwarded upstream (post-pipeline) for a conversation.
@@ -256,6 +271,14 @@ export class AcmClient {
     return this.request<AcmContextWindow>(
       'GET',
       '/context_window?conv=' + encodeURIComponent(conv),
+    );
+  }
+
+  // Per-request composition history (Graph view): one entry per proxied turn.
+  contextTimeline(conv = '', limit = 50): Promise<AcmContextTimeline> {
+    return this.request<AcmContextTimeline>(
+      'GET',
+      '/context_timeline?conv=' + encodeURIComponent(conv) + '&limit=' + limit,
     );
   }
 
@@ -361,6 +384,14 @@ export interface AcmMessageRow {
   preview: string;
   tool_call_id: string;
   dropped: boolean;
+  tokens?: number;
+  // True when the message carries image block(s) — a tool screenshot or a
+  // visual-method rasterised page. The conversation view fetches and renders
+  // these inline via messageImages(fp).
+  has_image?: boolean;
+  // Present only when the row was fetched with full=1 — the complete message
+  // text, so the conversation view can render in order without a per-row fetch.
+  text?: string;
 }
 
 // One chat's context window: its effective profile + live stats.
@@ -391,6 +422,37 @@ export interface AcmContextWindow {
   tools: any[];
 }
 
+// One message block in a timeline turn (Graph view). `tokens` is the block's
+// size before the pipeline ran; `after_tokens` is set when status is 'changed'.
+export interface AcmTimelineBlock {
+  id: string | null;
+  fp: string;
+  role: string; // system | human | ai | tool
+  tokens: number;
+  after_tokens?: number;
+  preview: string;
+  status: 'kept' | 'changed' | 'removed' | 'added';
+  technique: string; // '' when kept
+}
+
+export interface AcmTimelineTurn {
+  index: number;
+  ts: number;
+  surface: string;
+  model: string;
+  before_tokens: number;
+  after_tokens: number;
+  new_fps: string[]; // fps new since the previous turn (the growth blocks)
+  events: Array<Record<string, unknown>>;
+  blocks: AcmTimelineBlock[];
+}
+
+export interface AcmContextTimeline {
+  conversation: string;
+  limit: number;
+  turns: AcmTimelineTurn[];
+}
+
 export interface AcmSavingsRow {
   conversation: string;
   title: string;
@@ -408,6 +470,54 @@ export interface AcmSavings {
   cost_per_mtok: number;
   by_technique: Record<string, number>;
   conversations: AcmSavingsRow[];
+}
+
+// Live spend-cap state (the daily USD budget + where today's spend stands).
+export interface AcmBudget {
+  daily_usd: number;
+  hard_stop: boolean;
+  warn_frac: number;
+  spent_today: number;
+  pct: number;
+  over: boolean;
+  over_warn: boolean;
+  enabled: boolean;
+}
+
+export interface AcmCostTotals {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cached_tokens: number;
+  cost_usd: number;
+  turns: number;
+}
+
+export interface AcmCostProjectRow {
+  project: string;
+  cost_usd: number;
+  total_tokens: number;
+  turns: number;
+  chats: number;
+}
+
+export interface AcmCostChatRow {
+  conversation: string;
+  title: string;
+  project: string;
+  cost_usd: number;
+  total_tokens: number;
+  turns: number;
+  last_ts: number | null;
+}
+
+// Real priced spend, attributed per project + per chat, plus budget state.
+export interface AcmCost {
+  totals: AcmCostTotals;
+  spent_today: number;
+  projects: AcmCostProjectRow[];
+  conversations: AcmCostChatRow[];
+  budget: AcmBudget;
 }
 
 export interface AcmTrainingSummary {

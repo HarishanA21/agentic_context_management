@@ -75,12 +75,22 @@ def visualize_tool_messages(
     trigger_tokens: int = 500,
     only_tools: Optional[set] = None,
     exclude_tools: Optional[set] = None,
+    skip_fps: Optional[set] = None,
 ) -> Tuple[List[BaseMessage], Dict[str, Any]]:
     """Replace the body of each large, plain-text ToolMessage with a rasterised
     image + references. Skips already-multimodal results and respects the
-    only/exclude tool filters. Returns ``(replacements, info)`` using the same
-    id-preserving contract as the other techniques."""
-    info: Dict[str, Any] = {"rasterised": 0, "freed_tokens": 0, "total_tool_msgs": 0}
+    only/exclude tool filters. ``skip_fps`` holds fingerprints of tool messages
+    that predate the technique being enabled — those stay text. Returns
+    ``(replacements, info)`` using the same id-preserving contract as the other
+    techniques."""
+    info: Dict[str, Any] = {
+        "rasterised": 0,
+        "freed_tokens": 0,
+        "total_tool_msgs": 0,
+        "skipped_pre_enable": 0,
+        "before_tokens": 0,
+        "after_tokens": 0,
+    }
     excl = exclude_tools or set()
 
     replacements: List[BaseMessage] = []
@@ -98,6 +108,12 @@ def visualize_tool_messages(
             continue
         if _estimate_tokens(content) < trigger_tokens:
             continue
+        if skip_fps:
+            from .droplist import fingerprint
+
+            if fingerprint(m) in skip_fps:
+                info["skipped_pre_enable"] += 1
+                continue
 
         out = _rasterise(content, name)
         if out is None:
@@ -113,7 +129,10 @@ def visualize_tool_messages(
         )
         # text refs are tiny; the image is sent as base64 but counts very
         # differently against the budget — report the text tokens freed.
-        info["freed_tokens"] += max(0, before - _estimate_tokens(new_content[0]["text"]))
+        after = _estimate_tokens(new_content[0]["text"])
+        info["freed_tokens"] += max(0, before - after)
+        info["before_tokens"] += before
+        info["after_tokens"] += after
         info["rasterised"] += 1
         replacements.append(new_msg)
 

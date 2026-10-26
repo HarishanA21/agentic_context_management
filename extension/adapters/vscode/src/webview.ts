@@ -91,6 +91,10 @@ async function dispatch(client: AcmClient, method: string, params: any): Promise
       return client.savings();
     case 'savingsReset':
       return client.savingsReset(p.conv || '');
+    case 'cost':
+      return client.cost();
+    case 'setBudget':
+      return client.setBudget({ daily_usd: p.daily_usd, hard_stop: p.hard_stop });
     case 'preview':
       return client.preview(p.conv || '');
     case 'undoStatus':
@@ -134,9 +138,11 @@ async function dispatch(client: AcmClient, method: string, params: any): Promise
     case 'resetWindows':
       return client.resetWindows();
     case 'messages':
-      return client.messages(p.conv || '');
+      return client.messages(p.conv || '', !!p.full);
     case 'contextWindow':
       return client.contextWindow(p.conv || '');
+    case 'contextTimeline':
+      return client.contextTimeline(p.conv || '', p.limit || 50);
     case 'dropMessage':
       return client.dropMessage(p.fp, p.conv || '');
     case 'restoreMessage':
