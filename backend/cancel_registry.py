@@ -19,6 +19,11 @@ _cancelled: Set[str] = set()
 _lock = Lock()
 
 
+class ChatCancelled(Exception):
+    """Raised from an EventStreamer callback hook when it observes the
+    thread's cancel flag mid-turn, to unwind the LLM call in progress."""
+
+
 def request_cancel(thread_id: str) -> None:
     with _lock:
         _cancelled.add(thread_id)

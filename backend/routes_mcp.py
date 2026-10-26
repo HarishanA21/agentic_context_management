@@ -517,6 +517,9 @@ async def test_server(server_id: str, request: Request) -> Dict[str, Any]:
     except asyncio.TimeoutError:
         tools, err = [], "Timed out after 15s"
     except Exception as e:
+        # discover_tools_for_row already catches and formats its own
+        # failures (unwrapping ExceptionGroup itself) — this only fires for
+        # something outside that call, so no unwrap needed here.
         tools, err = [], f"{type(e).__name__}: {str(e)[:240]}"
 
     with pool.connection() as conn:

@@ -19,6 +19,7 @@ import time
 from collections import deque
 from typing import Any, Dict, List, Optional
 
+import psycopg
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
@@ -274,26 +275,33 @@ def create_provider(req: CreateProviderRequest, request: Request) -> Dict[str, A
                 "UPDATE llm_providers SET is_default = false WHERE user_id = %s",
                 (user_id,),
             )
-        row = conn.execute(
-            f"""
-            INSERT INTO llm_providers
-                (user_id, slug, label, model_id, credentials_blob, is_default,
-                 last_error, last_tested_at, temperature, max_tokens)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s)
-            RETURNING {_SELECT_FIELDS}
-            """,
-            (
-                user_id,
-                req.slug,
-                label,
-                model_id,
-                blob,
-                req.is_default,
-                last_error,
-                req.temperature,
-                req.max_tokens,
-            ),
-        ).fetchone()
+        try:
+            row = conn.execute(
+                f"""
+                INSERT INTO llm_providers
+                    (user_id, slug, label, model_id, credentials_blob, is_default,
+                     last_error, last_tested_at, temperature, max_tokens)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s)
+                RETURNING {_SELECT_FIELDS}
+                """,
+                (
+                    user_id,
+                    req.slug,
+                    label,
+                    model_id,
+                    blob,
+                    req.is_default,
+                    last_error,
+                    req.temperature,
+                    req.max_tokens,
+                ),
+            ).fetchone()
+        except psycopg.errors.UniqueViolation:
+            raise HTTPException(
+                400,
+                f"You already have a provider named '{label}' — pick a "
+                "different nickname.",
+            )
     return _row_to_dict(row)
 
 
@@ -381,7 +389,14 @@ def update_provider(
     )
 
     with _pool().connection() as conn:
-        row = conn.execute(sql, tuple(params)).fetchone()
+        try:
+            row = conn.execute(sql, tuple(params)).fetchone()
+        except psycopg.errors.UniqueViolation:
+            raise HTTPException(
+                400,
+                f"You already have a provider named '{new_label}' — pick a "
+                "different nickname.",
+            )
     if not row:
         raise HTTPException(404, "Provider not found.")
     return _row_to_dict(row)

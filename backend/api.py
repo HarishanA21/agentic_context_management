@@ -74,7 +74,7 @@ from pydantic import BaseModel
 
 from Tools import all_tools
 from agent_callbacks import AgentLogger, EventStreamer
-from cancel_registry import clear_cancel, request_cancel
+from cancel_registry import clear_cancel, is_cancelled, request_cancel
 from event_bus import bus as event_bus
 from sandbox_client import SandboxError, SandboxNotFoundError, get_backend
 from storage import file_key, get_bucket, is_not_found, session_prefix
@@ -311,14 +311,19 @@ def _unwrap_exc(e: BaseException) -> BaseException:
     what actually happened. Walk down to the first non-group leaf so the
     chat reply / error log shows the useful cause.
     """
-    # ExceptionGroup is stdlib in 3.11+; on older runtimes we just return
-    # the original exception unchanged.
-    EG = getattr(__builtins__, "ExceptionGroup", None) or globals().get(
-        "ExceptionGroup", type(None)
-    )
+    # ExceptionGroup is a real builtin name on 3.11+ — reference it directly
+    # rather than via `getattr(__builtins__, ...)`, which silently returns
+    # None in any regularly-imported module (as opposed to __main__, where
+    # __builtins__ is a dict, not the builtins module) and made this a
+    # permanent no-op. On pre-3.11 runtimes the name lookup itself raises
+    # NameError, which we fall back on.
+    try:
+        eg_type: type = ExceptionGroup  # noqa: F821 - builtin on 3.11+
+    except NameError:
+        return e
     seen = set()
     current: BaseException = e
-    while isinstance(current, EG) and id(current) not in seen:
+    while isinstance(current, eg_type) and id(current) not in seen:
         seen.add(id(current))
         children = getattr(current, "exceptions", None) or ()
         if not children:
@@ -1613,6 +1618,12 @@ class UpdateSessionRequest(BaseModel):
     # PR #1: per-session context-management profile override. Same
     # tri-state semantics as preferred_provider_id.
     context_profile_id: Optional[str] = None
+    # Persist an auto-generated or user-edited chat title server-side.
+    name: Optional[str] = None
+
+
+class UpdateThreadRequest(BaseModel):
+    name: Optional[str] = None
 
 
 @app.patch("/sessions/{session_id}")
@@ -1632,6 +1643,11 @@ def update_session(
             conn.execute(
                 "UPDATE sessions SET mode = %s WHERE id = %s AND user_id = %s",
                 (req.mode, session_id, user_id),
+            )
+        if req.name is not None:
+            conn.execute(
+                "UPDATE sessions SET name = %s WHERE id = %s AND user_id = %s",
+                (req.name, session_id, user_id),
             )
         if req.preferred_provider_id is not None:
             new_pid: Optional[str]
@@ -1676,6 +1692,7 @@ def update_session(
         "mode": req.mode,
         "preferred_provider_id": req.preferred_provider_id,
         "context_profile_id": req.context_profile_id,
+        "name": req.name,
     }
 
 
@@ -1910,6 +1927,24 @@ def create_thread(
         "created_at": t[2].isoformat(),
         "tokens": 0,
     }
+
+
+@app.patch("/sessions/{session_id}/threads/{thread_id}")
+def update_thread(
+    session_id: str,
+    thread_id: str,
+    req: UpdateThreadRequest,
+    user_id: str = Depends(get_current_user),
+):
+    """Partial-update a thread. Currently only supports renaming."""
+    with app.state.pool.connection() as conn:
+        _verify_thread(conn, user_id, session_id, thread_id)
+        if req.name is not None:
+            conn.execute(
+                "UPDATE threads SET name = %s WHERE id = %s AND user_id = %s",
+                (req.name, thread_id, user_id),
+            )
+    return {"ok": True, "name": req.name}
 
 
 @app.delete("/sessions/{session_id}")
@@ -4010,8 +4045,8 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
             _profile, req.model, user_id, req.session_id, req.thread_id
         )
 
-        # Project sessions get a sandboxed workspace; chat-only sessions don't.
-        # The lazy-create returns an existing workspace if there is one (auto-
+        # Every session gets a sandboxed workspace, chats included. The
+        # lazy-create returns an existing workspace if there is one (auto-
         # resumed if paused) — so the cost is amortised across turns. Failures
         # here are non-fatal: chat still works, only run_shell is unavailable.
         workspace_ref: Optional[str] = None
@@ -4022,10 +4057,9 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
                 "SELECT kind, mode FROM sessions WHERE id = %s AND user_id = %s",
                 (req.session_id, user_id),
             ).fetchone()
-        session_kind = session_row[0] if session_row else None
         if session_row and session_row[1]:
             session_mode = (session_row[1] or "auto").lower()
-        if session_kind and (session_kind or "").lower() == "project":
+        if session_row:
             try:
                 ws_row, workspace_ref = _ensure_workspace_for_session(user_id, req.session_id)
                 workspace_id = ws_row["id"]
@@ -4047,16 +4081,21 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
         # prints to the backend terminal.
         configurable = {
             "thread_id": f"{user_id}:{req.session_id}",
+            # Distinct from the LangGraph checkpoint thread_id above — this
+            # is the UI conversation thread that /chat/cancel flags, so
+            # cancel-aware tools (shell, write_file) must check this key.
+            "ui_thread_id": req.thread_id,
             "user_id": user_id,
             "session_id": req.session_id,
             "session_mode": session_mode,
         }
         if workspace_ref:
             configurable["workspace_ref"] = workspace_ref
+        event_streamer = EventStreamer(thread_id=req.thread_id)
         config = {
             "callbacks": [
                 AgentLogger(request_id=req.session_id),
-                EventStreamer(thread_id=req.thread_id),
+                event_streamer,
             ],
             "configurable": configurable,
         }
@@ -4198,6 +4237,20 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
                 )
             )
         except Exception as e:
+            if is_cancelled(req.thread_id):
+                # User clicked Stop and an EventStreamer hook unwound the
+                # in-flight LLM call. Persist whatever streamed so far as a
+                # normal assistant message (non-empty, so the frontend's
+                # history poll sees a new message and clears `sending`)
+                # instead of surfacing this as an error.
+                partial = (event_streamer.last_partial_text or "").strip()
+                content = f"{partial}\n\n_(cancelled)_" if partial else "_(cancelled)_"
+                with app.state.pool.connection() as conn:
+                    _record_message(
+                        conn, req.session_id, req.thread_id, user_id, "assistant", content
+                    )
+                clear_cancel(req.thread_id)
+                return {"cancelled": True}
             inner = _unwrap_exc(e)
             msg = str(inner) or inner.__class__.__name__
             cls = inner.__class__.__name__
@@ -4510,32 +4563,33 @@ def chat_resume(req: ResumeChatRequest, user_id: str = Depends(get_current_user)
             ).fetchone()
         if row:
             session_mode = (row[1] or "auto").lower()
-            if (row[0] or "").lower() == "project":
-                try:
-                    ws_row, workspace_ref = _ensure_workspace_for_session(
-                        user_id, req.session_id
-                    )
-                    workspace_id = ws_row["id"]
-                except HTTPException as e:
-                    if e.status_code == 429:
-                        raise
-                    print(
-                        f"[/chat/resume] workspace lookup failed: {e.detail}",
-                        flush=True,
-                    )
+            try:
+                ws_row, workspace_ref = _ensure_workspace_for_session(
+                    user_id, req.session_id
+                )
+                workspace_id = ws_row["id"]
+            except HTTPException as e:
+                if e.status_code == 429:
+                    raise
+                print(
+                    f"[/chat/resume] workspace lookup failed: {e.detail}",
+                    flush=True,
+                )
 
         configurable = {
             "thread_id": f"{user_id}:{req.session_id}",
+            "ui_thread_id": req.thread_id,
             "user_id": user_id,
             "session_id": req.session_id,
             "session_mode": session_mode,
         }
         if workspace_ref:
             configurable["workspace_ref"] = workspace_ref
+        event_streamer = EventStreamer(thread_id=req.thread_id)
         config = {
             "callbacks": [
                 AgentLogger(request_id=req.session_id),
-                EventStreamer(thread_id=req.thread_id),
+                event_streamer,
             ],
             "configurable": configurable,
         }
@@ -4600,6 +4654,15 @@ def chat_resume(req: ResumeChatRequest, user_id: str = Depends(get_current_user)
                 )
             )
         except Exception as e:
+            if is_cancelled(req.thread_id):
+                partial = (event_streamer.last_partial_text or "").strip()
+                content = f"{partial}\n\n_(cancelled)_" if partial else "_(cancelled)_"
+                with app.state.pool.connection() as conn:
+                    _record_message(
+                        conn, req.session_id, req.thread_id, user_id, "assistant", content
+                    )
+                clear_cancel(req.thread_id)
+                return {"cancelled": True}
             inner = _unwrap_exc(e)
             msg = str(inner) or inner.__class__.__name__
             print(

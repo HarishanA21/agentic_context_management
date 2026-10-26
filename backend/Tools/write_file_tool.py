@@ -85,10 +85,10 @@ def write_project_file(
 ) -> str:
     """Write text content to a file in the current project.
 
-    For project sessions with a sandboxed workspace, writes to
+    For sessions with a sandboxed workspace attached, writes to
     /workspace/<filename> — the agent's live working copy that run_shell,
-    git, and tests can see. For chat sessions (no workspace), writes to S3
-    under the session's prefix.
+    git, and tests can see. If no workspace is attached (yet, or at all),
+    writes to S3 under the session's prefix instead.
 
     Creates the file if missing, overwrites it if it exists.
 
@@ -103,7 +103,7 @@ def write_project_file(
         return f"Error: {e}"
 
     # Cancel-aware entry — see shell_tool.py for the same pattern.
-    thread_id = ((config or {}).get("configurable", {}) or {}).get("thread_id")
+    thread_id = ((config or {}).get("configurable", {}) or {}).get("ui_thread_id")
     if thread_id and is_cancelled(str(thread_id)):
         return "Cancelled by user."
 

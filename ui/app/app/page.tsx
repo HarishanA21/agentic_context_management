@@ -35,6 +35,9 @@ type Session = {
   created_at: string
   tokens?: number
   mode?: 'auto' | 'confirm'
+  github_owner?: string | null
+  github_repo?: string | null
+  github_branch?: string | null
 }
 type Thread = {
   id: string
@@ -258,6 +261,9 @@ export default function AppPage() {
   // Skills manage panel — swaps into the main pane like MCPs/Demo.
   const [skillsOpen, setSkillsOpen] = useState(false)
   const [projectModalOpen, setProjectModalOpen] = useState(false)
+  // Collapses the Context Profiles…Settings nav block so it doesn't eat
+  // sidebar space when the user only wants Chats/Projects visible.
+  const [navToolsOpen, setNavToolsOpen] = useState(true)
 
   // Per-row "⋯" menu — keyed by `${kind}:${id}` so chats and threads don't collide
   const [rowMenuKey, setRowMenuKey] = useState<string | null>(null)
@@ -565,6 +571,11 @@ export default function AppPage() {
             setInflightTools((prev) =>
               prev.filter((t) => t.tool_name !== 'skill_triggered'),
             )
+            // This SSE event arrives well before the /chat request's own
+            // history poll notices it — flip `sending` here too so the
+            // Stop button and composer re-enable immediately (matters most
+            // right after a cancel, so the user can send again right away).
+            setSending(false)
           }
           setMessages((prev) => mergeIncomingMessage(prev, evt))
           // Keep the floating ring's percentage in sync. Debounce so a
@@ -638,22 +649,47 @@ export default function AppPage() {
   }, [activeSession, activeThread])
 
   /* ─── name helpers ─── */
+  function findSessionIdForThread(tid: string): string | undefined {
+    for (const [sid, list] of Object.entries(threadsMap)) {
+      if (list.some((t) => t.id === tid)) return sid
+    }
+    return undefined
+  }
   function setSessionName(id: string, name: string) {
     persistName(SESSION_NAMES_KEY, id, name)
     setSessionNames((prev) => ({ ...prev, [id]: name }))
+    setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, name } : s)))
+    // Best effort — if this fails, the localStorage override still shows
+    // the right title on this device; next loadSessions elsewhere won't.
+    void authFetch(`/api/sessions/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ name }),
+    })
   }
-  function setThreadName(id: string, name: string) {
+  function setThreadName(id: string, name: string, sid?: string) {
     persistName(THREAD_NAMES_KEY, id, name)
     setThreadNames((prev) => ({ ...prev, [id]: name }))
+    const sessionId = sid ?? findSessionIdForThread(id)
+    if (!sessionId) return
+    setThreadsMap((prev) => ({
+      ...prev,
+      [sessionId]: (prev[sessionId] || []).map((t) =>
+        t.id === id ? { ...t, name } : t,
+      ),
+    }))
+    void authFetch(`/api/sessions/${sessionId}/threads/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ name }),
+    })
   }
   function sessionDisplayName(s: Session): string {
     const k = kinds[s.id] ?? 'project'
     const override = sessionNames[s.id]
-    if (k === 'chat') return override || 'New chat'
+    if (k === 'chat') return override || s.name || 'New chat'
     return override || s.name
   }
   function threadDisplayName(t: Thread): string {
-    return threadNames[t.id] || 'New chat'
+    return threadNames[t.id] || t.name || 'New chat'
   }
 
   /* ─── row actions ─── */
@@ -1418,6 +1454,9 @@ export default function AppPage() {
       id: data.id,
       name: data.name,
       created_at: data.created_at,
+      github_owner: data.github_owner ?? null,
+      github_repo: data.github_repo ?? null,
+      github_branch: data.github_branch ?? null,
     }
     const defaultThread: Thread | undefined = data.default_thread
 
@@ -1639,12 +1678,12 @@ export default function AppPage() {
         target === 'session' ? !!sessionNames[sid] : !!threadNames[tid]
       if (heuristic && !alreadyNamed) {
         if (target === 'session') setSessionName(sid, heuristic)
-        else setThreadName(tid, heuristic)
+        else setThreadName(tid, heuristic, sid)
         // Background upgrade — best effort, don't await.
         generateTitle(msg).then((better) => {
           if (!better || better === heuristic) return
           if (target === 'session') setSessionName(sid, better)
-          else setThreadName(tid, better)
+          else setThreadName(tid, better, sid)
         })
       }
     }
@@ -2222,6 +2261,34 @@ export default function AppPage() {
           </div>
         </div>
 
+        {/* Collapses the Context Profiles…Settings block below so the
+            sidebar can be kept compact when it's not needed. Arrow points
+            down while collapsed, up while expanded. */}
+        <div className="px-3 pt-2">
+          <button
+            onClick={() => setNavToolsOpen((v) => !v)}
+            aria-expanded={navToolsOpen}
+            aria-label={navToolsOpen ? 'Collapse menu' : 'Expand menu'}
+            className="flex items-center justify-center w-full py-1 rounded-md text-fog-400 hover:text-fog-200 hover:bg-soft/[0.04] transition"
+          >
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className={`transition-transform ${navToolsOpen ? 'rotate-180' : ''}`}
+            >
+              <path d="M6 9l6 6 6-6" />
+            </svg>
+          </button>
+        </div>
+
+        {navToolsOpen && (
+        <>
         {/* PR #8: context profiles entry — bundles tool surface +
             context-management toggles. Sits above Strategy Demo so
             users land on it before running comparisons. */}
@@ -2403,6 +2470,8 @@ export default function AppPage() {
             <span className="text-sm flex-1 text-left">Settings</span>
           </Link>
         </div>
+        </>
+        )}
 
         {/* User menu */}
         <div className="border-t border-line p-3 relative">
@@ -2492,6 +2561,18 @@ export default function AppPage() {
                       </span>
                     </>
                   )}
+                  {activeSessionObj.github_owner && activeSessionObj.github_repo && (
+                    <a
+                      href={`https://github.com/${activeSessionObj.github_owner}/${activeSessionObj.github_repo}${activeSessionObj.github_branch ? `/tree/${activeSessionObj.github_branch}` : ''}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="chip text-[11px] py-0.5 shrink-0 hover:bg-soft/[0.08]"
+                      title={`Linked to ${activeSessionObj.github_owner}/${activeSessionObj.github_repo}${activeSessionObj.github_branch ? ` @ ${activeSessionObj.github_branch}` : ''}`}
+                    >
+                      {activeSessionObj.github_owner}/{activeSessionObj.github_repo}
+                      {activeSessionObj.github_branch ? ` @ ${activeSessionObj.github_branch}` : ''}
+                    </a>
+                  )}
                 </>
               ) : (
                 <>
@@ -2523,7 +2604,7 @@ export default function AppPage() {
             {activeSessionObj && activeKind === 'project' && (
               <ViewToggle mode={viewMode} onChange={setViewMode} />
             )}
-            {activeSessionObj && activeKind === 'project' && (
+            {activeSessionObj && (
               <ModeToggle
                 mode={activeSessionObj.mode ?? 'auto'}
                 onChange={(m) => updateSessionMode(activeSessionObj.id, m)}
@@ -2587,10 +2668,15 @@ export default function AppPage() {
                       }
                     }
                   }}
-                  disabled={!activeSession && providers.length > 0}
                   className="bg-transparent text-xs text-fog-50 outline-none max-w-[22rem] truncate disabled:opacity-50"
                   title="Chat model"
                 >
+                  {/* Placeholder so the browser doesn't fall back to
+                      showing the first real option (e.g. a newly-added
+                      provider) when nothing is actually selected yet. */}
+                  <option value="" disabled hidden className="bg-ink-200 text-fog-50">
+                    Select provider or model…
+                  </option>
                   {/* ── Your configured providers at the top ── */}
                   {providers.length > 0 && (
                     <optgroup label="Your Providers">
